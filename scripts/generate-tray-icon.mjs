@@ -12,9 +12,10 @@ function createPillPng(width = 32, height = 32) {
   const rowLength = 1 + width * 4;
   const rawData = Buffer.alloc(rowLength * height, 0);
 
-  // Pill parameters (capsule in the middle)
-  const pillW = 24;
-  const pillH = 12;
+  // Scale pill proportionally to requested width/height
+  const scale = width / 32;
+  const pillW = Math.round(24 * scale);
+  const pillH = Math.round(12 * scale);
   const pillRadius = pillH / 2;
   const startX = (width - pillW) / 2;
   const startY = (height - pillH) / 2;
@@ -32,7 +33,7 @@ function createPillPng(width = 32, height = 32) {
       const pixelOffset = rowOffset + 1 + x * 4;
 
       // Distance from capsule
-      let dist = 999;
+      let dist = 9999;
       if (x < center1X) {
         dist = Math.hypot(x - center1X, y - centerY);
       } else if (x > center2X) {
@@ -43,15 +44,14 @@ function createPillPng(width = 32, height = 32) {
 
       if (dist <= pillRadius) {
         // Inside capsule
-        // Check if inside camera punch-hole dot
-        const dotDist = Math.hypot(x - (center2X - 2), y - centerY);
-        if (dotDist <= 1.8) {
+        const dotDist = Math.hypot(x - (center2X - 2 * scale), y - centerY);
+        if (dotDist <= 1.8 * scale) {
           // Dark camera lens
           rawData[pixelOffset] = 15;
           rawData[pixelOffset + 1] = 23;
           rawData[pixelOffset + 2] = 42;
           rawData[pixelOffset + 3] = 255;
-        } else if (dist >= pillRadius - 1.2) {
+        } else if (dist >= pillRadius - Math.max(1.2, 1.1 * scale)) {
           // Crisp border/glow
           rawData[pixelOffset] = 255;
           rawData[pixelOffset + 1] = 255;
@@ -59,9 +59,9 @@ function createPillPng(width = 32, height = 32) {
           rawData[pixelOffset + 3] = 230;
         } else {
           // Sleek dark pill body
-          rawData[pixelOffset] = 30;
-          rawData[pixelOffset + 1] = 30;
-          rawData[pixelOffset + 2] = 36;
+          rawData[pixelOffset] = 18;
+          rawData[pixelOffset + 1] = 18;
+          rawData[pixelOffset + 2] = 22;
           rawData[pixelOffset + 3] = 255;
         }
       }
@@ -122,7 +122,53 @@ function createPillPng(width = 32, height = 32) {
   return Buffer.concat([signature, ihdrChunk, idatChunk, iendChunk]);
 }
 
+function createIcoFromPngBuffers(entries) {
+  const count = entries.length;
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0); // Reserved
+  header.writeUInt16LE(1, 2); // Type 1 = ICO
+  header.writeUInt16LE(count, 4);
+
+  const dirEntries = [];
+  let dataOffset = 6 + count * 16;
+
+  for (const { width, height, png } of entries) {
+    const dir = Buffer.alloc(16);
+    dir.writeUInt8(width >= 256 ? 0 : width, 0);
+    dir.writeUInt8(height >= 256 ? 0 : height, 1);
+    dir.writeUInt8(0, 2); // palette
+    dir.writeUInt8(0, 3); // reserved
+    dir.writeUInt16LE(1, 4); // color planes
+    dir.writeUInt16LE(32, 6); // bits per pixel
+    dir.writeUInt32LE(png.length, 8);
+    dir.writeUInt32LE(dataOffset, 12);
+    dirEntries.push(dir);
+    dataOffset += png.length;
+  }
+
+  return Buffer.concat([header, ...dirEntries, ...entries.map((e) => e.png)]);
+}
+
 const outPath = path.join(__dirname, '..', 'electron', 'tray-icon.png');
-const pngBuffer = createPillPng(32, 32);
-fs.writeFileSync(outPath, pngBuffer);
-console.log('Generated tray icon at:', outPath, `(${pngBuffer.length} bytes)`);
+const png32 = createPillPng(32, 32);
+const png128 = createPillPng(128, 128);
+const png256 = createPillPng(256, 256);
+
+fs.mkdirSync(path.dirname(outPath), { recursive: true });
+fs.writeFileSync(outPath, png32);
+
+const tauriIconsDir = path.join(__dirname, '..', 'src-tauri', 'icons');
+fs.mkdirSync(tauriIconsDir, { recursive: true });
+fs.writeFileSync(path.join(tauriIconsDir, '32x32.png'), png32);
+fs.writeFileSync(path.join(tauriIconsDir, '128x128.png'), png128);
+fs.writeFileSync(path.join(tauriIconsDir, '128x128@2x.png'), png256);
+fs.writeFileSync(path.join(tauriIconsDir, 'icon.png'), png256);
+
+const icoBuffer = createIcoFromPngBuffers([
+  { width: 32, height: 32, png: png32 },
+  { width: 256, height: 256, png: png256 },
+]);
+fs.writeFileSync(path.join(tauriIconsDir, 'icon.ico'), icoBuffer);
+
+console.log('Generated Electron & Tauri 2.0 icons at:', tauriIconsDir);
+

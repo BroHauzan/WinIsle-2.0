@@ -1,3 +1,19 @@
+export function isDesktopRuntime(): boolean {
+  if (typeof window === 'undefined') return false;
+  const winAny = window as any;
+  if (winAny.__WINISLE_SERVER_URL__ || winAny.__TAURI_INTERNALS__ || winAny.__TAURI__) {
+    return true;
+  }
+  const proto = window.location.protocol;
+  const host = window.location.hostname;
+  return (
+    proto === 'file:' ||
+    proto === 'tauri:' ||
+    host === 'tauri.localhost' ||
+    Boolean(winAny.electronAPI?.isElectron)
+  );
+}
+
 export function getApiBaseUrl(): string {
   if (typeof window === 'undefined') return '';
   const winAny = window as any;
@@ -10,7 +26,7 @@ export function getApiBaseUrl(): string {
       // ignore
     }
   }
-  if (window.location.protocol === 'file:') {
+  if (isDesktopRuntime()) {
     return 'http://127.0.0.1:45781';
   }
   return '';
@@ -26,3 +42,4 @@ export function getWsBaseUrl(): string {
   const host = window.location.host || '127.0.0.1:45781';
   return `${proto}//${host}`;
 }
+

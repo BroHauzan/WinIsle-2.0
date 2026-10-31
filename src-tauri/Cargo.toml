@@ -1,0 +1,38 @@
+[package]
+name = "winisle"
+version = "1.2.5"
+description = "WinIsle Dynamic Island for Windows (Tauri 2.0 Edition)"
+authors = ["Isle Desktop"]
+license = "GPL-3.0-or-later"
+edition = "2021"
+
+[[bin]]
+name = "winisle"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+ureq = { version = "2.10", features = ["json"] }
+urlencoding = "2.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true

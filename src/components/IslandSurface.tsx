@@ -159,6 +159,16 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         const nr = Math.ceil(curR);
         const ns = Math.ceil(curS);
         if (prev.w === nw && prev.h === nh && prev.r === nr && prev.s === ns) return prev;
+        if (typeof window !== 'undefined') {
+          const winAny = window as any;
+          const totalW = nw + 2 * ns;
+          winAny.__WINISLE_ISLAND_BOUNDS__ = { w: totalW, h: nh };
+          if (typeof winAny.__TAURI_INTERNALS__?.invoke === 'function') {
+            winAny.__TAURI_INTERNALS__
+              .invoke('update_island_bounds', { width: totalW, height: nh })
+              .catch(() => {});
+          }
+        }
         return { w: nw, h: nh, r: nr, s: ns };
       });
 

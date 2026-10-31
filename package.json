@@ -11,9 +11,12 @@
     "dev": "tsx server.ts",
     "build": "vite build",
     "build:server": "node scripts/generate-tray-icon.mjs && node scripts/build-server.mjs",
+    "tauri:dev": "node scripts/generate-tray-icon.mjs && npx @tauri-apps/cli@2 dev",
+    "tauri:build": "node scripts/generate-tray-icon.mjs && npm run build && npx @tauri-apps/cli@2 build --bundles nsis && node scripts/package-release-zip.mjs",
     "electron:dev": "npm run build && npm run build:server && electron .",
-    "build:exe": "npm run build && npm run build:server && electron-builder --win nsis --x64 --publish never && node scripts/package-release-zip.mjs",
-    "dist": "npm run build && npm run build:server && electron-builder --win nsis --x64 --publish never && node scripts/package-release-zip.mjs",
+    "electron:build": "npm run build && npm run build:server && electron-builder --win nsis --x64 --publish never && node scripts/package-release-zip.mjs",
+    "build:exe": "npm run tauri:build",
+    "dist": "npm run tauri:build",
     "start": "node server.ts",
     "lint": "tsc --noEmit"
   },
@@ -25,12 +28,12 @@
     },
     "files": [
       "dist/**/*",
+      "!dist/assets/aistudio/**/*",
       "dist-server/**/*",
       "electron/**/*",
       "package.json"
     ],
     "asarUnpack": [
-      "dist/**/*",
       "dist-server/**/*",
       "electron/**/*"
     ],

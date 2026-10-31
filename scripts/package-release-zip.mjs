@@ -8,72 +8,94 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 const releaseDir = path.join(rootDir, 'release');
 
-console.log('Memeriksa output build di folder release...');
-
 if (!fs.existsSync(releaseDir)) {
-  console.error(`Error: Folder release (${releaseDir}) tidak ditemukan.`);
+  fs.mkdirSync(releaseDir, { recursive: true });
+}
+
+// 1. Check Tauri 2.0 release build outputs first
+const tauriReleaseDir = path.join(rootDir, 'src-tauri', 'target', 'release');
+const tauriNsisDir = path.join(tauriReleaseDir, 'bundle', 'nsis');
+const tauriStandaloneExe = path.join(tauriReleaseDir, 'winisle.exe');
+
+const finalSetupExe = path.join(releaseDir, 'WinIsleSetup.exe');
+const finalStandaloneExe = path.join(releaseDir, 'winisle.exe');
+const finalPortableZip = path.join(releaseDir, 'WinIsle-portable.zip');
+
+// Locate Tauri NSIS Setup installer (*.exe in src-tauri/target/release/bundle/nsis)
+if (fs.existsSync(tauriNsisDir)) {
+  const nsisFiles = fs
+    .readdirSync(tauriNsisDir)
+    .filter((f) => f.toLowerCase().endsWith('.exe'));
+  if (nsisFiles.length > 0) {
+    const srcInstaller = path.join(tauriNsisDir, nsisFiles[0]);
+    fs.copyFileSync(srcInstaller, finalSetupExe);
+    console.log(`Menyalin Tauri NSIS Installer: ${nsisFiles[0]} -> release/WinIsleSetup.exe`);
+  }
+}
+
+// Locate Tauri standalone portable binary (src-tauri/target/release/winisle.exe)
+if (fs.existsSync(tauriStandaloneExe)) {
+  fs.copyFileSync(tauriStandaloneExe, finalStandaloneExe);
+  console.log(`Menyalin Tauri Standalone Binary -> release/winisle.exe`);
+  if (!fs.existsSync(finalSetupExe)) {
+    fs.copyFileSync(tauriStandaloneExe, finalSetupExe);
+  }
+}
+
+// Fallback if built with Electron or existing .exe in release/
+if (!fs.existsSync(finalSetupExe)) {
+  const existingExe = fs
+    .readdirSync(releaseDir)
+    .find(
+      (f) =>
+        f.toLowerCase().endsWith('.exe') &&
+        !f.toLowerCase().includes('uninstall') &&
+        !f.toLowerCase().startsWith('builder-')
+    );
+  if (existingExe) {
+    const src = path.join(releaseDir, existingExe);
+    if (src !== finalSetupExe) {
+      fs.copyFileSync(src, finalSetupExe);
+    }
+    if (!fs.existsSync(finalStandaloneExe)) {
+      fs.copyFileSync(finalSetupExe, finalStandaloneExe);
+    }
+  }
+}
+
+if (!fs.existsSync(finalSetupExe) && !fs.existsSync(finalStandaloneExe)) {
+  console.error('Error: Tidak ditemukan file .exe hasil build di src-tauri/target/release maupun release/.');
   process.exit(1);
 }
 
-const files = fs.readdirSync(releaseDir);
-console.log('Isi folder release:', files);
-
-// Cari installer .exe utama (abaikan folder dan file blockmap)
-let targetExe = files.find((f) => f.toLowerCase() === 'winislesetup.exe');
-
-if (!targetExe) {
-  // Cari file .exe apa pun di release (misal: WinIsle Setup 1.0.0.exe)
-  targetExe = files.find(
-    (f) =>
-      f.toLowerCase().endsWith('.exe') &&
-      !f.toLowerCase().includes('uninstall') &&
-      !f.toLowerCase().startsWith('builder-')
-  );
+if (fs.existsSync(finalPortableZip)) {
+  fs.unlinkSync(finalPortableZip);
 }
 
-if (!targetExe) {
-  console.error('Error: Tidak ditemukan file installer .exe di dalam folder release.');
-  process.exit(1);
-}
-
-const targetExePath = path.join(releaseDir, targetExe);
-const finalExePath = path.join(releaseDir, 'WinIsleSetup.exe');
-const finalZipPath = path.join(releaseDir, 'WinIsleSetup.zip');
-
-// Jika nama filenya berbeda, copy/rename ke WinIsleSetup.exe
-if (targetExe !== 'WinIsleSetup.exe') {
-  console.log(`Menyalin ${targetExe} -> WinIsleSetup.exe...`);
-  fs.copyFileSync(targetExePath, finalExePath);
-}
-
-if (fs.existsSync(finalZipPath)) {
-  fs.unlinkSync(finalZipPath);
-}
-
-console.log(`Mengompres WinIsleSetup.exe ke WinIsleSetup.zip...`);
+const targetToZip = fs.existsSync(finalStandaloneExe) ? finalStandaloneExe : finalSetupExe;
+console.log(`Mengompres paket portable ke release/WinIsle-portable.zip...`);
 
 try {
   if (process.platform === 'win32') {
     execSync(
-      `powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '${finalExePath}' -DestinationPath '${finalZipPath}' -Force"`,
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '${targetToZip}' -DestinationPath '${finalPortableZip}' -Force"`,
       { stdio: 'inherit' }
     );
   } else {
-    execSync(`zip -j "${finalZipPath}" "${finalExePath}"`, { stdio: 'inherit' });
+    execSync(`zip -j "${finalPortableZip}" "${targetToZip}"`, { stdio: 'inherit' });
   }
+} catch {
+  const fileName = path.basename(targetToZip);
+  execSync(`tar -a -c -f "${finalPortableZip}" -C "${releaseDir}" "${fileName}"`, {
+    stdio: 'inherit',
+  });
+}
 
-  console.log(`SUKSES! Installer siap didownload dan dirilis:`);
-  console.log(`  -> release/WinIsleSetup.exe`);
-  console.log(`  -> release/WinIsleSetup.zip`);
-} catch (err) {
-  console.error('Gagal mengompres ZIP dengan command native, mencoba fallback node:', err);
-  // Fallback jika powershell Compress-Archive terkendala
-  try {
-    const tarCmd = `tar -a -c -f "${finalZipPath}" -C "${releaseDir}" "WinIsleSetup.exe"`;
-    execSync(tarCmd, { stdio: 'inherit' });
-    console.log(`SUKSES via fallback tar: release/WinIsleSetup.zip berhasil dibuat.`);
-  } catch (tarErr) {
-    console.error('Gagal membuat ZIP:', tarErr);
-    process.exit(1);
+for (const f of ['WinIsleSetup.exe', 'winisle.exe', 'WinIsle-portable.zip']) {
+  const p = path.join(releaseDir, f);
+  if (fs.existsSync(p)) {
+    const sizeMb = (fs.statSync(p).size / (1024 * 1024)).toFixed(2);
+    console.log(`  [READY] release/${f} (${sizeMb} MB)`);
   }
 }
+
