@@ -525,7 +525,7 @@ export default function App() {
   const [nudgeCount, setNudgeCount] = useState(0);
   const hoverLeaveTimerRef = useRef<number | null>(null);
 
-  // ── Mini Capsule Auto-Hide Mode (Alt + H: Auto-hides to top edge so Chrome tabs are never blocked, reveals on top-edge hover) ──
+  // ── Mini Capsule Auto-Hide Mode (Alt + H: Shrinks to 2px click-through top lip so middle Chrome tabs are 100% clickable) ──
   const [miniCapsuleMode, setMiniCapsuleMode] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem('isle_mini_capsule_mode') === 'true';
@@ -534,6 +534,7 @@ export default function App() {
     }
   });
   const [topEdgeHover, setTopEdgeHover] = useState<boolean>(false);
+  const lastMiniCapsuleToggleRef = useRef<number>(0);
 
   useEffect(() => {
     try {
@@ -541,24 +542,12 @@ export default function App() {
     } catch {
       // ignore
     }
-  }, [miniCapsuleMode]);
-
-  useEffect(() => {
-    if (!miniCapsuleMode) {
+    if (miniCapsuleMode) {
       setTopEdgeHover(false);
-      return;
+      (window as any).electronAPI?.setInteractiveLock?.(false);
+      (window as any).electronAPI?.setIgnoreMouseEvents?.(true, { forward: true });
     }
-    const onMove = (e: MouseEvent) => {
-      const centerDist = Math.abs(e.clientX - window.innerWidth / 2);
-      if (e.clientY <= 6 && centerDist <= 260) {
-        setTopEdgeHover(true);
-      } else if (e.clientY > 44 && !isHovered && !isPinnedOpen && !assistantOpen) {
-        setTopEdgeHover(false);
-      }
-    };
-    window.addEventListener('mousemove', onMove, { passive: true });
-    return () => window.removeEventListener('mousemove', onMove);
-  }, [miniCapsuleMode, isHovered, isPinnedOpen, assistantOpen]);
+  }, [miniCapsuleMode]);
 
   // ── Bynara Router AI Key State & Model Preferences ──
   const HARDCODED_GEMINI_KEY = 'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
@@ -629,16 +618,20 @@ export default function App() {
       rafId = window.requestAnimationFrame(() => {
         rafId = 0;
         const surface = document.getElementById('dynamic-island-surface');
-        if (!surface) {
+        if (!surface || surface.classList.contains('pointer-events-none')) {
           setDesktopClickThrough(true);
           return;
         }
         const rect = surface.getBoundingClientRect();
+        if (rect.height <= 6) {
+          setDesktopClickThrough(true);
+          return;
+        }
         const insideBounds =
-          clientX >= rect.left - 4 &&
-          clientX <= rect.right + 4 &&
-          clientY >= Math.max(0, rect.top - 2) &&
-          clientY <= rect.bottom + 6;
+          clientX >= rect.left &&
+          clientX <= rect.right &&
+          clientY >= Math.max(0, rect.top) &&
+          clientY <= rect.bottom;
 
         setDesktopClickThrough(!insideBounds);
       });
@@ -649,7 +642,7 @@ export default function App() {
       if (rafId) window.cancelAnimationFrame(rafId);
       window.removeEventListener('mousemove', handleGlobalMouseMove);
     };
-  }, [setDesktopClickThrough]);
+  }, [setDesktopClickThrough, miniCapsuleMode, assistantOpen]);
 
   useEffect(() => {
     if (assistantOpen && assistantMode === 'conversation') {
@@ -979,7 +972,8 @@ export default function App() {
   const [lyricsMode, setLyricsMode] = useState(false);
   const activePage = ISLAND_PAGES[pageIndex].id;
   const isExpanded =
-    (isHovered || isPinnedOpen || dragAutoOpened || isDragOver || assistantOpen || lyricsMode) &&
+    ((!miniCapsuleMode && (isHovered || isPinnedOpen || dragAutoOpened || isDragOver || lyricsMode)) ||
+      assistantOpen) &&
     !activeAlert;
 
   // Trigger lightweight native memory trimming whenever the island collapses back to compact notch
@@ -4728,6 +4722,9 @@ export default function App() {
         e.preventDefault();
         e.stopPropagation();
         if (e.repeat) return;
+        const nowToggle = Date.now();
+        if (nowToggle - lastMiniCapsuleToggleRef.current < 250) return;
+        lastMiniCapsuleToggleRef.current = nowToggle;
         if (alertTimerRef.current) {
           window.clearTimeout(alertTimerRef.current);
           alertTimerRef.current = null;
@@ -4743,6 +4740,7 @@ export default function App() {
             setLyricsMode(false);
             setSettingsOpen(false);
             setTopEdgeHover(false);
+            setDesktopClickThrough(true);
           }
           return next;
         });
@@ -4939,6 +4937,9 @@ export default function App() {
     });
 
     const unsubscribeMiniCapsuleShortcut = window.electronAPI?.onToggleMiniCapsule?.(() => {
+      const nowToggle = Date.now();
+      if (nowToggle - lastMiniCapsuleToggleRef.current < 250) return;
+      lastMiniCapsuleToggleRef.current = nowToggle;
       if (alertTimerRef.current) {
         window.clearTimeout(alertTimerRef.current);
         alertTimerRef.current = null;
@@ -6894,12 +6895,17 @@ export default function App() {
           radius={targetR}
           shoulder={targetS}
           topInset={0}
+          hidden={miniCapsuleMode && !assistantOpen && !activeAlert}
           tintStyle={tintStyle}
           tintRgb={tintRgb}
           auraColors={botPalette.glow}
           voiceLevelRef={voiceEnergyRef}
           nudgeTrigger={nudgeCount}
           onMouseEnter={() => {
+            if (miniCapsuleMode && !assistantOpen && !activeAlert) {
+              setDesktopClickThrough(true);
+              return;
+            }
             if (hoverLeaveTimerRef.current !== null) {
               window.clearTimeout(hoverLeaveTimerRef.current);
               hoverLeaveTimerRef.current = null;
@@ -6915,9 +6921,11 @@ export default function App() {
             if (hoverLeaveTimerRef.current !== null) {
               window.clearTimeout(hoverLeaveTimerRef.current);
             }
+            // Immediately re-enable click-through the instant the cursor leaves the island surface
+            // so clicking Chrome tabs right after leaving the island never steals focus
+            setDesktopClickThrough(true);
             hoverLeaveTimerRef.current = window.setTimeout(() => {
               hoverLeaveTimerRef.current = null;
-              setDesktopClickThrough(true);
               if (activeAlert) {
                 setAlertHovered(false);
               } else {

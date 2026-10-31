@@ -10,6 +10,7 @@ export interface IslandRect {
   y?: number;
   width?: number;
   height?: number;
+  hidden?: boolean;
 }
 
 export interface VolumePayload {

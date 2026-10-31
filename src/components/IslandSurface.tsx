@@ -27,6 +27,7 @@ export interface IslandSurfaceProps {
   radius: number;
   shoulder: number;
   topInset: number;
+  hidden?: boolean;
   tintStyle?: 'none' | 'wash' | 'glow' | 'aura';
   tintRgb?: [number, number, number];
   auraColors?: [number, number, number][];
@@ -46,6 +47,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   radius,
   shoulder,
   topInset,
+  hidden = false,
   tintStyle = 'none',
   tintRgb = [0.2, 0.5, 0.95],
   auraColors = [
@@ -160,27 +162,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         const nr = Math.ceil(curR);
         const ns = Math.ceil(curS);
         if (prev.w === nw && prev.h === nh && prev.r === nr && prev.s === ns) return prev;
-        if (typeof window !== 'undefined') {
-          const winAny = window as any;
-          const totalW = nw + 2 * ns;
-          winAny.__WINISLE_ISLAND_BOUNDS__ = { w: totalW, h: nh };
-          const winW = window.innerWidth || 740;
-          const left = Math.max(0, Math.round((winW - totalW) / 2));
-          const top = 0;
-          const right = left + totalW;
-          const bottom = nh;
-
-          updateIslandBounds({
-            left,
-            top,
-            right,
-            bottom,
-            x: left,
-            y: top,
-            width: totalW,
-            height: nh,
-          }).catch(() => {});
-        }
         return { w: nw, h: nh, r: nr, s: ns };
       });
 
@@ -385,19 +366,48 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, [topInset, tintStyle, auraColors, voiceLevelRef]);
 
+  const isMiniHidden = Boolean(hidden || dims.h <= 6 || height <= 6);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const winAny = window as any;
+    const totalW = dims.w + 2 * dims.s;
+    const nh = dims.h;
+    winAny.__WINISLE_ISLAND_BOUNDS__ = { w: totalW, h: nh, hidden: isMiniHidden };
+    const winW = window.innerWidth || 740;
+    const left = Math.max(0, Math.round((winW - totalW) / 2));
+    const top = 0;
+    const right = left + totalW;
+    const bottom = nh;
+
+    updateIslandBounds({
+      left,
+      top,
+      right,
+      bottom,
+      x: left,
+      y: top,
+      width: totalW,
+      height: nh,
+      hidden: isMiniHidden,
+    }).catch(() => {});
+  }, [dims.w, dims.h, dims.s, isMiniHidden]);
+
   return (
     <div
       id="dynamic-island-surface"
       data-island-surface="true"
-      className="relative flex flex-col items-center select-none pointer-events-auto"
+      className={`relative flex flex-col items-center select-none ${
+        isMiniHidden ? 'pointer-events-none' : 'pointer-events-auto'
+      }`}
       style={{
         width: `${dims.w + 2 * dims.s}px`,
         height: `${dims.h}px`,
       }}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
-      onClick={onClick}
-      onContextMenu={onContextMenu}
+      onMouseEnter={isMiniHidden ? undefined : onMouseEnter}
+      onMouseLeave={isMiniHidden ? undefined : onMouseLeave}
+      onClick={isMiniHidden ? undefined : onClick}
+      onContextMenu={isMiniHidden ? undefined : onContextMenu}
     >
       <canvas
         ref={canvasRef}

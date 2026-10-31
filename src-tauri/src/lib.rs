@@ -21,11 +21,11 @@ pub mod window_decorations {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, DefWindowProcW, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos,
-        GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HTTRANSPARENT, STYLESTRUCT, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WNDPROC, WS_BORDER, WS_CAPTION, WS_DLGFRAME,
-        WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-        WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE, WM_NCCALCSIZE, WM_NCPAINT, WM_NCACTIVATE,
-        WM_STYLECHANGING, WM_NCHITTEST,
+        GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HTTRANSPARENT, MA_NOACTIVATEANDEAT, STYLESTRUCT,
+        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_MOUSEACTIVATE, WM_NCACTIVATE,
+        WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_STYLECHANGING, WNDPROC, WS_BORDER, WS_CAPTION,
+        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+        WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
     };
 
     #[repr(C)]
@@ -82,6 +82,12 @@ pub mod window_decorations {
             // Non-client activation: prevent active/inactive frame repainting
             WM_NCACTIVATE => {
                 return LRESULT(1);
+            }
+            // Prevent stealing foreground focus from Chrome when click-through is active
+            WM_MOUSEACTIVATE => {
+                if IS_IGNORING_MOUSE.load(Ordering::Relaxed) {
+                    return LRESULT(MA_NOACTIVATEANDEAT as isize);
+                }
             }
             // Dynamic hit-testing: pass mouse events through when cursor is outside the dynamic island
             WM_NCHITTEST => {

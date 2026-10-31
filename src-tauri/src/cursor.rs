@@ -22,6 +22,8 @@ pub struct IslandRect {
     pub width: i32,
     #[serde(default)]
     pub height: i32,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl IslandRect {
@@ -47,6 +49,14 @@ impl IslandRect {
             top + self.height
         };
         (left, top, right, bottom)
+    }
+
+    pub fn is_mini_or_hidden(&self) -> bool {
+        if self.hidden {
+            return true;
+        }
+        let (_l, t, _r, b) = self.normalized_bounds();
+        b > t && (b - t) <= 6
     }
 }
 
@@ -117,6 +127,24 @@ pub fn spawn_cursor_monitor(app_handle: AppHandle, state: Arc<CursorMonitorState
             let mut pt = POINT::default();
             let mut last_auto_compact = std::time::Instant::now();
             loop {
+                let is_mini_hidden = {
+                    let bounds = state.active_bounds.lock().unwrap();
+                    bounds.is_mini_or_hidden()
+                };
+
+                // When hidden via Alt+H (Mini Capsule Mode), ALWAYS keep 100% click-through enabled
+                // so middle Chrome tabs never lose focus or fail to click
+                if is_mini_hidden && !state.is_locked_interactive.load(Ordering::Relaxed) {
+                    if !state.currently_ignoring.load(Ordering::Relaxed) {
+                        if let Some(win) = app_handle.get_webview_window("main") {
+                            crate::window_decorations::set_click_through(&win, true);
+                            state.currently_ignoring.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    continue;
+                }
+
                 // If interactive lock is active (e.g. Isle Assistant or modal open)
                 if state.is_locked_interactive.load(Ordering::Relaxed) {
                     if state.currently_ignoring.load(Ordering::Relaxed) {
@@ -177,16 +205,12 @@ pub fn spawn_cursor_monitor(app_handle: AppHandle, state: Arc<CursorMonitorState
                     continue;
                 }
 
-                // Hit test with DPI-scaled safety margins: left-28, right+28, top-6, bottom+24
-                let margin_left = (28.0 * scale).round() as i32;
-                let margin_right = (28.0 * scale).round() as i32;
-                let margin_top = (6.0 * scale).round() as i32;
-                let margin_bottom = (24.0 * scale).round() as i32;
-
-                let is_inside = pt.x >= (screen_left - margin_left)
-                    && pt.x <= (screen_right + margin_right)
-                    && pt.y >= (screen_top - margin_top)
-                    && pt.y <= (screen_bottom + margin_bottom);
+                // Exact pixel hit test matching the visible Dynamic Island pill (0px outer margin
+                // so transparent areas around the pill never intercept Chrome tab clicks or steal focus)
+                let is_inside = pt.x >= screen_left
+                    && pt.x <= screen_right
+                    && pt.y >= screen_top
+                    && pt.y <= screen_bottom;
 
                 // Tab bar top-zone auto-compact detection:
                 // Only trigger auto-compact if cursor is distinctly far outside the island (at least 60px past island boundaries)
@@ -222,9 +246,17 @@ pub fn spawn_cursor_monitor(app_handle: AppHandle, state: Arc<CursorMonitorState
 pub fn update_island_bounds(
     rect: IslandRect,
     state: State<'_, Arc<CursorMonitorState>>,
+    window: WebviewWindow,
 ) -> Result<(), String> {
-    let mut bounds = state.active_bounds.lock().map_err(|e| e.to_string())?;
-    *bounds = rect;
+    let is_mini = rect.is_mini_or_hidden();
+    {
+        let mut bounds = state.active_bounds.lock().map_err(|e| e.to_string())?;
+        *bounds = rect;
+    }
+    if is_mini && !state.is_locked_interactive.load(Ordering::Relaxed) {
+        crate::window_decorations::set_click_through(&window, true);
+        state.currently_ignoring.store(true, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -238,6 +270,16 @@ pub fn set_interactive_lock(
     if locked {
         crate::window_decorations::set_click_through(&window, false);
         state.currently_ignoring.store(false, Ordering::Relaxed);
+    } else {
+        let is_mini = state
+            .active_bounds
+            .lock()
+            .map(|b| b.is_mini_or_hidden())
+            .unwrap_or(false);
+        if is_mini {
+            crate::window_decorations::set_click_through(&window, true);
+            state.currently_ignoring.store(true, Ordering::Relaxed);
+        }
     }
     Ok(())
 }
