@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { updateIslandBounds } from '../core/tauri-bridge';
 
 interface SpringState {
   value: number;

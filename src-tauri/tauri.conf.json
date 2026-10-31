@@ -1,16 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "WinIsle",
-  "version": "1.2.5",
+  "version": "1.1.0",
   "identifier": "com.isle.dynamicisland",
   "build": {
     "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:3000",
-    "beforeBuildCommand": "npm run build && node scripts/generate-tray-icon.mjs",
     "frontendDist": "../dist"
   },
   "app": {
-    "macOSPrivateApi": true,
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -18,15 +18,16 @@
         "width": 740,
         "height": 340,
         "resizable": false,
-        "maximizable": false,
-        "minimizable": false,
         "fullscreen": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": false,
-        "visible": true
+        "visible": false,
+        "center": false,
+        "x": 0,
+        "y": 0
       }
     ],
     "security": {
@@ -39,18 +40,7 @@
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
-      "icons/128x128@2x.png",
       "icons/icon.ico"
-    ],
-    "windows": {
-      "webviewInstallMode": {
-        "type": "downloadBootstrapper"
-      },
-      "nsis": {
-        "installMode": "currentUser",
-        "installerIcon": "icons/icon.ico",
-        "displayLanguageSelector": false
-      }
-    }
+    ]
   }
 }

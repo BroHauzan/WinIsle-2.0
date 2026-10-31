@@ -1,19 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for WinIsle Dynamic Island Tauri 2.0 overlay",
-  "windows": ["main"],
+  "description": "Default capability for WinIsle Dynamic Island overlay",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
+    "core:event:default",
+    "core:window:default",
     "core:window:allow-set-ignore-cursor-events",
     "core:window:allow-show",
     "core:window:allow-hide",
     "core:window:allow-set-focus",
-    "core:window:allow-set-position",
-    "core:window:allow-set-size",
-    "core:window:allow-set-always-on-top",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
-    "global-shortcut:allow-is-registered"
+    "core:app:default"
   ]
 }
