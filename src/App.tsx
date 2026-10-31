@@ -3667,9 +3667,13 @@ export default function App() {
 
   useEffect(() => {
     if (assistantMode === 'conversation' && chatScrollRef.current) {
-      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+      if (showAllChatHistory || animatingMsgId !== null) {
+        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+      } else {
+        chatScrollRef.current.scrollTop = 0;
+      }
     }
-  }, [messages, assistantLoading, assistantMode, assistantOpen, showAllChatHistory, revealedChars]);
+  }, [messages, assistantLoading, assistantMode, assistantOpen, showAllChatHistory, revealedChars, animatingMsgId]);
 
   // Stop Gemini Live WebSocket, 16kHz mic capture, 24kHz audio playback, & Web Speech API cleanly
   const stopVoiceRecognition = useCallback(() => {
@@ -7676,10 +7680,10 @@ export default function App() {
                   {/* Main Response Area */}
                   <div
                     ref={chatScrollRef}
-                    className="flex-1 overflow-y-auto no-scrollbar pr-0.5 my-1 flex flex-col justify-center"
+                    className="flex-1 min-h-0 overflow-y-auto no-scrollbar pr-0.5 my-1 flex flex-col"
                   >
                     {assistantLoading ? (
-                      <div className="flex items-center gap-2.5 py-1 pl-0.5 animate-[ isleFadeIn_180ms_ease-out ]">
+                      <div className="my-auto flex items-center gap-2.5 py-1 pl-0.5 animate-[ isleFadeIn_180ms_ease-out ]">
                         <div className="shrink-0">
                           <BotCanvas
                             size={18}
@@ -7693,13 +7697,13 @@ export default function App() {
                           label={
                             agentHeadline ||
                             (assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                              ? 'Agnes 3.0 Flash memproses...'
-                              : 'Muse Spark Thinking...')
+                              ? 'Agnes sedang merespons...'
+                              : 'Muse Spark sedang berpikir...')
                           }
                         />
                       </div>
                     ) : showAllChatHistory ? (
-                      <div className="space-y-2 py-0.5">
+                      <div className="my-auto space-y-2 py-0.5">
                         {messages
                           .filter((m) => m.role === 'assistant')
                           .map((m) => (
@@ -7731,7 +7735,7 @@ export default function App() {
                     ) : latestAssistantMessage ? (
                       <div
                         key={latestAssistantMessage.id}
-                        className="flex flex-col gap-1 animate-[ isleFadeIn_240ms_ease-out ]"
+                        className="my-auto flex flex-col gap-1 py-0.5 animate-[ isleFadeIn_240ms_ease-out ]"
                       >
                         <div className="flex items-start gap-2">
                           <div className="shrink-0 mt-0.5">
@@ -7867,7 +7871,7 @@ export default function App() {
                           )}
                       </div>
                     ) : (
-                      <div className="flex items-center gap-2 py-1 pl-1 animate-[isleFadeIn_180ms_ease-out]">
+                      <div className="my-auto flex items-center gap-2 py-1 pl-1 animate-[isleFadeIn_180ms_ease-out]">
                         <div className="shrink-0">
                           <BotCanvas
                             size={16}
@@ -7878,7 +7882,7 @@ export default function App() {
                           />
                         </div>
                         <div className="text-[11.5px] text-white/85 font-normal select-none">
-                          Halo! Ada yang bisa aku bantu di Windows hari ini?
+                          Halo, lagi mau ngobrol santai atau minta aku aturin sesuatu di laptop kamu?
                         </div>
                       </div>
                     )}
@@ -7995,10 +7999,10 @@ export default function App() {
                           voiceListening
                             ? 'Listening...'
                             : pendingImage
-                            ? 'Tanyakan sesuatu tentang gambar ini...'
-                            : assistantModel === 'gemini-3.1-flash-lite'
-                            ? 'Tanya cepat dengan Gemini 3.1 Flash Lite... (Enter)'
-                            : 'Tanya mendalam dengan Muse Spark Thinking... (Enter)'
+                            ? 'tanya apa aja tentang gambar ini yaa...'
+                            : assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
+                            ? 'ngobrol santai sama agnes flash... (Enter)'
+                            : 'ngobrol mendalam sama muse spark... (Enter)'
                         }
                         className="flex-1 bg-transparent text-[11.5px] text-white placeholder-white/35 focus:outline-none min-w-0"
                       />

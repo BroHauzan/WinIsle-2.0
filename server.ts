@@ -2668,17 +2668,25 @@ app.post('/api/gemini/assistant', async (req, res) => {
     ? Promise.resolve({ snippets: [] as string[], sources: [] as { title: string; uri: string }[] })
     : fetchLiveWebSearchData(prompt);
 
-  const systemPrompt = `You are the live Multimodal AI Assistant & Windows PC Controller inside Isle (Windows Dynamic Island overlay).
-Answer the user's question accurately, concisely, and conversationally in the same language they used (Indonesian or English).
+  const systemPrompt = `You are the live Multimodal AI Companion & Windows PC Controller inside Isle (Windows Dynamic Island overlay).
+Follow this natural Indonesian conversational companion style ("conversational-companion-id") in all replies:
 
-FORMATTING RULES:
-- Do NOT output raw markdown hashes like '###' or '##'. Write clean subtitles or paragraphs without hashes.
-- Do NOT wrap your whole response in quotation marks ("").
-- Avoid excessive asterisks (**) or raw markdown symbols. Speak naturally and elegantly so it looks clean inside the compact Dynamic Island.
-- If giving steps or tips, use clean bullet points (- Item) with line breaks.
+1. GAYA BAHASA & PENULISAN (NATURAL & RAPI):
+- Huruf Kapital Wajar: Gunakan huruf kapital dengan benar pada awal kalimat dan pada kata-kata yang memang memerlukan huruf kapital (nama orang, tempat, brand, judul lagu, aplikasi, atau istilah khusus). Jangan gunakan huruf kecil semua.
+- Ringkas & Mengalir: Jawab dengan ringkas, padat, dan langsung ke inti (1 sampai 3 kalimat pendek untuk obrolan biasa). Jangan membuat paragraf bertele-tele atau poin-poin kaku jika tidak diminta.
+- Tanpa Format Berlebihan: Hindari penggunaan tanda seru (!) yang berlebihan dan jangan membungkus seluruh jawaban dengan tanda kutip ("").
 
-If an image or screenshot is attached, carefully read, inspect, and analyze the visual content (text, UI elements, songs, code, errors, or objects) to directly answer the user's request.
-You CAN directly control the user's laptop & all Dynamic Island menus! Whenever the user asks to perform an action, append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
+2. SAPAAN & KEPRIBADIAN TEMAN NGOBROL:
+- Panggilan: Gunakan kata ganti "aku" dan "kamu" secara konsisten (jangan gunakan saya/Anda).
+- Karakter: Teman ngobrol yang asik, hangat, cerdas, santai, dan nyambung dengan konteks pembicaraan.
+- Anti-Kaku & Anti-Lebay:
+  - DILARANG memaksakan partikel atau huruf panjang di akhir kalimat seperti "donggg", "iyaaa", "nihh", "tuhh", atau "hehehe" yang tidak nyambung dengan konteks kalimat.
+  - Gunakan kosakata santai sehari-hari yang wajar (seperti "nggak", "udah", "lagi", "bikin", "gimana", "kenapa") secara natural tanpa dibuat-buat.
+  - Jangan membuka dengan template robot "Halo! Ada yang bisa aku bantu?" dan jangan menutup dengan "Ada lagi yang bisa kubantu?".
+
+3. KENDALI LAPTOP & DYNAMIC ISLAND ACTION TAG:
+If an image or screenshot is attached, carefully read, inspect, and analyze the visual content to directly answer the user's request in the companion style above.
+You CAN directly control the user's laptop & all Dynamic Island menus. Whenever the user asks to perform an action, append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
 Valid action_name values:
 - add_todo|task_title|HH:mm (add a scheduled task to the Dynamic Island Tasks menu with 24h time like [ACTION:add_todo|Olahraga Pagi|05:00] or [ACTION:add_todo|Belajar|20:00])
 - set_timer|minutes (set and start a countdown timer / Pomodoro in minutes, e.g., [ACTION:set_timer|15])
@@ -2753,7 +2761,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
       ];
       for (const m of rawHistory.slice(-6)) {
         const text = sanitizeText(m?.text, 300);
-        if (!text || text.includes('Maaf, gagal memproses respon AI')) continue;
+        if (!text || text.includes('maaf') || text.includes('gagal memproses')) continue;
         bynaraMessages.push({
           role: m?.role === 'assistant' ? 'assistant' : 'user',
           content: text,
@@ -2785,16 +2793,19 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
             model: 'muse-spark-1.3-contributor',
             messages: bynaraMessages,
             temperature: 0.7,
-            max_tokens: 800,
+            max_tokens: 3500,
           }),
         }),
-        15000,
+        18000,
         'bynara-muse-spark'
       );
 
       if (bynaraRes.ok) {
         const bynaraData: any = await bynaraRes.json();
-        const content = String(bynaraData?.choices?.[0]?.message?.content || '').trim();
+        const choice = bynaraData?.choices?.[0];
+        const content = String(
+          choice?.message?.content || choice?.message?.reasoning_content || ''
+        ).trim();
         if (content) {
           response = { text: content, candidates: [] };
           usedModel = 'muse-spark-1.3-contributor';
@@ -2818,7 +2829,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
     ];
     for (const m of rawHistory.slice(-6)) {
       const text = sanitizeText(m?.text, 300);
-      if (!text || text.includes('Maaf, gagal memproses respon AI')) continue;
+      if (!text || text.includes('maaf') || text.includes('gagal memproses')) continue;
       agnesMessages.push({
         role: m?.role === 'assistant' ? 'assistant' : 'user',
         content: text,
@@ -2852,8 +2863,8 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
             body: JSON.stringify({
               model: agnesModel,
               messages: agnesMessages,
-              temperature: 0.6,
-              max_tokens: 700,
+              temperature: 0.7,
+              max_tokens: 260,
             }),
           }),
           9000,
@@ -2884,7 +2895,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
     if (fallbackInferred.action && fallbackInferred.action !== 'none') {
       const paramLabel = fallbackInferred.actionParam ? ` (${fallbackInferred.actionParam.replace('|', ' · ')})` : '';
       response = {
-        text: `Siap, perintah telah dijalankan di Dynamic Island${paramLabel}. [ACTION:${fallbackInferred.action}${
+        text: `Oke, udah langsung aku jalanin di Dynamic Island kamu${paramLabel} [ACTION:${fallbackInferred.action}${
           fallbackInferred.actionParam ? `|${fallbackInferred.actionParam}` : ''
         }]`,
         candidates: [],
@@ -2904,9 +2915,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
       console.error('Model request failed:', usedModel, lastError?.message || lastError);
       return res.status(200).json({
         error: `Gagal merespons dari ${usedModel}.`,
-        reply: isThinkingModel
-          ? `Maaf, Muse Spark sedang tidak dapat merespons (${lastError?.message || 'Koneksi sibuk'}). Silakan coba lagi.`
-          : `Maaf, koneksi ke Agnes 3.0 Flash terkendala (${lastError?.message || 'Koneksi sibuk'}). Silakan coba lagi atau gunakan perintah langsung.`,
+        reply: `Koneksinya lagi agak sibuk, coba tanya lagi ke aku ya.`,
         action: 'none',
         needApiKey: false,
       });
@@ -2932,6 +2941,17 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
       replyText = maybeJson.reply;
       if (maybeJson.action) detectedAction = maybeJson.action;
       if (maybeJson.actionParam) detectedParam = maybeJson.actionParam;
+    }
+
+    // Clean up outer quotes and any hallucinated forced trailing particles while preserving proper capitalization
+    replyText = replyText
+      .replace(/^["'“”]+|["'“”]+$/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/[,\s]*(?:dong{2,}|iya{2,}|nih{2,}|tuh{2,}|nggak{2,})(?:[,\s]+(?:dong{2,}|iya{2,}|nih{2,}|tuh{2,}))*[.!?]*$/gi, '')
+      .trim();
+
+    if (replyText.length > 0) {
+      replyText = replyText.charAt(0).toUpperCase() + replyText.slice(1);
     }
 
     const inferred = inferIslandAction(prompt, detectedAction, detectedParam);

@@ -136,6 +136,33 @@ async function resolveTauriSong(
     // ignore
   }
 
+  let youtubeVideoId = '';
+  try {
+    const ytmRes = await origFetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        context: {
+          client: { clientName: 'WEB_REMIX', clientVersion: '1.20240717.01.00', hl: 'en', gl: 'ID' },
+        },
+        query: `${title} ${artist}`.trim(),
+        params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
+      }),
+    });
+    if (ytmRes.ok) {
+      const ytmData = await ytmRes.json();
+      const rawJson = JSON.stringify(ytmData);
+      const vidMatch = rawJson.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+      if (vidMatch && vidMatch[1]) {
+        youtubeVideoId = vidMatch[1];
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   return {
     title,
     artist,
@@ -143,7 +170,7 @@ async function resolveTauriSong(
     audioUrl: '',
     isFlac: useFlac,
     durationMs,
-    youtubeVideoId: '',
+    youtubeVideoId,
     lrc,
     syncType: 'LINE',
     provider,

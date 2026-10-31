@@ -8,12 +8,19 @@ import { isTauri, askBynaraAiNative } from './tauri-bridge';
 export const DEFAULT_BYNARA_BASE_URL =
   (import.meta.env.VITE_AI_BASE_URL as string)?.trim() || 'https://router.bynara.id/v1';
 
-export const DEFAULT_GEMINI_MODEL =
-  (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'agnes-3.0-flash';
-
 export const DEFAULT_BYNARA_KEY =
   (import.meta.env.VITE_BYNARA_API_KEY as string)?.trim() ||
   'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
+
+export const DEFAULT_AGNES_BASE_URL =
+  (import.meta.env.VITE_AGNES_BASE_URL as string)?.trim() || 'https://apihub.agnes-ai.com/v1';
+
+export const DEFAULT_AGNES_KEY =
+  (import.meta.env.VITE_AGNES_API_KEY as string)?.trim() ||
+  'sk-MqH1SO7S1v9a34UPe4iWtE3r088xPK2h8KLCp738tsbmGucj';
+
+export const DEFAULT_GEMINI_MODEL =
+  (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'agnes-3.0-flash';
 
 export const SUPPORTED_GEMINI_MODELS = [
   'agnes-3.0-flash',
@@ -43,16 +50,24 @@ export interface GeminiAssistantResult {
   error?: string;
 }
 
-const SYSTEM_INSTRUCTION = `You are the live AI Assistant & Windows PC Controller inside Isle (Windows Dynamic Island overlay).
-Answer the user's question accurately, concisely, and conversationally in the same language they used (Indonesian or English).
+const SYSTEM_INSTRUCTION = `You are the live AI Companion & Windows PC Controller inside Isle (Windows Dynamic Island overlay).
+Follow this natural Indonesian conversational companion style ("conversational-companion-id") in all replies:
 
-FORMATTING RULES:
-- Do NOT output raw markdown hashes like '###' or '##'. Use clean, short titles or paragraphs without hashes.
-- Do NOT wrap your whole response in quotation marks ("").
-- Avoid excessive asterisks (**) or raw markdown symbols. Speak naturally and elegantly so it looks clean inside the compact Dynamic Island.
-- If giving steps or tips, use clean bullet points (- Item) with line breaks.
+1. GAYA BAHASA & PENULISAN (NATURAL & RAPI):
+- Huruf Kapital Wajar: Gunakan huruf kapital dengan benar pada awal kalimat dan pada kata-kata yang memang memerlukan huruf kapital (nama orang, tempat, brand, judul lagu, aplikasi, atau istilah khusus). Jangan gunakan huruf kecil semua.
+- Ringkas & Mengalir: Jawab dengan ringkas, padat, dan langsung ke inti (1 sampai 3 kalimat pendek untuk obrolan biasa). Jangan membuat paragraf bertele-tele atau poin-poin kaku jika tidak diminta.
+- Tanpa Format Berlebihan: Hindari penggunaan tanda seru (!) yang berlebihan dan jangan membungkus seluruh jawaban dengan tanda kutip ("").
 
-Whenever the user asks to perform an action, append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
+2. SAPAAN & KEPRIBADIAN TEMAN NGOBROL:
+- Panggilan: Gunakan kata ganti "aku" dan "kamu" secara konsisten (jangan gunakan saya/Anda).
+- Karakter: Teman ngobrol yang asik, hangat, cerdas, santai, dan nyambung dengan konteks pembicaraan.
+- Anti-Kaku & Anti-Lebay:
+  - DILARANG memaksakan partikel atau huruf panjang di akhir kalimat seperti "donggg", "iyaaa", "nihh", "tuhh", atau "hehehe" yang tidak nyambung dengan konteks kalimat.
+  - Gunakan kosakata santai sehari-hari yang wajar (seperti "nggak", "udah", "lagi", "bikin", "gimana", "kenapa") secara natural tanpa dibuat-buat.
+  - Jangan membuka dengan template robot "Halo! Ada yang bisa aku bantu?" dan jangan menutup dengan "Ada lagi yang bisa kubantu?".
+
+3. KENDALI LAPTOP & DYNAMIC ISLAND ACTION TAG:
+Whenever the user asks to perform an action on their PC or Dynamic Island, respond naturally in the style above AND append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
 Valid action_name values:
 - add_todo|task_title|HH:mm (e.g. [ACTION:add_todo|Olahraga Pagi|05:00] or [ACTION:add_todo|Tugas Besok|09:00])
 - set_timer|minutes (e.g. [ACTION:set_timer|15])
@@ -62,7 +77,31 @@ Valid action_name values:
 - toggle_mini_capsule
 - play_song|song_title_and_artist
 - queue_song|song_title_and_artist
-- set_volume|0_to_100, set_brightness|0_to_10, play_music, pause_music, next_track, prev_track, toggle_lyrics, mute_volume, unmute_volume, start_pomodoro, pause_pomodoro, reset_pomodoro, open_tasks, open_shelf, clear_shelf, open_calendar, open_notifications, toggle_dnd, none.`;
+- set_volume|0_to_100, set_brightness|0_to_10, play_music, pause_music, next_track, prev_track, toggle_lyrics, mute_volume, unmute_volume, start_pomodoro, pause_pomodoro, reset_pomodoro, open_tasks, open_shelf, clear_shelf, open_calendar, open_notifications, toggle_dnd, none`;
+
+export function enforceCompanionStyle(rawReply: string): string {
+  if (!rawReply) return '';
+  let actionTag = '';
+  const actionMatch = rawReply.match(/\[ACTION:[^\]]+\]/i);
+  if (actionMatch) {
+    actionTag = actionMatch[0];
+  }
+  let text = rawReply
+    .replace(/\[ACTION:[^\]]+\]/gi, '')
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  // Remove any weird forced trailing particles like "donggg, iyaaa" if model hallucinated them
+  text = text.replace(/[,\s]*(?:dong{2,}|iya{2,}|nih{2,}|tuh{2,}|nggak{2,})(?:[,\s]+(?:dong{2,}|iya{2,}|nih{2,}|tuh{2,}))*[.!?]*$/gi, '').trim();
+
+  // Ensure the first character is capitalized properly
+  if (text.length > 0) {
+    text = text.charAt(0).toUpperCase() + text.slice(1);
+  }
+
+  return actionTag ? `${text} ${actionTag}`.trim() : text;
+}
 
 function resolveEffectiveBynaraKey(rawKey?: string): string {
   const cleaned = (rawKey || '').trim();
@@ -73,13 +112,10 @@ function resolveEffectiveBynaraKey(rawKey?: string): string {
 export async function askGeminiAssistant(
   params: GeminiAssistantParams
 ): Promise<GeminiAssistantResult> {
-  const apiKey = resolveEffectiveBynaraKey(params.apiKey);
-  const baseUrl = DEFAULT_BYNARA_BASE_URL;
-
   const promptText = params.prompt.trim();
   if (!promptText && !params.image) {
     return {
-      reply: 'Silakan ketik pertanyaan atau lampirkan gambar/screenshot untuk dianalisis.',
+      reply: 'Ketik dulu apa yang mau kita obrolin atau kirim gambarnya ke aku ya.',
       error: 'EMPTY_PROMPT',
     };
   }
@@ -104,7 +140,7 @@ export async function askGeminiAssistant(
 
   if (Array.isArray(params.history)) {
     for (const h of params.history.slice(-6)) {
-      if (!h.text || h.text.includes('Maaf, gagal memproses respon AI')) continue;
+      if (!h.text || h.text.includes('maaf') || h.text.includes('gagal memproses')) continue;
       messages.push({
         role: h.role === 'assistant' ? 'assistant' : 'user',
         content: h.text,
@@ -113,37 +149,90 @@ export async function askGeminiAssistant(
   }
 
   const effectiveUserPrompt =
-    promptText || 'Tolong analisis dan jelaskan kondisi layar/desktop saat ini secara ringkas.';
+    promptText || 'tolong jelasin kondisi layar atau desktop aku sekarang secara singkat dongg';
 
   messages.push({
     role: 'user',
     content: params.image
-      ? `${effectiveUserPrompt}\n\n[Konteks Tangkapan Layar / Sistem Saat Ini: ${stateContext}]`
+      ? [
+          {
+            type: 'text',
+            text: `${effectiveUserPrompt}\n\n[Konteks Tangkapan Layar / Sistem Saat Ini: ${stateContext}]`,
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:${params.image.mimeType};base64,${params.image.data}` },
+          },
+        ]
       : effectiveUserPrompt,
   });
 
-  const candidateModels = [
-    params.model?.trim() || DEFAULT_GEMINI_MODEL,
-    'agnes-3.0-flash',
-    'agnes-2.5-flash',
-    'muse-spark-1.3-contributor',
-  ];
-  const models = Array.from(new Set(candidateModels.filter(Boolean)));
+  const requestedModel = params.model?.trim() || DEFAULT_GEMINI_MODEL;
+  const isThinkingModel = requestedModel === 'muse-spark-1.3-contributor';
+
+  // Build ordered routing targets: Fast -> Agnes AI first, Thinking -> Bynara Muse Spark first (with cross-provider fallback)
+  const routeTargets: Array<{
+    model: string;
+    baseUrl: string;
+    apiKey: string;
+    maxTokens: number;
+  }> = isThinkingModel
+    ? [
+        {
+          model: 'muse-spark-1.3-contributor',
+          baseUrl: DEFAULT_BYNARA_BASE_URL,
+          apiKey: resolveEffectiveBynaraKey(params.apiKey),
+          maxTokens: 3500, // High ceiling so internal thinking tokens never truncate visible content
+        },
+        {
+          model: 'agnes-3.0-flash',
+          baseUrl: DEFAULT_AGNES_BASE_URL,
+          apiKey: DEFAULT_AGNES_KEY,
+          maxTokens: 260,
+        },
+        {
+          model: 'agnes-2.5-flash',
+          baseUrl: DEFAULT_AGNES_BASE_URL,
+          apiKey: DEFAULT_AGNES_KEY,
+          maxTokens: 260,
+        },
+      ]
+    : [
+        {
+          model: requestedModel === 'agnes-2.5-flash' ? 'agnes-2.5-flash' : 'agnes-3.0-flash',
+          baseUrl: DEFAULT_AGNES_BASE_URL,
+          apiKey: DEFAULT_AGNES_KEY,
+          maxTokens: 260,
+        },
+        {
+          model: requestedModel === 'agnes-2.5-flash' ? 'agnes-3.0-flash' : 'agnes-2.5-flash',
+          baseUrl: DEFAULT_AGNES_BASE_URL,
+          apiKey: DEFAULT_AGNES_KEY,
+          maxTokens: 260,
+        },
+        {
+          model: 'muse-spark-1.3-contributor',
+          baseUrl: DEFAULT_BYNARA_BASE_URL,
+          apiKey: resolveEffectiveBynaraKey(params.apiKey),
+          maxTokens: 3500,
+        },
+      ];
+
   let lastError = '';
 
-  for (const model of models) {
+  for (const target of routeTargets) {
     if (params.signal?.aborted) {
       return {
-        reply: 'Permintaan dibatalkan.',
+        reply: 'Permintaan tadi udah dibatalin ya.',
         error: 'ABORTED',
       };
     }
 
     const payloadStr = JSON.stringify({
-      model,
+      model: target.model,
       messages,
       temperature: 0.7,
-      max_tokens: 800,
+      max_tokens: target.maxTokens,
     });
 
     try {
@@ -151,15 +240,15 @@ export async function askGeminiAssistant(
 
       if (isTauri()) {
         // Call via native Rust curl.exe command to bypass WebView2 CORS restrictions
-        const rawJson = await askBynaraAiNative(baseUrl, apiKey, payloadStr);
+        const rawJson = await askBynaraAiNative(target.baseUrl, target.apiKey, payloadStr);
         data = JSON.parse(rawJson);
       } else {
-        const endpoint = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
+        const endpoint = `${target.baseUrl.replace(/\/+$/, '')}/chat/completions`;
         const res = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
+            Authorization: `Bearer ${target.apiKey}`,
           },
           signal: params.signal,
           body: payloadStr,
@@ -181,17 +270,19 @@ export async function askGeminiAssistant(
       }
 
       const choice = data?.choices?.[0];
-      const replyText = String(choice?.message?.content || '').trim();
-      if (replyText) {
+      const rawContent = String(
+        choice?.message?.content || choice?.message?.reasoning_content || ''
+      ).trim();
+      if (rawContent) {
         return {
-          reply: replyText,
+          reply: enforceCompanionStyle(rawContent),
         };
       }
       lastError = 'Empty completion content';
     } catch (err: any) {
       if (params.signal?.aborted) {
         return {
-          reply: 'Permintaan dibatalkan.',
+          reply: 'Permintaan tadi udah dibatalin ya.',
           error: 'ABORTED',
         };
       }
@@ -201,7 +292,7 @@ export async function askGeminiAssistant(
   }
 
   return {
-    reply: `Maaf, gagal memproses respon AI (${lastError || 'Koneksi sibuk'}). Silakan coba lagi.`,
+    reply: `Koneksinya lagi agak sibuk, coba tanya lagi ke aku ya.`,
     error: lastError || 'TIMEOUT',
   };
 }
