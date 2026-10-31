@@ -77,7 +77,15 @@ pub fn calculate_screen_hit_bounds(
     scale: f64,
 ) -> (i32, i32, i32, i32) {
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-    let (raw_left, raw_top, raw_right, raw_bottom) = bounds.normalized_bounds();
+    let (mut raw_left, raw_top, mut raw_right, raw_bottom) = bounds.normalized_bounds();
+
+    // If only width/height was sent (left and right unset or 0), horizontally center within window width
+    if raw_right > raw_left && (bounds.left == 0 && bounds.right == 0 && bounds.x == 0) {
+        let logical_win_w = (win_w as f64 / scale).round() as i32;
+        let w = raw_right - raw_left;
+        raw_left = (logical_win_w - w) / 2;
+        raw_right = raw_left + w;
+    }
 
     if raw_right > raw_left && raw_bottom > raw_top {
         // Client-relative coordinates scaled by DPI scale factor to physical pixels
@@ -169,11 +177,11 @@ pub fn spawn_cursor_monitor(app_handle: AppHandle, state: Arc<CursorMonitorState
                     continue;
                 }
 
-                // Hit test with DPI-scaled safety margins: left-4, right+4, top-2, bottom+6
-                let margin_left = (4.0 * scale).round() as i32;
-                let margin_right = (4.0 * scale).round() as i32;
-                let margin_top = (2.0 * scale).round() as i32;
-                let margin_bottom = (6.0 * scale).round() as i32;
+                // Hit test with DPI-scaled safety margins: left-28, right+28, top-6, bottom+24
+                let margin_left = (28.0 * scale).round() as i32;
+                let margin_right = (28.0 * scale).round() as i32;
+                let margin_top = (6.0 * scale).round() as i32;
+                let margin_bottom = (24.0 * scale).round() as i32;
 
                 let is_inside = pt.x >= (screen_left - margin_left)
                     && pt.x <= (screen_right + margin_right)
@@ -181,12 +189,13 @@ pub fn spawn_cursor_monitor(app_handle: AppHandle, state: Arc<CursorMonitorState
                     && pt.y <= (screen_bottom + margin_bottom);
 
                 // Tab bar top-zone auto-compact detection:
-                // When cursor moves into the top tab bar zone (y <= 42px) to the left or right of the dynamic island
-                let tab_zone_y = (42.0 * scale).round() as i32;
+                // Only trigger auto-compact if cursor is distinctly far outside the island (at least 60px past island boundaries)
+                let tab_zone_y = (36.0 * scale).round() as i32;
+                let tab_margin_x = (60.0 * scale).round() as i32;
                 if pt.y <= tab_zone_y
-                    && (pt.x < screen_left - margin_left || pt.x > screen_right + margin_right)
+                    && (pt.x < screen_left - tab_margin_x || pt.x > screen_right + tab_margin_x)
                 {
-                    if last_auto_compact.elapsed() > std::time::Duration::from_millis(800) {
+                    if last_auto_compact.elapsed() > std::time::Duration::from_millis(1500) {
                         let _ = app_handle.emit("request_auto_compact", ());
                         last_auto_compact = std::time::Instant::now();
                     }

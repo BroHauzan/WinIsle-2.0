@@ -42,18 +42,33 @@ mod win_media {
         }
     }
 
-    fn clean_source_app(raw_app: &str) -> String {
+    fn is_browser_app(raw_app: &str) -> bool {
         let lower = raw_app.to_lowercase();
-        if lower.contains("chrome") {
-            "Google Chrome".to_string()
-        } else if lower.contains("spotify") {
+        lower.contains("chrome")
+            || lower.contains("msedge")
+            || lower.contains("edge")
+            || lower.contains("brave")
+            || lower.contains("firefox")
+            || lower.contains("opera")
+            || lower.contains("vivaldi")
+    }
+
+    fn clean_source_app(raw_app: &str, raw_title: &str, raw_album: &str) -> String {
+        let lower_app = raw_app.to_lowercase();
+        let lower_title = raw_title.to_lowercase();
+        let lower_album = raw_album.to_lowercase();
+        if lower_app.contains("spotify") || lower_title.contains("spotify") {
             "Spotify".to_string()
-        } else if lower.contains("msedge") || lower.contains("edge") {
-            "Microsoft Edge".to_string()
-        } else if lower.contains("firefox") {
-            "Firefox".to_string()
-        } else if lower.contains("brave") {
-            "Brave".to_string()
+        } else if lower_app.contains("youtube")
+            || lower_app.contains("ytm")
+            || lower_title.contains("youtube music")
+            || lower_album.contains("youtube music")
+        {
+            "YouTube Music".to_string()
+        } else if lower_app.contains("apple") || lower_app.contains("itunes") {
+            "Apple Music".to_string()
+        } else if is_browser_app(&lower_app) {
+            "YouTube Music".to_string()
         } else if !raw_app.is_empty() {
             raw_app
                 .split('\\')
@@ -62,11 +77,102 @@ mod win_media {
                 .trim_end_matches(".exe")
                 .to_string()
         } else {
-            "Media Player".to_string()
+            "Music".to_string()
         }
     }
 
-    fn extract_thumbnail_base64(session: &GlobalSystemMediaTransportControlsSession) -> Option<String> {
+    fn is_non_music_title_or_artist(title: &str, artist: &str) -> bool {
+        let combined = format!("{} {}", title.to_lowercase(), artist.to_lowercase());
+        let blocked = [
+            "google ai studio",
+            "ai studio",
+            "aistudio",
+            "winisle",
+            "github",
+            "whatsapp",
+            "discord",
+            "telegram",
+            "bandicam",
+            "obs studio",
+            "localhost",
+            "127.0.0.1",
+            ".mp4",
+            ".webm",
+            ".mov",
+            ".mkv",
+            ".avi",
+            "new tab",
+            "untitled",
+            "google chrome",
+            "microsoft edge",
+            "chatgpt",
+            "claude",
+            "gemini",
+            "stack overflow",
+            "docs.google",
+            "drive.google",
+            "mail.google",
+            "facebook",
+            "instagram",
+            "twitter",
+            "x.com",
+            "tiktok",
+        ];
+        blocked.iter().any(|kw| combined.contains(kw))
+    }
+
+    fn clean_song_and_artist(raw_title: &str, raw_artist: &str) -> (String, String) {
+        let mut title = raw_title.trim().to_string();
+        let suffixes = [
+            " - YouTube Music",
+            " - YouTube",
+            " - Google Chrome",
+            " - Microsoft Edge",
+            " - Brave",
+            " - Mozilla Firefox",
+            " - Spotify",
+            " | YouTube Music",
+            " | YouTube",
+        ];
+        for s in suffixes.iter() {
+            if title.len() > s.len() && title.to_lowercase().ends_with(&s.to_lowercase()) {
+                let new_len = title.len() - s.len();
+                title = title[..new_len].trim().to_string();
+            }
+        }
+
+        let mut artist = raw_artist.trim().to_string();
+        if artist.to_lowercase().ends_with(" - topic") && artist.len() > 8 {
+            let new_len = artist.len() - 8;
+            artist = artist[..new_len].trim().to_string();
+        }
+        if artist.eq_ignore_ascii_case("google chrome")
+            || artist.eq_ignore_ascii_case("microsoft edge")
+            || artist.eq_ignore_ascii_case("various artists")
+            || artist.eq_ignore_ascii_case("unknown artist")
+        {
+            artist.clear();
+        }
+
+        // If artist is empty and title has "Artist - Song Title", split cleanly
+        if artist.is_empty() {
+            if let Some(idx) = title.find(" - ") {
+                let left = title[..idx].trim().to_string();
+                let right = title[idx + 3..].trim().to_string();
+                if !left.is_empty() && !right.is_empty() {
+                    artist = left;
+                    title = right;
+                }
+            }
+        }
+
+        (title, artist)
+    }
+
+    fn extract_thumbnail_base64(
+        session: &GlobalSystemMediaTransportControlsSession,
+        is_browser: bool,
+    ) -> Option<String> {
         let async_props = session.TryGetMediaPropertiesAsync().ok()?;
         let props = async_props.get().ok()?;
         let thumb_ref = props.Thumbnail().ok()?;
@@ -74,7 +180,9 @@ mod win_media {
         let async_stream = thumb_ref.OpenReadAsync().ok()?;
         let stream = async_stream.get().ok()?;
         let size = stream.Size().ok()? as u32;
-        if size == 0 || size > 2_000_000 {
+        // Skip tiny browser app-icon placeholders (< 14KB in Chrome/Edge) so official song cover art is used
+        let min_bytes = if is_browser { 14_000 } else { 512 };
+        if size < min_bytes || size > 2_000_000 {
             return None;
         }
         let content_type = stream.ContentType().ok()?.to_string();
@@ -102,12 +210,24 @@ mod win_media {
             .get()
             .map_err(|e| format!("GSMTC manager error: {}", e))?;
 
-        let session = match mgr.GetCurrentSession() {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
+        if let Ok(session) = mgr.GetCurrentSession() {
+            if let Ok(Some(info)) = extract_session_info(&session) {
+                return Ok(Some(info));
+            }
+        }
 
-        extract_session_info(&session)
+        if let Ok(sessions) = mgr.GetSessions() {
+            let count = sessions.Size().unwrap_or(0);
+            for i in 0..count {
+                if let Ok(session) = sessions.GetAt(i) {
+                    if let Ok(Some(info)) = extract_session_info(&session) {
+                        return Ok(Some(info));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn extract_session_info(
@@ -117,7 +237,7 @@ mod win_media {
             .SourceAppUserModelId()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let source_app = clean_source_app(&raw_app_id);
+        let is_browser = is_browser_app(&raw_app_id);
 
         let playback_info = match session.GetPlaybackInfo() {
             Ok(info) => info,
@@ -147,11 +267,11 @@ mod win_media {
             .map_err(|e| e.to_string())?;
         let media_props = async_props.get().map_err(|e| e.to_string())?;
 
-        let title = media_props
+        let raw_title = media_props
             .Title()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let artist = media_props
+        let raw_artist = media_props
             .Artist()
             .map(|s| s.to_string())
             .unwrap_or_default();
@@ -160,16 +280,29 @@ mod win_media {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        if title.trim().is_empty() && artist.trim().is_empty() {
+        if raw_title.trim().is_empty() {
             return Ok(None);
         }
+
+        if is_non_music_title_or_artist(&raw_title, &raw_artist) {
+            return Ok(None);
+        }
+
+        let (title, artist) = clean_song_and_artist(&raw_title, &raw_artist);
+        if title.is_empty() {
+            return Ok(None);
+        }
+
+        // If from a browser and there is still no artist metadata, it is a generic webpage tab, not a music track
+        if is_browser && artist.is_empty() {
+            return Ok(None);
+        }
+
+        let source_app = clean_source_app(&raw_app_id, &raw_title, &album);
 
         let mut position_ms: u64 = 0;
         let mut duration_ms: u64 = 0;
 
-        // Accurate real-time timeline extrapolation:
-        // GSMTC provides a snapshot Position and LastUpdatedTime.
-        // When playing, add the elapsed time since LastUpdatedTime to avoid static 00:01-00:03 looping!
         if let Ok(timeline) = session.GetTimelineProperties() {
             let base_pos = timeline
                 .Position()
@@ -182,7 +315,6 @@ mod win_media {
                     let now_100ns = get_system_100ns();
                     if now_100ns > last_updated.UniversalTime {
                         let elapsed_ms = (now_100ns - last_updated.UniversalTime) / 10_000;
-                        // Avoid jumping beyond reasonable threshold (e.g. max 12 hours)
                         if elapsed_ms > 0 && elapsed_ms < 43_200_000 {
                             current_pos = base_pos + elapsed_ms as u64;
                         }
@@ -200,7 +332,12 @@ mod win_media {
             position_ms = current_pos;
         }
 
-        let cover_url = extract_thumbnail_base64(session);
+        // Ignore short clips (< 35s) from browsers (e.g. short screen recordings or UI sounds)
+        if is_browser && duration_ms > 0 && duration_ms < 35_000 {
+            return Ok(None);
+        }
+
+        let cover_url = extract_thumbnail_base64(session, is_browser);
 
         Ok(Some(SystemMediaInfo {
             title,

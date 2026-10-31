@@ -413,6 +413,25 @@ export async function sendSystemMediaCommand(action: string, targetShuffle?: boo
   }
 }
 
+/**
+ * Executes an HTTPS POST to Bynara AI Router natively via Rust (curl.exe with CREATE_NO_WINDOW)
+ * so WebView2 CORS policies never block AI requests in the Tauri desktop binary.
+ */
+export async function askBynaraAiNative(
+  baseUrl: string,
+  apiKey: string,
+  payloadJson: string
+): Promise<string> {
+  if (isTauri()) {
+    return await invoke<string>('ask_bynara_ai', {
+      baseUrl,
+      apiKey,
+      payloadJson,
+    });
+  }
+  throw new Error('Not running in Tauri environment');
+}
+
 // ── Standard Bridge Export & window.electronAPI Fallback ──
 
 export const tauriBridge = {
@@ -428,6 +447,7 @@ export const tauriBridge = {
   getSystemScreenshot,
   getSystemMedia,
   sendSystemMediaCommand,
+  askBynaraAiNative,
   onVolumeChanged,
   onToggleAssistant,
   onSystemMediaChanged,

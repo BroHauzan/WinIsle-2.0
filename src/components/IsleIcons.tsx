@@ -577,6 +577,38 @@ export const AlarmBellSvg: React.FC<IconProps> = ({ size = 14, className = '' })
     <path d="M20 2c1.2 1.7 2 3.7 2 6" />
   </svg>
 );
+export const FastLightningSvg: React.FC<IconProps> = ({ className = '', size = 11 }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className}>
+    <path
+      d="M8.8 1.6L3.6 8.5H7.7L6.8 14.4L12.4 7.4H8.2L8.8 1.6Z"
+      fill="currentColor"
+      stroke="currentColor"
+      strokeWidth="0.5"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
 
-
+export const ThinkingBrainSvg: React.FC<IconProps> = ({ className = '', size = 11 }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className}>
+    <path
+      d="M5.5 3C3.6 3 2 4.6 2 6.5C2 7.8 2.7 8.9 3.7 9.5C3.3 10.5 3.7 11.8 4.7 12.5C5.4 13 6.3 13.1 7.2 12.8V3.2C6.6 3.1 6.1 3 5.5 3Z"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M10.5 3C12.4 3 14 4.6 14 6.5C14 7.8 13.3 8.9 12.3 9.5C12.7 10.5 12.3 11.8 11.3 12.5C10.6 13 9.7 13.1 8.8 12.8V3.2C9.4 3.1 9.9 3 10.5 3Z"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path d="M4.6 6.5C5.4 6.5 6.1 7 6.3 7.7" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+    <path d="M11.4 6.5C10.6 6.5 9.9 7 9.7 7.7" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+    <path d="M5.1 9.8C5.9 9.8 6.6 10.2 6.8 10.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+    <path d="M10.9 9.8C10.1 9.8 9.4 10.2 9.2 10.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+  </svg>
+);
 

@@ -63,7 +63,6 @@ app.get('/api/winisle-health', (_req, res) => {
   });
 });
 
-const DEFAULT_HARDCODED_KEY = 'AQ.Ab8RN6KdBVqg30x69prVlTWNqkpxqGYvT0ozWdATn5ni9d46ng';
 const INITIAL_ENV_GEMINI_KEY = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
 
 function isValidGeminiKey(key?: string | null): boolean {
@@ -77,7 +76,7 @@ function isValidGeminiKey(key?: string | null): boolean {
 app.get('/api/gemini/config', (_req, res) => {
   const persisted = loadPersistedGeminiKey();
   const envKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
-  const effectiveKey = (isValidGeminiKey(persisted) ? persisted : (isValidGeminiKey(envKey) ? envKey : DEFAULT_HARDCODED_KEY)).trim();
+  const effectiveKey = (isValidGeminiKey(persisted) ? persisted : envKey).trim();
   const hasKey = isValidGeminiKey(effectiveKey);
   res.json({
     hasKey,
@@ -208,7 +207,7 @@ function loadPersistedGeminiKey(): string {
       // ignore
     }
   }
-  return DEFAULT_HARDCODED_KEY;
+  return '';
 }
 
 function savePersistedGeminiKey(key: string): boolean {
@@ -231,18 +230,17 @@ function savePersistedGeminiKey(key: string): boolean {
   return saved;
 }
 
-// Auto-seed persistent cache on server startup with the user's hardcoded key
-(() => {
-  savePersistedGeminiKey(DEFAULT_HARDCODED_KEY);
-})();
-
-// Dynamic Server-Side Gemini Client Resolver (user's hardcoded key is primary, with env key fallback)
+// Server-Side Gemini Client Resolver (custom/persisted key or Google AI Studio env key)
 function getGeminiClient(customKey?: string): GoogleGenAI | null {
+  const envKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  const persisted = loadPersistedGeminiKey();
   const key = (
     (customKey && isValidGeminiKey(customKey) && !customKey.includes('Dummy') ? customKey.trim() : '') ||
-    DEFAULT_HARDCODED_KEY ||
-    INITIAL_ENV_GEMINI_KEY
+    (isValidGeminiKey(persisted) ? persisted : '') ||
+    envKey
   ).trim();
+
+  if (!key) return null;
 
   return new GoogleGenAI({
     apiKey: key,
@@ -255,12 +253,17 @@ function getGeminiClient(customKey?: string): GoogleGenAI | null {
 }
 
 function getGeminiClients(customKey?: string): GoogleGenAI[] {
+  const envKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  const persisted = loadPersistedGeminiKey();
   const candidates = [
     customKey && isValidGeminiKey(customKey) && !customKey.includes('Dummy') ? customKey.trim() : '',
-    DEFAULT_HARDCODED_KEY,
-    INITIAL_ENV_GEMINI_KEY,
+    isValidGeminiKey(persisted) ? persisted : '',
+    isValidGeminiKey(envKey) ? envKey : '',
   ].filter((k) => isValidGeminiKey(k));
   const uniqueKeys = Array.from(new Set(candidates));
+  if (uniqueKeys.length === 0 && envKey) {
+    uniqueKeys.push(envKey);
+  }
   return uniqueKeys.map(
     (key) =>
       new GoogleGenAI({
@@ -1969,21 +1972,75 @@ if ($null -ne $session) {
       );
       const parsed = extractJsonObject(gsmtcOut || '');
       if (parsed && parsed.found && parsed.title) {
-        detectedTitle = String(parsed.title || '').trim();
-        detectedArtist = String(parsed.artist || '').trim();
+        let rawT = String(parsed.title || '').trim();
+        let rawA = String(parsed.artist || '').trim();
         const rawApp = String(parsed.app || '').toLowerCase();
-        if (rawApp.includes('spotify')) sourceApp = 'Spotify';
-        else if (rawApp.includes('youtube') || rawApp.includes('ytm')) sourceApp = 'YouTube Music';
-        else if (rawApp.includes('apple') || rawApp.includes('itunes')) sourceApp = 'Apple Music';
-        else if (rawApp.includes('chrome') || rawApp.includes('msedge')) sourceApp = 'Browser Media';
-        else sourceApp = 'OS Media';
+        const isBrowser = /chrome|msedge|edge|brave|firefox|opera/.test(rawApp);
 
-        isPlayingNow = String(parsed.status || '').toLowerCase() === 'playing';
-        if (typeof parsed.shuffle === 'boolean') {
-          externalOsShuffleState = parsed.shuffle;
+        const combinedCheck = `${rawT} ${rawA}`.toLowerCase();
+        const blockedKeywords = [
+          'google ai studio',
+          'ai studio',
+          'aistudio',
+          'winisle',
+          'github',
+          'whatsapp',
+          'discord',
+          'telegram',
+          'bandicam',
+          'obs studio',
+          'localhost',
+          '127.0.0.1',
+          '.mp4',
+          '.webm',
+          '.mov',
+          '.mkv',
+          'new tab',
+          'untitled',
+          'google chrome',
+          'microsoft edge',
+          'chatgpt',
+          'claude',
+          'gemini',
+        ];
+        const isBlocked = blockedKeywords.some((kw) => combinedCheck.includes(kw));
+        const isTooShort = isBrowser && typeof parsed.endMs === 'number' && parsed.endMs > 0 && parsed.endMs < 35000;
+
+        if (!isBlocked && !isTooShort) {
+          rawT = rawT
+            .replace(/\s*(?:-|\|)\s*(?:YouTube Music|YouTube|Google Chrome|Microsoft Edge|Brave|Mozilla Firefox|Spotify).*$/i, '')
+            .trim();
+          rawA = rawA
+            .replace(/\s*-\s*Topic$/i, '')
+            .replace(/^(?:Google Chrome|Microsoft Edge|Brave|Firefox|Various Artists|Unknown Artist)$/i, '')
+            .trim();
+
+          if (!rawA && rawT.includes(' - ')) {
+            const parts = rawT.split(' - ');
+            const left = parts[0]?.trim() || '';
+            const right = parts.slice(1).join(' - ').trim();
+            if (left && right) {
+              rawA = left;
+              rawT = right;
+            }
+          }
+
+          if (!isBrowser || rawA) {
+            detectedTitle = rawT;
+            detectedArtist = rawA;
+            if (rawApp.includes('spotify')) sourceApp = 'Spotify';
+            else if (rawApp.includes('youtube') || rawApp.includes('ytm') || isBrowser) sourceApp = 'YouTube Music';
+            else if (rawApp.includes('apple') || rawApp.includes('itunes')) sourceApp = 'Apple Music';
+            else sourceApp = 'Music';
+
+            isPlayingNow = String(parsed.status || '').toLowerCase() === 'playing';
+            if (typeof parsed.shuffle === 'boolean') {
+              externalOsShuffleState = parsed.shuffle;
+            }
+            if (typeof parsed.posMs === 'number' && parsed.posMs >= 0) posMs = parsed.posMs;
+            if (typeof parsed.endMs === 'number' && parsed.endMs > 30000) endMs = parsed.endMs;
+          }
         }
-        if (typeof parsed.posMs === 'number' && parsed.posMs >= 0) posMs = parsed.posMs;
-        if (typeof parsed.endMs === 'number' && parsed.endMs > 30000) endMs = parsed.endMs;
       }
     } catch {
       // Fallback to window title inspection below
@@ -1993,7 +2050,7 @@ if ($null -ne $session) {
     if (!detectedTitle) {
       const { stdout } = await withTimeout(
         execAsync(
-          'powershell -NoProfile -Command "Get-Process | Where-Object { $_.ProcessName -match \'Spotify|Music|vlc|chrome|msedge\' -and $_.MainWindowTitle -match \' - \' } | Select-Object -First 1 -Property ProcessName, MainWindowTitle | ConvertTo-Json -Compress"'
+          'powershell -NoProfile -Command "Get-Process | Where-Object { $_.ProcessName -match \'Spotify|Music|vlc\' -and $_.MainWindowTitle -match \' - \' } | Select-Object -First 1 -Property ProcessName, MainWindowTitle | ConvertTo-Json -Compress"'
         ),
         2200,
         'win-media-detect'
@@ -2257,6 +2314,8 @@ app.get('/api/weather', async (req, res) => {
       isDay,
       sunrise,
       sunset,
+      utcOffsetSeconds:
+        typeof wData?.utc_offset_seconds === 'number' ? wData.utc_offset_seconds : undefined,
       hourly,
     });
   } catch {
@@ -2605,7 +2664,14 @@ app.post('/api/gemini/assistant', async (req, res) => {
     : fetchLiveWebSearchData(prompt);
 
   const systemPrompt = `You are the live Multimodal AI Assistant & Windows PC Controller inside Isle (Windows Dynamic Island overlay).
-Answer the user's question accurately and concisely (1-3 sentences) in the same language they used (Indonesian or English).
+Answer the user's question accurately, concisely, and conversationally in the same language they used (Indonesian or English).
+
+FORMATTING RULES:
+- Do NOT output raw markdown hashes like '###' or '##'. Write clean subtitles or paragraphs without hashes.
+- Do NOT wrap your whole response in quotation marks ("").
+- Avoid excessive asterisks (**) or raw markdown symbols. Speak naturally and elegantly so it looks clean inside the compact Dynamic Island.
+- If giving steps or tips, use clean bullet points (- Item) with line breaks.
+
 If an image or screenshot is attached, carefully read, inspect, and analyze the visual content (text, UI elements, songs, code, errors, or objects) to directly answer the user's request.
 You CAN directly control the user's laptop & all Dynamic Island menus! Whenever the user asks to perform an action, append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
 Valid action_name values:
@@ -2627,8 +2693,26 @@ Valid action_name values:
 Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'}, nowPlaying=${sanitizeText(currentState.trackTitle, 80) || 'Idle'}, queueLength=${Number(currentState.queueCount) || 0}, moodShuffle=${currentState.moodShuffleEnabled ? 'ON' : 'OFF'}, volume=${Number(currentState.volume) || 36}%, brightness=${Number(currentState.brightness) ?? 7}/10, battery=${Number(currentState.batteryLevel) || 82}%, bluetooth=${currentState.bluetoothEnabled !== false ? 'ON' : 'OFF'}, pomodoro=${sanitizeText(currentState.pomoRemaining, 10) || '25:00'} (${currentState.pomoRunning ? 'running' : 'paused'}), shelfFiles=${Number(currentState.shelfCount) || 0}.`;
 
   let response: any = null;
-  let usedModel = 'gemini-3.1-flash-lite';
+  const requestedModel = (req.body?.model as string)?.trim() || 'gemini-3.1-flash-lite';
+  const isThinkingModel = requestedModel === 'muse-spark-1.3-contributor';
+  let usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite';
   let lastError: any = null;
+
+  const bynaraKey =
+    clientKey && clientKey.trim().startsWith('sk-nry-')
+      ? clientKey.trim()
+      : 'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
+  const bynaraBaseUrl = (process.env.BYNARA_BASE_URL || 'https://router.bynara.id/v1').replace(
+    /\/+$/,
+    ''
+  );
+
+  // Wait for live web search snippets so model also receives fresh web context
+  const liveWeb = await liveWebPromise;
+  const webContextBlock =
+    liveWeb.snippets.length > 0
+      ? `\n\nLive Google Search & Web Data (use this real-time data to answer accurately):\n${liveWeb.snippets.join('\n')}`
+      : '';
 
   const buildContentsPayload = (textBlock: string) => {
     if (imageBase64) {
@@ -2649,118 +2733,132 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
     return textBlock;
   };
 
-  const aiClients = getGeminiClients(clientKey);
-  const primaryModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const;
-
-  // Step A: Try native googleSearch / multimodal vision call first with fastest Gemini 3.1 Flash Lite, then Gemini 3.8 Flash
-  outerStepA: for (const client of aiClients) {
-    for (const modelName of primaryModels) {
-      try {
-        const baseText = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}`;
-        response = await withTimeout(
-          client.models.generateContent({
-            model: modelName,
-            contents: buildContentsPayload(baseText),
-            config: imageBase64
-              ? {
-                  systemInstruction: systemPrompt,
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                }
-              : {
-                  systemInstruction: systemPrompt,
-                  tools: [{ googleSearch: {} }],
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                },
-          }),
-          imageBase64 ? 12000 : 9000,
-          `${modelName}-primary`
-        );
-        usedModel = modelName;
-        break outerStepA;
-      } catch (err: any) {
-        lastError = err;
+  // ROUTE 1: Thinking Mode (`muse-spark-1.3-contributor`) via Bynara Router
+  if (isThinkingModel) {
+    try {
+      const bynaraMessages: Array<{ role: string; content: any }> = [
+        { role: 'system', content: systemPrompt },
+      ];
+      for (const m of rawHistory.slice(-6)) {
+        const text = sanitizeText(m?.text, 300);
+        if (!text || text.includes('Maaf, gagal memproses respon AI')) continue;
+        bynaraMessages.push({
+          role: m?.role === 'assistant' ? 'assistant' : 'user',
+          content: text,
+        });
       }
+      if (imageBase64) {
+        bynaraMessages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: `${prompt}${webContextBlock}` },
+            { type: 'image_url', image_url: { url: `data:${imageMimeType};base64,${imageBase64}` } },
+          ],
+        });
+      } else {
+        bynaraMessages.push({
+          role: 'user',
+          content: `${prompt}${webContextBlock}`,
+        });
+      }
+
+      const bynaraRes = await withTimeout(
+        fetch(`${bynaraBaseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${bynaraKey}`,
+          },
+          body: JSON.stringify({
+            model: 'muse-spark-1.3-contributor',
+            messages: bynaraMessages,
+            temperature: 0.7,
+            max_tokens: 800,
+          }),
+        }),
+        15000,
+        'bynara-muse-spark'
+      );
+
+      if (bynaraRes.ok) {
+        const bynaraData: any = await bynaraRes.json();
+        const content = String(bynaraData?.choices?.[0]?.message?.content || '').trim();
+        if (content) {
+          response = { text: content, candidates: [] };
+          usedModel = 'muse-spark-1.3-contributor';
+        }
+      } else {
+        const errBody = await bynaraRes.text().catch(() => '');
+        lastError = new Error(`Muse Spark HTTP ${bynaraRes.status}: ${errBody.slice(0, 160)}`);
+      }
+    } catch (err: any) {
+      lastError = err;
     }
-  }
+  } else {
+    // ROUTE 2: Fast Mode (`gemini-3.1-flash-lite`) via official Google GenAI SDK (@google/genai)
+    const aiClients = getGeminiClients(clientKey);
+    const geminiModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const;
 
-  // Wait for our live web search results
-  const liveWeb = await liveWebPromise;
-
-  // Step B: Fallback without googleSearch tool if Step A hit tool/quota constraint (STRICTLY gemini-3.1-flash-lite & gemini-3.8-flash only)
-  if (!response) {
-    const webContextBlock =
-      liveWeb.snippets.length > 0
-        ? `\n\nLive Google Search & Web Data (use this real-time data to answer accurately):\n${liveWeb.snippets.join('\n')}`
-        : '';
-
-    outerStepB: for (const client of aiClients) {
-      for (const modelName of primaryModels) {
+    outerFastStepA: for (const client of aiClients) {
+      for (const modelName of geminiModels) {
         try {
-          const fallbackText = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}${webContextBlock}`;
+          const baseText = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}`;
           response = await withTimeout(
             client.models.generateContent({
               model: modelName,
-              contents: buildContentsPayload(fallbackText),
-              config: {
-                systemInstruction: systemPrompt,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              },
+              contents: buildContentsPayload(baseText),
+              config: imageBase64
+                ? {
+                    systemInstruction: systemPrompt,
+                    thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                  }
+                : {
+                    systemInstruction: systemPrompt,
+                    tools: [{ googleSearch: {} }],
+                    thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                  },
             }),
-            10000,
-            `${modelName}-grounded`
+            imageBase64 ? 12000 : 9000,
+            `${modelName}-primary`
           );
           usedModel = modelName;
-          break outerStepB;
+          break outerFastStepA;
         } catch (err: any) {
           lastError = err;
         }
       }
     }
-  }
 
-  // Step C: Interactions API fallback with gemini-3.8-flash / gemini-3.1-flash-lite if generateContent failed
-  if (!response && !imageBase64) {
-    const webContextBlock =
-      liveWeb.snippets.length > 0
-        ? `\n\nLive Google Search & Web Data:\n${liveWeb.snippets.join('\n')}`
-        : '';
-    const interactionInput = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}${webContextBlock}`;
-
-    outerStepC: for (const client of aiClients) {
-      for (const modelName of primaryModels) {
-        try {
-          const interaction: any = await withTimeout(
-            (client as any).interactions.create({
-              model: modelName,
-              input: interactionInput,
-              system_instruction: systemPrompt,
-              generation_config: {
-                thinking_level: 'low',
-              },
-            }),
-            10000,
-            `${modelName}-interactions`
-          );
-          const outputs = Array.isArray(interaction?.outputs) ? interaction.outputs : [];
-          const textOut = outputs
-            .filter((o: any) => o?.type === 'text' && typeof o?.text === 'string')
-            .map((o: any) => o.text)
-            .join('\n')
-            .trim();
-          if (textOut) {
-            response = { text: textOut, candidates: [] };
+    // Fallback without googleSearch tool if grounded call hit tool constraint
+    if (!response) {
+      outerFastStepB: for (const client of aiClients) {
+        for (const modelName of geminiModels) {
+          try {
+            const fallbackText = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}${webContextBlock}`;
+            response = await withTimeout(
+              client.models.generateContent({
+                model: modelName,
+                contents: buildContentsPayload(fallbackText),
+                config: {
+                  systemInstruction: systemPrompt,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                },
+              }),
+              10000,
+              `${modelName}-grounded`
+            );
             usedModel = modelName;
-            break outerStepC;
+            break outerFastStepB;
+          } catch (err: any) {
+            lastError = err;
           }
-        } catch (err: any) {
-          lastError = err;
         }
       }
     }
   }
 
   if (!response) {
-    // Graceful local intent execution & response so Dynamic Island commands always succeed without raw 404/API JSON dumps
+    // Graceful local intent execution & response so Dynamic Island commands always succeed without raw error dumps
     const fallbackInferred = inferIslandAction(prompt);
     if (fallbackInferred.action && fallbackInferred.action !== 'none') {
       const paramLabel = fallbackInferred.actionParam ? ` (${fallbackInferred.actionParam.replace('|', ' · ')})` : '';
@@ -2770,7 +2868,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
         }]`,
         candidates: [],
       };
-      usedModel = 'gemini-3.1-flash-lite';
+      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite';
     } else if (liveWeb.snippets.length > 0) {
       const cleanSummary = liveWeb.snippets
         .slice(0, 2)
@@ -2780,14 +2878,20 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
         text: cleanSummary,
         candidates: [],
       };
-      usedModel = 'gemini-3.1-flash-lite';
+      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite';
     } else {
-      console.error('All Gemini models failed:', lastError?.message || lastError);
+      console.error('Model request failed:', usedModel, lastError?.message || lastError);
+      const isAuthErr = String(lastError?.message || '').includes('401') || String(lastError?.message || '').includes('API key');
+      const errDetail = isAuthErr
+        ? 'Periksa API Key Google AI Studio Anda di Settings > Secrets atau masukkan Gemini API Key di menu Settings Isle.'
+        : lastError?.message || 'Koneksi sedang sibuk';
       return res.status(200).json({
-        error: 'Koneksi model AI sedang sibuk.',
-        reply: 'Maaf, koneksi ke Gemini 3.1 Flash Lite / 3.8 Flash sedang sibuk. Silakan coba lagi atau gunakan perintah langsung (seperti tambah task, set timer, cek cuaca, atau putar lagu).',
+        error: `Gagal merespons dari ${usedModel}.`,
+        reply: isThinkingModel
+          ? `Maaf, Muse Spark sedang tidak dapat merespons (${lastError?.message || 'Koneksi sibuk'}). Silakan coba lagi.`
+          : `Maaf, koneksi ke Gemini 3.1 Flash Lite terkendala (${errDetail}). Silakan coba lagi atau gunakan perintah langsung.`,
         action: 'none',
-        needApiKey: false,
+        needApiKey: isAuthErr,
       });
     }
   }

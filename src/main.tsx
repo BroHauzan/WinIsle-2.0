@@ -25,15 +25,74 @@ function jsonResponse(payload: unknown, status = 200): Response {
   });
 }
 
+function isBlockedNonMusicText(title: string, artist: string): boolean {
+  const combined = `${title} ${artist}`.toLowerCase();
+  const blocked = [
+    'google ai studio',
+    'ai studio',
+    'aistudio',
+    'winisle',
+    'github',
+    'whatsapp',
+    'discord',
+    'telegram',
+    'bandicam',
+    'obs studio',
+    'localhost',
+    '127.0.0.1',
+    '.mp4',
+    '.webm',
+    '.mov',
+    '.mkv',
+    'new tab',
+    'untitled',
+    'google chrome',
+    'microsoft edge',
+    'chatgpt',
+    'claude',
+    'gemini',
+    'facebook',
+    'instagram',
+    'twitter',
+    'x.com',
+    'tiktok',
+  ];
+  return blocked.some((kw) => combined.includes(kw));
+}
+
+function cleanExternalSongAndArtist(rawTitle: string, rawArtist: string): { title: string; artist: string } {
+  let title = (rawTitle || '')
+    .replace(/\s*(?:-|\|)\s*(?:YouTube Music|YouTube|Google Chrome|Microsoft Edge|Brave|Mozilla Firefox|Spotify).*$/i, '')
+    .trim();
+  let artist = (rawArtist || '')
+    .replace(/\s*-\s*Topic$/i, '')
+    .replace(/^(?:Google Chrome|Microsoft Edge|Brave|Firefox|Various Artists|Unknown Artist)$/i, '')
+    .trim();
+
+  if (!artist && title.includes(' - ')) {
+    const parts = title.split(' - ');
+    const left = parts[0]?.trim() || '';
+    const right = parts.slice(1).join(' - ').trim();
+    if (left && right) {
+      artist = left;
+      title = right;
+    }
+  }
+  return { title, artist };
+}
+
 async function resolveTauriSong(
   origFetch: typeof window.fetch,
   query: string,
   useFlac = false
 ) {
-  const cleanQ = query.trim();
+  const cleanQ = query
+    .replace(/\s*(?:-|\|)\s*(?:YouTube Music|YouTube|Google Chrome|Microsoft Edge|Spotify).*$/i, '')
+    .replace(/\s*-\s*Topic\b/gi, '')
+    .trim();
   if (!cleanQ) return null;
   let title = cleanQ;
-  let artist = 'Various Artists';
+  let artist = '';
   let coverUrl = '';
   let durationMs = 210000;
 
@@ -106,7 +165,7 @@ if (typeof window !== 'undefined') {
       const bodyObj = init?.body && typeof init.body === 'string' ? JSON.parse(init.body) : {};
 
       if (pathname === '/api/gemini/config') {
-        return jsonResponse({ hasKey: true, maskedKey: 'AQ.Ab8••••46ng', isPermanent: true });
+        return jsonResponse({ hasKey: true, maskedKey: 'sk-nry••••ByRY', isPermanent: true });
       }
       if (pathname === '/api/system/hardware-status') {
         const hw = await getHardwareStatus();
@@ -139,21 +198,44 @@ if (typeof window !== 'undefined') {
         if (!media || !media.title) {
           return jsonResponse({ playing: false, shuffleActive: false });
         }
-        const resolved = await resolveTauriSong(origFetch, `${media.title} ${media.artist || ''}`);
+        if (isBlockedNonMusicText(media.title, media.artist || '')) {
+          return jsonResponse({ playing: false, shuffleActive: false });
+        }
+        if (media.duration_ms > 0 && media.duration_ms < 35000) {
+          return jsonResponse({ playing: false, shuffleActive: false });
+        }
+        const cleaned = cleanExternalSongAndArtist(media.title, media.artist || '');
+        if (!cleaned.title) {
+          return jsonResponse({ playing: false, shuffleActive: false });
+        }
+        const isBrowserSource = /chrome|edge|brave|firefox|browser/i.test(media.source_app || '');
+        if (isBrowserSource && !cleaned.artist) {
+          return jsonResponse({ playing: false, shuffleActive: false });
+        }
+
+        const resolved = await resolveTauriSong(
+          origFetch,
+          `${cleaned.title} ${cleaned.artist}`.trim()
+        );
+        const finalTitle = cleaned.title || resolved?.title || media.title;
+        const finalArtist = cleaned.artist || resolved?.artist || '';
+        // Always prefer high-res official song album artwork (resolved.coverUrl) so browser logos are never shown
+        const finalCover = resolved?.coverUrl || media.cover_url || '';
+
         return jsonResponse({
           playing: true,
           isPaused: !media.is_playing,
           shuffleActive: media.shuffle_active,
-          sourceApp: media.source_app || 'System Media',
+          sourceApp: isBrowserSource ? 'YouTube Music' : media.source_app || 'Music',
           positionMs: media.position_ms,
           track: {
             ...(resolved || {}),
-            title: media.title,
-            artist: media.artist || resolved?.artist || 'Unknown Artist',
-            coverUrl: media.cover_url || resolved?.coverUrl || '',
+            title: finalTitle,
+            artist: finalArtist,
+            coverUrl: finalCover,
             durationMs: media.duration_ms || resolved?.durationMs || 210000,
             sourceType: 'external',
-            externalApp: media.source_app || 'System Media',
+            externalApp: isBrowserSource ? 'YouTube Music' : media.source_app || 'Music',
             audioUrl: '',
             youtubeVideoId: undefined,
           },
@@ -185,22 +267,37 @@ if (typeof window !== 'undefined') {
         });
       }
       if (pathname === '/api/weather') {
-        let city = (params.get('city') || '').trim() || 'Jakarta';
+        const requestedCity = (params.get('city') || '').trim();
+        let city = requestedCity || 'Jakarta';
         let lat = Number(params.get('lat')) || -6.2088;
         let lon = Number(params.get('lon')) || 106.8456;
         try {
-          if (params.get('city')) {
+          if (requestedCity) {
             const gRes = await origFetch(
-              `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=id&format=json`
+              `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(requestedCity)}&count=1&language=id&format=json`
             );
             if (gRes.ok) {
               const gData = await gRes.json();
               const first = gData?.results?.[0];
               if (first) {
-                city = first.name || city;
+                city = first.name || requestedCity;
                 lat = first.latitude ?? lat;
                 lon = first.longitude ?? lon;
               }
+            }
+          } else if (!params.get('lat')) {
+            try {
+              const ipRes = await origFetch('https://ipwho.is/');
+              if (ipRes.ok) {
+                const ipData = await ipRes.json();
+                if (ipData?.success && typeof ipData.latitude === 'number' && typeof ipData.longitude === 'number') {
+                  city = ipData.city || city;
+                  lat = ipData.latitude;
+                  lon = ipData.longitude;
+                }
+              }
+            } catch {
+              // ignore IP geo error
             }
           }
           const wRes = await origFetch(
@@ -211,10 +308,21 @@ if (typeof window !== 'undefined') {
             const currentTemp = Math.round(Number(wData?.current?.temperature_2m ?? 28));
             const weatherCode = Number(wData?.current?.weather_code ?? 2);
             const isDay = Number(wData?.current?.is_day ?? 1) === 1;
+            const fmtClock = (iso: string, fallback: string) => {
+              const part = String(iso || '').split('T')[1];
+              if (!part) return fallback;
+              const [hh, mm] = part.split(':');
+              return `${parseInt(hh, 10)}:${mm || '00'}`;
+            };
+            const sunrise = fmtClock(wData?.daily?.sunrise?.[0] || '', '5:49');
+            const sunset = fmtClock(wData?.daily?.sunset?.[0] || '', '17:52');
             const times: string[] = wData?.hourly?.time || [];
             const temps: number[] = wData?.hourly?.temperature_2m || [];
             const codes: number[] = wData?.hourly?.weather_code || [];
-            const startIdx = Math.max(0, new Date().getHours());
+            const utcOffsetSec =
+              typeof wData?.utc_offset_seconds === 'number' ? wData.utc_offset_seconds : 25200;
+            const cityNow = new Date(Date.now() + utcOffsetSec * 1000);
+            const startIdx = Math.max(0, cityNow.getUTCHours());
             const hourly = Array.from({ length: 7 }, (_, i) => {
               const idx = startIdx + i;
               const tIso = times[idx] || '';
@@ -232,8 +340,12 @@ if (typeof window !== 'undefined') {
               currentTemp,
               weatherCode,
               isDay,
-              sunrise: '5:49',
-              sunset: '17:52',
+              sunrise,
+              sunset,
+              utcOffsetSeconds:
+                typeof wData?.utc_offset_seconds === 'number'
+                  ? wData.utc_offset_seconds
+                  : undefined,
               hourly,
             });
           }
@@ -257,6 +369,7 @@ if (typeof window !== 'undefined') {
         const res = await askGeminiAssistant({
           prompt: bodyObj?.prompt || '',
           apiKey: bodyObj?.apiKey,
+          model: bodyObj?.model,
           image: bodyObj?.image,
           history: bodyObj?.history,
           currentState: bodyObj?.currentState,
@@ -282,7 +395,7 @@ if (typeof window !== 'undefined') {
           actionParam: detectedParam,
           trackData,
           searchSources: res.searchSources?.map((s) => ({ title: s.title, uri: s.url })),
-          source: 'gemini-3.1-flash-lite',
+          source: bodyObj?.model || 'stepfun-3.7-flash',
         });
       }
 

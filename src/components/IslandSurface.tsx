@@ -164,11 +164,22 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           const winAny = window as any;
           const totalW = nw + 2 * ns;
           winAny.__WINISLE_ISLAND_BOUNDS__ = { w: totalW, h: nh };
-          if (typeof winAny.__TAURI_INTERNALS__?.invoke === 'function') {
-            winAny.__TAURI_INTERNALS__
-              .invoke('update_island_bounds', { width: totalW, height: nh })
-              .catch(() => {});
-          }
+          const winW = window.innerWidth || 740;
+          const left = Math.max(0, Math.round((winW - totalW) / 2));
+          const top = 0;
+          const right = left + totalW;
+          const bottom = nh;
+
+          updateIslandBounds({
+            left,
+            top,
+            right,
+            bottom,
+            x: left,
+            y: top,
+            width: totalW,
+            height: nh,
+          }).catch(() => {});
         }
         return { w: nw, h: nh, r: nr, s: ns };
       });

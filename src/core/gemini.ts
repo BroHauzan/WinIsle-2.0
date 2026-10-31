@@ -1,20 +1,23 @@
 /**
- * Direct Google Gemini API Client for WinIsle Dynamic Island.
- * Supports Multimodal Vision (screenshots/images), Chat History, and Action Intent Detection.
+ * Bynara Router OpenAI-Compatible AI Client (`muse-spark-1.3-contributor`) for WinIsle Dynamic Island.
+ * Supports Chat History, Desktop Context, Multimodal Vision, and Action Intent Detection.
  */
 
-/**
- * Configurable active Gemini model.
- * Defaults to `gemini-3.8-flash` (recommended by Google AI Studio for all new requests),
- * or can be configured via `VITE_GEMINI_MODEL` environment variable.
- */
+import { isTauri, askBynaraAiNative } from './tauri-bridge';
+
+export const DEFAULT_BYNARA_BASE_URL =
+  (import.meta.env.VITE_AI_BASE_URL as string)?.trim() || 'https://router.bynara.id/v1';
+
 export const DEFAULT_GEMINI_MODEL =
   (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'gemini-3.1-flash-lite';
 
+export const DEFAULT_BYNARA_KEY =
+  (import.meta.env.VITE_BYNARA_API_KEY as string)?.trim() ||
+  'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
+
 export const SUPPORTED_GEMINI_MODELS = [
-  DEFAULT_GEMINI_MODEL,
   'gemini-3.1-flash-lite',
-  'gemini-3.8-flash',
+  'muse-spark-1.3-contributor',
 ];
 
 export interface GeminiAssistantParams {
@@ -39,10 +42,15 @@ export interface GeminiAssistantResult {
   error?: string;
 }
 
-const DEFAULT_FALLBACK_KEY = 'AQ.Ab8RN6KdBVqg30x69prVlTWNqkpxqGYvT0ozWdATn5ni9d46ng';
+const SYSTEM_INSTRUCTION = `You are the live AI Assistant & Windows PC Controller inside Isle (Windows Dynamic Island overlay).
+Answer the user's question accurately, concisely, and conversationally in the same language they used (Indonesian or English).
 
-const SYSTEM_INSTRUCTION = `You are the live Multimodal AI Assistant inside Isle (Windows Dynamic Island overlay).
-Answer the user's question accurately and concisely (1-3 sentences) in the same language they used (Indonesian or English).
+FORMATTING RULES:
+- Do NOT output raw markdown hashes like '###' or '##'. Use clean, short titles or paragraphs without hashes.
+- Do NOT wrap your whole response in quotation marks ("").
+- Avoid excessive asterisks (**) or raw markdown symbols. Speak naturally and elegantly so it looks clean inside the compact Dynamic Island.
+- If giving steps or tips, use clean bullet points (- Item) with line breaks.
+
 Whenever the user asks to perform an action, append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
 Valid action_name values:
 - add_todo|task_title|HH:mm (e.g. [ACTION:add_todo|Olahraga Pagi|05:00] or [ACTION:add_todo|Tugas Besok|09:00])
@@ -55,10 +63,17 @@ Valid action_name values:
 - queue_song|song_title_and_artist
 - set_volume|0_to_100, set_brightness|0_to_10, play_music, pause_music, next_track, prev_track, toggle_lyrics, mute_volume, unmute_volume, start_pomodoro, pause_pomodoro, reset_pomodoro, open_tasks, open_shelf, clear_shelf, open_calendar, open_notifications, toggle_dnd, none.`;
 
+function resolveEffectiveBynaraKey(rawKey?: string): string {
+  const cleaned = (rawKey || '').trim();
+  if (cleaned.startsWith('sk-nry-')) return cleaned;
+  return DEFAULT_BYNARA_KEY;
+}
+
 export async function askGeminiAssistant(
   params: GeminiAssistantParams
 ): Promise<GeminiAssistantResult> {
-  const apiKey = (params.apiKey || DEFAULT_FALLBACK_KEY).trim();
+  const apiKey = resolveEffectiveBynaraKey(params.apiKey);
+  const baseUrl = DEFAULT_BYNARA_BASE_URL;
 
   const promptText = params.prompt.trim();
   if (!promptText && !params.image) {
@@ -68,46 +83,51 @@ export async function askGeminiAssistant(
     };
   }
 
-  // Build Gemini contents array with history
-  const contents: any[] = [];
+  const cs = params.currentState || {};
+  const stateContext = `Desktop State: activePage=${cs.activePage || 'music'}, nowPlaying=${
+    cs.trackTitle || 'Idle'
+  }, queueLength=${Number(cs.queueCount) || 0}, moodShuffle=${
+    cs.moodShuffleEnabled ? 'ON' : 'OFF'
+  }, volume=${Number(cs.volume) ?? 36}%, brightness=${
+    Number(cs.brightness) ?? 7
+  }/10, battery=${Number(cs.batteryLevel) ?? 82}%, pomodoro=${
+    cs.pomoRemaining || '25:00'
+  } (${cs.pomoRunning ? 'running' : 'paused'}), shelfFiles=${Number(cs.shelfCount) || 0}.`;
+
+  const messages: Array<{ role: string; content: any }> = [
+    {
+      role: 'system',
+      content: `${SYSTEM_INSTRUCTION}\n${stateContext}`,
+    },
+  ];
 
   if (Array.isArray(params.history)) {
     for (const h of params.history.slice(-6)) {
-      if (!h.text) continue;
-      contents.push({
-        role: h.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: h.text }],
+      if (!h.text || h.text.includes('Maaf, gagal memproses respon AI')) continue;
+      messages.push({
+        role: h.role === 'assistant' ? 'assistant' : 'user',
+        content: h.text,
       });
     }
   }
 
-  // Current user turn
-  const userParts: any[] = [];
-  if (promptText) {
-    userParts.push({ text: promptText });
-  }
+  const effectiveUserPrompt =
+    promptText || 'Tolong analisis dan jelaskan kondisi layar/desktop saat ini secara ringkas.';
 
-  if (params.image && params.image.data) {
-    userParts.push({
-      inlineData: {
-        mimeType: params.image.mimeType || 'image/png',
-        data: params.image.data,
-      },
-    });
-  }
-
-  contents.push({
+  messages.push({
     role: 'user',
-    parts: userParts,
+    content: params.image
+      ? `${effectiveUserPrompt}\n\n[Konteks Tangkapan Layar / Sistem Saat Ini: ${stateContext}]`
+      : effectiveUserPrompt,
   });
 
-  const activeModel = params.model?.trim() || DEFAULT_GEMINI_MODEL;
   const candidateModels = [
-    activeModel,
-    'gemini-3.1-flash-lite',
-    'gemini-3.8-flash',
+    params.model?.trim() || DEFAULT_GEMINI_MODEL,
+    'stepfun-3.7-flash',
+    'muse-spark-1.3-contributor',
+    'laguna-s-2.1',
   ];
-  const models = Array.from(new Set(candidateModels));
+  const models = Array.from(new Set(candidateModels.filter(Boolean)));
   let lastError = '';
 
   for (const model of models) {
@@ -118,124 +138,69 @@ export async function askGeminiAssistant(
       };
     }
 
-    // Strict 5-second per-model timeout to eliminate any freezing or hanging
-    const modelController = new AbortController();
-    const timeoutId = setTimeout(() => {
-      modelController.abort();
-    }, 5000);
-
-    const abortHandler = () => modelController.abort();
-    if (params.signal) {
-      params.signal.addEventListener('abort', abortHandler, { once: true });
-    }
+    const payloadStr = JSON.stringify({
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: 800,
+    });
 
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-        apiKey
-      )}`;
+      let data: any = null;
 
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        signal: modelController.signal,
-        body: JSON.stringify({
-          contents,
-          systemInstruction: {
-            parts: [{ text: SYSTEM_INSTRUCTION }],
+      if (isTauri()) {
+        // Call via native Rust curl.exe command to bypass WebView2 CORS restrictions
+        const rawJson = await askBynaraAiNative(baseUrl, apiKey, payloadStr);
+        data = JSON.parse(rawJson);
+      } else {
+        const endpoint = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
           },
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 1024,
-          },
-        }),
-      });
-
-      clearTimeout(timeoutId);
-      if (params.signal) {
-        params.signal.removeEventListener('abort', abortHandler);
+          signal: params.signal,
+          body: payloadStr,
+        });
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => null);
+          lastError = errJson?.error?.message || `HTTP ${res.status}`;
+          continue;
+        }
+        data = await res.json();
       }
 
-      if (!res.ok) {
-        const errorJson = await res.json().catch(() => null);
-        const errMsg = errorJson?.error?.message || `HTTP ${res.status}`;
-        lastError = errMsg;
-
-        // If rate limit reached, return immediately
-        if (res.status === 429) {
-          return {
-            reply: 'Batas kuota Gemini API tercapai (Rate Limit). Mohon tunggu beberapa detik sebelum mencoba lagi.',
-            error: 'RATE_LIMIT',
-          };
-        }
-
-        // If API key is invalid
-        if (res.status === 400 && errMsg.toLowerCase().includes('api key')) {
-          return {
-            reply: 'API Key Gemini Anda tidak valid. Silakan periksa kembali API Key yang Anda masukkan di menu Pengaturan.',
-            error: 'INVALID_API_KEY',
-          };
-        }
-
-        if (res.status === 403) {
-          return {
-            reply: `Akses Gemini API ditolak (${errMsg}). Pastikan API Key aktif dan memiliki izin yang sesuai di Google AI Studio.`,
-            error: errMsg,
-          };
-        }
-
-        // If model not found (404) or unsupported in this region/version, try next model
+      if (data?.error) {
+        lastError =
+          typeof data.error === 'string'
+            ? data.error
+            : data.error.message || JSON.stringify(data.error);
         continue;
       }
 
-      const data = await res.json();
-      clearTimeout(timeoutId);
-
-      const candidate = data?.candidates?.[0];
-      const replyText =
-        candidate?.content?.parts?.map((p: any) => p.text || '').join('') ||
-        'Tidak ada respon dari model.';
-
-      // Extract search grounding sources if present
-      const sources: Array<{ title: string; url: string }> = [];
-      const metadata = candidate?.groundingMetadata;
-      if (Array.isArray(metadata?.groundingChunks)) {
-        for (const chunk of metadata.groundingChunks) {
-          if (chunk?.web?.uri) {
-            sources.push({
-              title: chunk.web.title || chunk.web.uri,
-              url: chunk.web.uri,
-            });
-          }
-        }
+      const choice = data?.choices?.[0];
+      const replyText = String(choice?.message?.content || '').trim();
+      if (replyText) {
+        return {
+          reply: replyText,
+        };
       }
-
-      return {
-        reply: replyText.trim(),
-        searchSources: sources.length > 0 ? sources : undefined,
-      };
+      lastError = 'Empty completion content';
     } catch (err: any) {
-      clearTimeout(timeoutId);
-      if (params.signal) {
-        params.signal.removeEventListener('abort', abortHandler);
-      }
-
       if (params.signal?.aborted) {
         return {
           reply: 'Permintaan dibatalkan.',
           error: 'ABORTED',
         };
       }
-
       lastError = err?.message || String(err);
-      // Timeout or network drop for this specific model, attempt next candidate
       continue;
     }
   }
 
   return {
-    reply: `Maaf, gagal memproses respon AI (${lastError || 'Batas waktu terlampaui'}). Silakan periksa API Key dan koneksi internet Anda.`,
+    reply: `Maaf, gagal memproses respon AI (${lastError || 'Koneksi sibuk'}). Silakan coba lagi.`,
     error: lastError || 'TIMEOUT',
   };
 }

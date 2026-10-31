@@ -16,6 +16,7 @@ import {
   CloseCrossSvg,
   CoffeeCupSvg,
   EditPencilSvg,
+  FastLightningSvg,
   FileDocumentBadgeSvg,
   ForwardSkipSvg,
   GearSettingsSvg,
@@ -39,12 +40,17 @@ import {
   SunBrightnessSvg,
   TargetFocusSvg,
   TaskCheckBoxSvg,
+  ThinkingBrainSvg,
   TimerStopwatchSvg,
   VideoCameraSvg,
 } from './components/IsleIcons';
 import { BotColorName, BotForm, BotShapeName, paletteFor } from './core/bot';
 import { parseLrc, SAMPLE_TRACKS } from './core/lrc';
 import { getWsBaseUrl } from './utils/apiBase';
+import {
+  initNotificationPruning,
+  pruneStaleNotifications,
+} from './utils/notificationCleaner';
 
 type IslandPage =
   | 'music'
@@ -136,6 +142,7 @@ function truncateMiddleFileName(name: string, maxChars = 11): string {
 
 interface NotificationItem {
   id: number;
+  createdAt?: number;
   iconType: 'calendar' | 'download' | 'message';
   title: string;
   subtitle: string;
@@ -184,6 +191,7 @@ export interface WeatherData {
   isDay: boolean;
   sunrise: string;
   sunset: string;
+  utcOffsetSeconds?: number;
   hourly: WeatherHourItem[];
 }
 
@@ -515,6 +523,7 @@ export default function App() {
   const [assistantMode, setAssistantMode] = useState<'voice-pill' | 'conversation'>(defaultAltQMode);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nudgeCount, setNudgeCount] = useState(0);
+  const hoverLeaveTimerRef = useRef<number | null>(null);
 
   // ── Mini Capsule Auto-Hide Mode (Alt + H: Auto-hides to top edge so Chrome tabs are never blocked, reveals on top-edge hover) ──
   const [miniCapsuleMode, setMiniCapsuleMode] = useState<boolean>(() => {
@@ -551,11 +560,31 @@ export default function App() {
     return () => window.removeEventListener('mousemove', onMove);
   }, [miniCapsuleMode, isHovered, isPinnedOpen, assistantOpen]);
 
-  // ── Google Gemini API Key State & Storage (Hardcoded for WinIsle) ──
-  const HARDCODED_GEMINI_KEY = 'AQ.Ab8RN6KdBVqg30x69prVlTWNqkpxqGYvT0ozWdATn5ni9d46ng';
+  // ── Bynara Router AI Key State & Model Preferences ──
+  const HARDCODED_GEMINI_KEY = 'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
   const [geminiApiKey] = useState<string>(HARDCODED_GEMINI_KEY);
   const [hasServerKey, setHasServerKey] = useState(true);
-  const [serverMaskedKey, setServerMaskedKey] = useState<string>('AQ.Ab8••••46ng');
+  const [serverMaskedKey, setServerMaskedKey] = useState<string>('sk-nry••••ByRY');
+
+  // AI Model Selection: 'gemini-3.1-flash-lite' (Fast / Kilat via Google AI Studio) vs 'muse-spark-1.3-contributor' (Thinking / Mendalam via Bynara)
+  const [assistantModel, setAssistantModel] = useState<string>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_ai_model');
+      if (saved === 'gemini-3.1-flash-lite' || saved === 'muse-spark-1.3-contributor') return saved;
+      if (saved === 'stepfun-3.7-flash') return 'gemini-3.1-flash-lite';
+    } catch {
+      // ignore
+    }
+    return 'gemini-3.1-flash-lite';
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_ai_model', assistantModel);
+    } catch {
+      // ignore
+    }
+  }, [assistantModel]);
 
   useEffect(() => {
     fetch('/api/gemini/config')
@@ -563,7 +592,7 @@ export default function App() {
       .then((data) => {
         if (data?.hasKey) {
           setHasServerKey(true);
-          setServerMaskedKey(data.maskedKey || 'AQ.Ab8••••46ng');
+          setServerMaskedKey(data.maskedKey || 'sk-nry••••ByRY');
         }
       })
       .catch(() => {});
@@ -1881,7 +1910,7 @@ export default function App() {
     handleTrackEndedRef.current = handleTrackEnded;
   }, [handleTrackEnded]);
 
-  // Poll OS Media Session (/api/music/os-now-playing) to detect External Apps (Spotify, YouTube Music, OS Media)
+  // Poll OS Media Session (/api/music/os-now-playing) to detect External Apps (Spotify, YouTube Music)
   // and synchronize external shuffle state
   const refreshExternalOsMedia = useCallback(async () => {
     try {
@@ -1890,13 +1919,34 @@ export default function App() {
       if (typeof data?.shuffleActive === 'boolean') {
         setExternalShuffleEnabled(data.shuffleActive);
       }
-      // Only take over activeTrack if no internal AI track is currently active (or if activeTrack is already external)
       const curr = activeTrackRef.current;
-      if (data?.playing && data?.track && (!curr || curr.sourceType === 'external')) {
+      if (!data?.playing || !data?.track) {
+        if (curr && curr.sourceType === 'external') {
+          activeTrackRef.current = null;
+          setActiveTrack(null);
+          setIsPlaying(false);
+          positionMsRef.current = 0;
+          setPositionMs(0);
+        }
+        return;
+      }
+      // Only take over activeTrack if no internal AI track is currently active (or if activeTrack is already external)
+      if (!curr || curr.sourceType === 'external') {
+        const cleanTitle = String(data.track.title || '')
+          .replace(/\s*(?:-|\|)\s*(?:YouTube Music|YouTube|Google Chrome|Microsoft Edge|Spotify).*$/i, '')
+          .trim();
+        const cleanArtist = String(data.track.artist || '')
+          .replace(/\s*-\s*Topic$/i, '')
+          .replace(/^(?:Google Chrome|Microsoft Edge|Brave|Firefox|Various Artists|Unknown Artist)$/i, '')
+          .trim();
+        if (!cleanTitle) return;
+
         const extTrack: RealMediaTrack = {
           ...data.track,
+          title: cleanTitle,
+          artist: cleanArtist,
           sourceType: 'external',
-          externalApp: data.sourceApp || data.track.externalApp || 'Spotify',
+          externalApp: data.sourceApp || data.track.externalApp || 'Music',
           youtubeVideoId: undefined,
           audioUrl: '',
           tintRgb: curr?.tintRgb || [0.54, 0.36, 0.16],
@@ -1934,7 +1984,7 @@ export default function App() {
 
   useEffect(() => {
     refreshExternalOsMedia();
-    const id = window.setInterval(refreshExternalOsMedia, 6000);
+    const id = window.setInterval(refreshExternalOsMedia, 3500);
     return () => window.clearInterval(id);
   }, [refreshExternalOsMedia]);
 
@@ -2169,7 +2219,7 @@ export default function App() {
       const saved = window.localStorage.getItem('isle_notifications_v2');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) return pruneStaleNotifications(parsed);
       }
     } catch {
       // ignore
@@ -2204,10 +2254,12 @@ export default function App() {
 
       const now = new Date();
       const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      const createdAt = now.getTime();
 
       setNotifications((prev) => [
         {
-          id: Date.now() + Math.floor(Math.random() * 1000),
+          id: createdAt + Math.floor(Math.random() * 1000),
+          createdAt,
           iconType,
           title: cleanTitle,
           subtitle: cleanSub || 'Isle System Notification',
@@ -2227,6 +2279,16 @@ export default function App() {
     },
     [dndEnabled]
   );
+
+  // Automatically clear expired/stale notifications (> 7 days) from localStorage & memory
+  useEffect(() => {
+    const unbind = initNotificationPruning({
+      onPruned: () => {
+        setNotifications((prev) => pruneStaleNotifications(prev));
+      },
+    });
+    return unbind;
+  }, []);
 
   // ── Page 3: Focus / Pomodoro State ──
   const [pomoMode, setPomoMode] = useState<'focus' | 'break'>('focus');
@@ -2505,8 +2567,15 @@ export default function App() {
   // ── Page 7: Real-Time Weather & Solar Arc State (Auto Location + Manual City Override) ──
   const [weatherData, setWeatherData] = useState<WeatherData>(() => {
     const h = new Date().getHours();
+    let savedCity = 'Jakarta';
+    try {
+      const fromStorage = window.localStorage.getItem('isle_weather_city');
+      if (fromStorage && fromStorage.trim()) savedCity = fromStorage.trim();
+    } catch {
+      // ignore
+    }
     return {
-      city: 'Mendeteksi...',
+      city: savedCity,
       currentTemp: 28,
       weatherCode: 2,
       isDay: h >= 6 && h < 18,
@@ -2523,46 +2592,227 @@ export default function App() {
   const [weatherCityInput, setWeatherCityInput] = useState('');
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherTransitioning, setWeatherTransitioning] = useState(false);
+  const [weatherAnimTick, setWeatherAnimTick] = useState(0);
+  const [animatedSunT, setAnimatedSunT] = useState<number>(0.48);
+  const animatedSunTRef = useRef<number>(0.48);
+
+  // Compute target solar progress (0.08 .. 0.92) from the location's sunrise, sunset, and timezone offset
+  const targetSunT = useMemo(() => {
+    const parseClockMin = (str: string, defMin: number) => {
+      const m = str.match(/(\d{1,2}):(\d{2})/);
+      if (!m) return defMin;
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    };
+    const sunriseMin = parseClockMin(weatherData.sunrise, 5 * 60 + 49);
+    const sunsetMin = parseClockMin(weatherData.sunset, 17 * 60 + 52);
+    let cityNowMin = nowDate.getHours() * 60 + nowDate.getMinutes();
+    if (typeof weatherData.utcOffsetSeconds === 'number') {
+      const cityDate = new Date(nowDate.getTime() + weatherData.utcOffsetSeconds * 1000);
+      cityNowMin = cityDate.getUTCHours() * 60 + cityDate.getUTCMinutes();
+    }
+    const rawProgress =
+      sunsetMin > sunriseMin
+        ? (cityNowMin - sunriseMin) / (sunsetMin - sunriseMin)
+        : 0.48;
+    return Math.min(0.92, Math.max(0.08, rawProgress));
+  }, [weatherData.sunrise, weatherData.sunset, weatherData.utcOffsetSeconds, nowDate]);
+
+  // Smoothly animate the sun & active horizon arc along the quadratic Bezier curve whenever location or sunrise/sunset updates
+  useEffect(() => {
+    const currentT = animatedSunTRef.current;
+    // If refreshing the same location or switching between nearby cities with similar solar progress,
+    // sweep from slightly earlier on the horizon arc so the update is visually fluid
+    const startT =
+      Math.abs(targetSunT - currentT) < 0.025 && weatherAnimTick > 0
+        ? Math.max(0.08, targetSunT - 0.16)
+        : currentT;
+    const deltaT = targetSunT - startT;
+    if (Math.abs(deltaT) < 0.001) {
+      animatedSunTRef.current = targetSunT;
+      setAnimatedSunT(targetSunT);
+      return;
+    }
+
+    let rafId = 0;
+    const durationMs = 640;
+    const startTime = performance.now();
+
+    const step = (now: number) => {
+      const elapsed = now - startTime;
+      const p = Math.min(1, Math.max(0, elapsed / durationMs));
+      // Smooth cubic-out easing
+      const eased = 1 - Math.pow(1 - p, 3);
+      const nextVal = startT + deltaT * eased;
+      animatedSunTRef.current = nextVal;
+      setAnimatedSunT(nextVal);
+      if (p < 1) {
+        rafId = window.requestAnimationFrame(step);
+      }
+    };
+
+    rafId = window.requestAnimationFrame(step);
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [targetSunT, weatherAnimTick]);
 
   const fetchWeatherData = useCallback(async (customCity?: string) => {
     setWeatherLoading(true);
     if (customCity !== undefined) {
       setWeatherTransitioning(true);
     }
-    try {
-      const savedCity =
-        customCity !== undefined
-          ? customCity.trim()
-          : window.localStorage.getItem('isle_weather_city') || '';
+    const targetCity =
+      customCity !== undefined
+        ? customCity.trim()
+        : (() => {
+            try {
+              return window.localStorage.getItem('isle_weather_city') || '';
+            } catch {
+              return '';
+            }
+          })();
 
+    const saveCityPreference = (cityVal: string) => {
+      if (customCity === undefined) return;
+      try {
+        if (cityVal.trim()) {
+          window.localStorage.setItem('isle_weather_city', cityVal.trim());
+        } else {
+          window.localStorage.removeItem('isle_weather_city');
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    try {
+      // 1. Try Direct Open-Meteo Geocoding + Forecast first so manual city typing works in both Web & Tauri standalone .exe
+      let resolvedCity = targetCity || 'Jakarta';
+      let lat = -6.2088;
+      let lon = 106.8456;
+      let coordsFound = false;
+
+      if (targetCity) {
+        try {
+          const geoRes = await fetch(
+            `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+              targetCity
+            )}&count=1&language=id&format=json`
+          );
+          if (geoRes.ok) {
+            const geoData = await geoRes.json();
+            const first = geoData?.results?.[0];
+            if (first && typeof first.latitude === 'number' && typeof first.longitude === 'number') {
+              resolvedCity = first.name || targetCity;
+              lat = first.latitude;
+              lon = first.longitude;
+              coordsFound = true;
+            }
+          }
+        } catch {
+          // fallback to /api/weather below
+        }
+      } else {
+        try {
+          const ipRes = await fetch('https://ipwho.is/');
+          if (ipRes.ok) {
+            const ipData = await ipRes.json();
+            if (ipData?.success && typeof ipData.latitude === 'number' && typeof ipData.longitude === 'number') {
+              resolvedCity = ipData.city || resolvedCity;
+              lat = ipData.latitude;
+              lon = ipData.longitude;
+              coordsFound = true;
+            }
+          }
+        } catch {
+          // fallback below
+        }
+      }
+
+      if (coordsFound) {
+        const wRes = await fetch(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code,is_day&hourly=temperature_2m,weather_code&daily=sunrise,sunset&timezone=auto&forecast_days=2`
+        );
+        if (wRes.ok) {
+          const wData = await wRes.json();
+          const currentTemp = Math.round(Number(wData?.current?.temperature_2m ?? 28));
+          const weatherCode = Number(wData?.current?.weather_code ?? 2);
+          const isDay = Number(wData?.current?.is_day ?? 1) === 1;
+          const utcOffsetSeconds =
+            typeof wData?.utc_offset_seconds === 'number' ? wData.utc_offset_seconds : undefined;
+          const fmtClock = (iso: string, fallback: string) => {
+            const part = String(iso || '').split('T')[1];
+            if (!part) return fallback;
+            const [hh, mm] = part.split(':');
+            return `${parseInt(hh, 10)}:${mm || '00'}`;
+          };
+          const sunrise = fmtClock(wData?.daily?.sunrise?.[0] || '', '5:49');
+          const sunset = fmtClock(wData?.daily?.sunset?.[0] || '', '17:52');
+          const times: string[] = Array.isArray(wData?.hourly?.time) ? wData.hourly.time : [];
+          const temps: number[] = Array.isArray(wData?.hourly?.temperature_2m) ? wData.hourly.temperature_2m : [];
+          const codes: number[] = Array.isArray(wData?.hourly?.weather_code) ? wData.hourly.weather_code : [];
+
+          let localHour = new Date().getHours();
+          if (typeof utcOffsetSeconds === 'number') {
+            localHour = new Date(Date.now() + utcOffsetSeconds * 1000).getUTCHours();
+          }
+          const nowHourStr = String(localHour).padStart(2, '0') + ':00';
+          let startIdx = times.findIndex((t) => t.endsWith(`T${nowHourStr}`));
+          if (startIdx < 0) startIdx = Math.max(0, localHour);
+
+          const hourly = Array.from({ length: 7 }, (_, i) => {
+            const idx = startIdx + i;
+            const tIso = times[idx] || '';
+            return {
+              time: tIso.includes('T')
+                ? tIso.split('T')[1].slice(0, 5)
+                : `${String((localHour + i) % 24).padStart(2, '0')}:00`,
+              temp: typeof temps[idx] === 'number' ? Math.round(temps[idx]) : currentTemp,
+              code: typeof codes[idx] === 'number' ? codes[idx] : weatherCode,
+            };
+          });
+
+          setWeatherData({
+            city: resolvedCity,
+            currentTemp,
+            weatherCode,
+            isDay,
+            sunrise,
+            sunset,
+            utcOffsetSeconds,
+            hourly,
+          });
+          setWeatherAnimTick((t) => t + 1);
+          saveCityPreference(targetCity ? resolvedCity : '');
+          return;
+        }
+      }
+
+      // 2. Fallback to backend /api/weather endpoint
       let url = '/api/weather';
-      if (savedCity) {
-        url = `/api/weather?city=${encodeURIComponent(savedCity)}`;
+      if (targetCity) {
+        url = `/api/weather?city=${encodeURIComponent(targetCity)}`;
       }
       const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
         if (data?.ok) {
-          setWeatherData({
-            city: data.city || savedCity || 'Jakarta',
+          setWeatherData((prev) => ({
+            city: data.city || targetCity || 'Jakarta',
             currentTemp: typeof data.currentTemp === 'number' ? data.currentTemp : 28,
             weatherCode: typeof data.weatherCode === 'number' ? data.weatherCode : 2,
             isDay: Boolean(data.isDay ?? true),
             sunrise: data.sunrise || '5:49',
             sunset: data.sunset || '17:52',
-            hourly: Array.isArray(data.hourly) ? data.hourly.slice(0, 7) : [],
-          });
-          if (customCity !== undefined) {
-            try {
-              if (customCity.trim()) {
-                window.localStorage.setItem('isle_weather_city', customCity.trim());
-              } else {
-                window.localStorage.removeItem('isle_weather_city');
-              }
-            } catch {
-              // ignore
-            }
-          }
+            utcOffsetSeconds:
+              typeof data.utcOffsetSeconds === 'number' ? data.utcOffsetSeconds : undefined,
+            hourly:
+              Array.isArray(data.hourly) && data.hourly.length > 0
+                ? data.hourly.slice(0, 7)
+                : prev.hourly,
+          }));
+          setWeatherAnimTick((t) => t + 1);
+          saveCityPreference(targetCity);
         }
       }
     } catch {
@@ -3233,7 +3483,14 @@ export default function App() {
       const saved = window.localStorage.getItem('isle_chat_messages_v2');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) {
+          return parsed.filter(
+            (m: any) =>
+              typeof m?.text === 'string' &&
+              !m.text.includes('Maaf, gagal memproses respon AI') &&
+              !m.text.includes('experiencing high demand')
+          );
+        }
       }
     } catch {
       // ignore
@@ -3273,6 +3530,103 @@ export default function App() {
       // ignore
     }
   }, [messages]);
+
+  // Elegant Zero-Dependency Markdown Renderer for Isle Assistant:
+  // Cleans raw syntax (###, **, -) and formats headers, bold emphasis, bullets, and linebreaks
+  const renderAssistantFormattedText = useCallback((rawText: string) => {
+    if (!rawText) return null;
+
+    let cleaned = rawText.trim();
+    // Strip outer quotes if entire text is enclosed in quotes
+    if (
+      (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+      (cleaned.startsWith('“') && cleaned.endsWith('”'))
+    ) {
+      cleaned = cleaned.slice(1, -1).trim();
+    }
+
+    // Convert inline markdown headings (e.g. "...di Mobile Legends. ### Efek: - Ling...") into distinct lines
+    cleaned = cleaned.replace(/\s*###\s+/g, '\n\n### ');
+    // Convert inline bullets (e.g. "Efek: - Ling... - Setelah...") into newlines
+    cleaned = cleaned.replace(/\s+-\s+([A-Za-z0-9])/g, '\n- $1');
+
+    const lines = cleaned.split('\n');
+
+    const formatInline = (str: string, keyPrefix: string) => {
+      const parts = str.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g);
+      return parts.map((part, i) => {
+        const k = `${keyPrefix}-${i}`;
+        if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+          return (
+            <code
+              key={k}
+              className="px-1 py-0.2 rounded bg-white/12 font-mono text-[10px] text-amber-300"
+            >
+              {part.slice(1, -1)}
+            </code>
+          );
+        }
+        if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+          return (
+            <strong key={k} className="font-bold text-white">
+              {part.slice(2, -2)}
+            </strong>
+          );
+        }
+        if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+          return (
+            <em key={k} className="italic text-white/90">
+              {part.slice(1, -1)}
+            </em>
+          );
+        }
+        return <span key={k}>{part}</span>;
+      });
+    };
+
+    return (
+      <div className="space-y-1.5 leading-relaxed">
+        {lines.map((line, idx) => {
+          const trimmed = line.trim();
+          if (!trimmed) return null;
+
+          // Heading line (### Title, ## Title, # Title)
+          const headingMatch = trimmed.match(/^#{1,3}\s+(.+)$/);
+          if (headingMatch) {
+            const title = headingMatch[1].replace(/[:]+$/, '');
+            return (
+              <div
+                key={`h-${idx}`}
+                className="text-[11px] font-bold text-amber-300 tracking-tight pt-1 flex items-center gap-1.5"
+              >
+                <span className="w-1 h-3 rounded-full bg-amber-400 shrink-0" />
+                <span>{title}</span>
+              </div>
+            );
+          }
+
+          // Bullet item (- Item, * Item, • Item, 1. Item)
+          const bulletMatch = trimmed.match(/^(?:[-*•]|\d+\.)\s+(.+)$/);
+          if (bulletMatch) {
+            return (
+              <div key={`b-${idx}`} className="flex items-start gap-1.5 pl-0.5 my-0.5">
+                <span className="text-amber-400 font-bold text-[9px] mt-0.5 shrink-0">•</span>
+                <div className="flex-1 min-w-0 text-white/92">
+                  {formatInline(bulletMatch[1], `b-${idx}`)}
+                </div>
+              </div>
+            );
+          }
+
+          return (
+            <p key={`p-${idx}`} className="text-white/92">
+              {formatInline(trimmed, `p-${idx}`)}
+            </p>
+          );
+        })}
+      </div>
+    );
+  }, []);
 
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -3707,6 +4061,7 @@ export default function App() {
         signal: controller.signal,
         body: JSON.stringify({
           prompt: effectivePrompt,
+          model: assistantModel,
           image: imageToSend
             ? {
                 data: imageToSend.base64,
@@ -4032,7 +4387,7 @@ export default function App() {
         {
           id: errReplyId,
           role: 'assistant',
-          text: `⚠️ Maaf, AI belum merespons (${errMsg}). Silakan coba tanyakan kembali.`,
+          text: `Maaf, AI belum merespons (${errMsg}). Silakan coba tanyakan kembali.`,
           timestamp: timeStr,
         },
       ]);
@@ -4775,17 +5130,6 @@ export default function App() {
       };
     }
 
-    if (activePage === 'weather' && !settingsOpen) {
-      return {
-        targetW: 440,
-        targetH: 192,
-        targetR: 34,
-        targetS: 16,
-        tintStyle: 'none' as const,
-        tintRgb: [0.95, 0.78, 0.22] as [number, number, number],
-      };
-    }
-
     return {
       targetW: 440,
       targetH: 178,
@@ -4876,25 +5220,14 @@ export default function App() {
         const isExternalSource = Boolean(activeTrack && activeTrack.sourceType === 'external');
         const activeShuffleState = isExternalSource ? externalShuffleEnabled : moodShuffleEnabled;
         const displayHeadline = activeTrack
-          ? lyricsMode
-            ? activeTrack.title
-            : activeTrack.artist &&
-              !activeTrack.title.toLowerCase().includes(activeTrack.artist.toLowerCase())
-            ? `${activeTrack.title} - ${activeTrack.artist}`
-            : activeTrack.title
+          ? activeTrack.title
           : mediaLoading
           ? 'Memuat lagu...'
           : 'Tidak ada media';
         const displaySub = mediaLoading
           ? 'Menyiapkan Official Studio Audio & Synced Lyrics...'
           : activeTrack
-          ? lyricsMode
-            ? activeTrack.artist
-              ? `${activeTrack.artist} - ${activeTrack.title}`
-              : activeTrack.title
-            : isExternalSource && activeTrack.externalApp
-            ? `${activeTrack.artist || activeTrack.title} · ${activeTrack.externalApp}`
-            : activeTrack.artist || activeTrack.title
+          ? activeTrack.artist || ''
           : '';
         const displayLyricsLines = activeTrack ? parsedLyrics : [];
         const controlsActive = Boolean(activeTrack);
@@ -6210,345 +6543,294 @@ export default function App() {
         );
 
       case 'weather': {
-        // Parse sunrise & sunset minutes to compute exact live position of the Sun along the golden horizon curve
-        const parseClockMin = (str: string, defMin: number) => {
-          const m = str.match(/(\d{1,2}):(\d{2})/);
-          if (!m) return defMin;
-          return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-        };
-        const sunriseMin = parseClockMin(weatherData.sunrise, 5 * 60 + 49);
-        const sunsetMin = parseClockMin(weatherData.sunset, 17 * 60 + 37);
-        const nowMin = nowDate.getHours() * 60 + nowDate.getMinutes();
-        const rawProgress =
-          sunsetMin > sunriseMin
-            ? (nowMin - sunriseMin) / (sunsetMin - sunriseMin)
-            : 0.48;
-        const sunT = Math.min(0.92, Math.max(0.08, rawProgress));
-
-        // Quadratic Bezier curve from (46, 74) via control point (200, 2) to (354, 74)
+        // Elevated quadratic Bezier solar arc from (46, 70) via (200, -18) to (354, 70)
+        // Gives a higher arch (apex at y=26) so the center temperature text below has generous breathing room
+        const sunT = animatedSunT;
         const p0x = 46;
-        const p0y = 74;
+        const p0y = 70;
         const p1x = 200;
-        const p1y = 2;
+        const p1y = -18;
         const p2x = 354;
-        const p2y = 74;
+        const p2y = 70;
         const oneMinusT = 1 - sunT;
         const sunX = oneMinusT * oneMinusT * p0x + 2 * oneMinusT * sunT * p1x + sunT * sunT * p2x;
         const sunY = oneMinusT * oneMinusT * p0y + 2 * oneMinusT * sunT * p1y + sunT * sunT * p2y;
+        // De Casteljau control point for the traversed portion of the solar arc from sunrise to current sun position
+        const activeCtrlX = p0x + sunT * (p1x - p0x);
+        const activeCtrlY = p0y + sunT * (p1y - p0y);
 
-        const fullDays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-        const weatherDateLabel = `${fullDays[nowDate.getDay()]}, ${nowDate.getDate()} ${SHORT_MONTHS[
-          nowDate.getMonth()
-        ].toLowerCase()}`;
+        const getWeatherConditionLabel = (code: number, isDayTime: boolean): string => {
+          if (code === 0) return isDayTime ? 'Cerah' : 'Malam Cerah';
+          if (code === 1 || code === 2) return 'Cerah Berawan';
+          if (code === 3) return 'Berawan';
+          if (code === 45 || code === 48) return 'Berkabut';
+          if (code >= 51 && code <= 57) return 'Gerimis';
+          if (code >= 61 && code <= 67) return 'Hujan Ringan';
+          if (code >= 71 && code <= 77) return 'Bersalju';
+          if (code >= 80 && code <= 82) return 'Hujan Deras';
+          if (code >= 95) return 'Hujan Petir';
+          return 'Cerah Berawan';
+        };
 
-        const renderHourlyWeatherIcon = (code: number, idx: number) => {
-          const isDarkCloud = code >= 51 || idx < 3;
+        const weatherConditionText = getWeatherConditionLabel(
+          weatherData.weatherCode,
+          weatherData.isDay
+        );
+
+        const renderHourlyWeatherIcon = (code: number, timeStr: string) => {
+          const hourNum = parseInt(String(timeStr || '12:00').split(':')[0], 10);
+          const isNightHour = !Number.isNaN(hourNum) && (hourNum < 6 || hourNum >= 18);
+
+          // 0: Clear Sky (Sun by day, Crescent Moon + Star by night)
+          if (code === 0) {
+            if (isNightHour) {
+              return (
+                <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
+                  <path
+                    d="M17.2 4.5a6.2 6.2 0 1 0 5.3 9.4 5.2 5.2 0 0 1-5.3-9.4z"
+                    fill="#facc15"
+                  />
+                  <circle cx={9.5} cy={7.5} r={1} fill="#fde047" opacity={0.85} />
+                </svg>
+              );
+            }
+            return (
+              <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
+                <circle cx={14} cy={11} r={4.8} fill="#facc15" />
+                {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => {
+                  const rad = (deg * Math.PI) / 180;
+                  return (
+                    <circle
+                      key={deg}
+                      cx={14 + Math.cos(rad) * 7.4}
+                      cy={11 + Math.sin(rad) * 7.4}
+                      r={1}
+                      fill="#fde047"
+                    />
+                  );
+                })}
+              </svg>
+            );
+          }
+
+          // 95+: Thunderstorm (Dark Storm Cloud + Lightning Bolt)
+          if (code >= 95) {
+            return (
+              <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
+                <path
+                  d="M8.5 15.8h10.2c2.4 0 4.3-1.8 4.3-4.1 0-2.1-1.6-3.9-3.7-4.1-.7-2.4-2.8-4.1-5.5-4.1-3.1 0-5.6 2.5-5.6 5.5 0 .3 0 .5.1.8-1.5.5-2.6 1.8-2.6 3.5 0 1.4 1.5 2.5 2.8 2.5z"
+                  fill="#525866"
+                />
+                <path
+                  d="M14.6 12.2l-2.3 3.9h2l-.8 3.6 3.4-4.4h-2.1l.8-3.1z"
+                  fill="#facc15"
+                />
+              </svg>
+            );
+          }
+
+          // 51..82: Drizzle / Rain / Showers (Cloud + Blue Raindrops)
+          if (code >= 51 && code <= 82) {
+            return (
+              <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
+                <path
+                  d="M8.5 15.5h10.2c2.4 0 4.3-1.8 4.3-4.1 0-2.1-1.6-3.9-3.7-4.1-.7-2.4-2.8-4.1-5.5-4.1-3.1 0-5.6 2.5-5.6 5.5 0 .3 0 .5.1.8-1.5.5-2.6 1.8-2.6 3.5 0 1.4 1.5 2.5 2.8 2.5z"
+                  fill="#64748b"
+                />
+                <line x1={10.5} y1={17.2} x2={9.6} y2={20} stroke="#60a5fa" strokeWidth={1.5} strokeLinecap="round" />
+                <line x1={14.2} y1={17.2} x2={13.3} y2={20} stroke="#60a5fa" strokeWidth={1.5} strokeLinecap="round" />
+                <line x1={17.9} y1={17.2} x2={17} y2={20} stroke="#60a5fa" strokeWidth={1.5} strokeLinecap="round" />
+              </svg>
+            );
+          }
+
+          // 3, 45, 48: Overcast / Fog (Layered Sculpted Clouds)
+          if (code === 3 || code === 45 || code === 48) {
+            return (
+              <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
+                <circle cx={19.5} cy={8.5} r={4} fill="#64748b" opacity={0.85} />
+                <path
+                  d="M8.5 18.5h10.2c2.6 0 4.6-2 4.6-4.5 0-2.3-1.7-4.2-3.9-4.4-.7-2.6-3-4.5-5.8-4.5-3.3 0-6 2.7-6 6 0 .3 0 .6.1.9-1.6.5-2.8 2-2.8 3.8 0 1.5 1.6 2.7 3.6 2.7z"
+                  fill="#94a3b8"
+                />
+              </svg>
+            );
+          }
+
+          // 1, 2 (Default): Partly Cloudy (Warm Sun by Day or Soft Moon Accent by Night behind Cloud)
           return (
-            <svg width={26} height={20} viewBox="0 0 28 22" className="shrink-0">
-              {/* Subtle rear cloud/moon accent */}
+            <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
               <circle
                 cx={19.5}
-                cy={8.5}
+                cy={8.2}
                 r={4}
-                fill={isDarkCloud ? '#8fa0b5' : '#525866'}
-                opacity={0.85}
+                fill={isNightHour ? '#8fa0b5' : '#facc15'}
+                opacity={0.9}
               />
-              {/* Main sculpted cloud silhouette matching reference */}
               <path
                 d="M8.5 18.5h10.2c2.6 0 4.6-2 4.6-4.5 0-2.3-1.7-4.2-3.9-4.4-.7-2.6-3-4.5-5.8-4.5-3.3 0-6 2.7-6 6 0 .3 0 .6.1.9-1.6.5-2.8 2-2.8 3.8 0 1.5 1.6 2.7 3.6 2.7z"
-                fill={isDarkCloud ? '#4a4e54' : '#b8c7db'}
+                fill={isNightHour ? '#64748b' : '#cbd5e1'}
               />
             </svg>
           );
         };
 
-        const quickCities = ['Jakarta', 'Bandung', 'Surabaya', 'Yogyakarta', 'Bali', 'Tokyo'];
-        const isCrossFading = editingWeatherCity || weatherTransitioning || weatherLoading;
+        const isSwitchingCity = weatherTransitioning;
 
         return (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="relative w-full h-full flex flex-col justify-between overflow-hidden rounded-b-[32px] select-none pt-3 pb-1"
+            className="relative w-full h-full flex flex-col justify-between overflow-hidden rounded-b-[32px] select-none pt-0.5 pb-0.5"
           >
-            {/* Top-Left Date & Location Pin (Click city to change manually or auto-detect) + Top-Right Quick Actions */}
-            <div className="flex items-start justify-between px-7 z-20 shrink-0">
-              <div className="flex flex-col">
-                <span className="text-[11px] font-medium text-white/65 tracking-tight leading-tight">
-                  {weatherDateLabel}
-                </span>
-                {editingWeatherCity ? (
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      setEditingWeatherCity(false);
-                      fetchWeatherData(weatherCityInput);
-                    }}
-                    className="flex items-center gap-1.5 mt-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
-                  >
-                    <input
-                      type="text"
-                      autoFocus
-                      value={weatherCityInput}
-                      onChange={(e) => setWeatherCityInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Escape') {
-                          e.stopPropagation();
-                          setEditingWeatherCity(false);
-                        }
-                      }}
-                      placeholder="Ketik kota (Enter)..."
-                      className="w-[132px] bg-white/10 border border-white/25 rounded-[2px] px-1.5 py-0.5 text-[10.5px] text-white placeholder-white/40 focus:outline-none focus:border-[#f7d648]/80 transition-colors"
-                    />
-                    <button
-                      type="submit"
-                      className="px-1.5 py-0.5 bg-white/15 hover:bg-white/25 text-[9.5px] font-semibold text-white rounded-[2px] transition cursor-pointer"
-                    >
-                      OK
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEditingWeatherCity(false)}
-                      className="px-1 py-0.5 text-[9.5px] text-white/50 hover:text-white transition cursor-pointer"
-                    >
-                      ✕
-                    </button>
-                  </form>
-                ) : (
-                  <div className="flex items-center gap-1.5 mt-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]">
-                    <button
-                      onClick={() => {
-                        setWeatherCityInput(
-                          weatherData.city === 'Mendeteksi...' ? '' : weatherData.city
-                        );
-                        setEditingWeatherCity(true);
-                      }}
-                      title="Klik untuk ganti kota manual (kosongkan untuk deteksi otomatis)"
-                      className="inline-flex items-center gap-1 text-left group cursor-pointer"
-                    >
-                      <svg
-                        width={10}
-                        height={10}
-                        viewBox="0 0 24 24"
-                        fill="#d4d4d8"
-                        className="shrink-0 group-hover:fill-white transition"
-                      >
-                        <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 010-5 2.5 2.5 0 010 5z" />
-                      </svg>
-                      <span
-                        className={`text-[11.5px] font-semibold text-white/90 group-hover:text-white tracking-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                          weatherTransitioning || weatherLoading ? 'opacity-45 translate-y-[1px]' : 'opacity-100 translate-y-0'
-                        }`}
-                      >
-                        {weatherLoading ? 'Memuat...' : weatherData.city}
-                      </span>
-                    </button>
-                    <button
-                      onClick={() => {
-                        setEditingWeatherCity(false);
-                        fetchWeatherData('');
-                      }}
-                      title="Deteksi lokasi otomatis"
-                      className="text-[9.5px] text-white/35 hover:text-white/80 font-medium transition cursor-pointer"
-                    >
-                      Auto
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Subtle Top-Right Current Temp & Assistant Trigger */}
-              <div className="flex items-center gap-2 text-white/75">
-                <span
-                  className={`text-[12px] font-semibold text-[#f5d547] tabular-nums transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                    isCrossFading ? 'opacity-50 scale-95' : 'opacity-100 scale-100'
-                  }`}
-                >
-                  {weatherData.currentTemp}°C
-                </span>
-                <button
-                  onClick={() => {
-                    setShowAllChatHistory(false);
-                    setAssistantOpen(true);
-                    setAssistantMode(defaultAltQMode);
-                  }}
-                  title="Buka Isle Assistant (Alt+Q)"
-                  className="text-white/60 hover:text-white transition cursor-pointer"
-                >
-                  <SparkleFourPointSvg size={13} />
-                </button>
-              </div>
-            </div>
-
-            {/* Center Current Conditions (Golden Solar Horizon Curve + Sunrise/Sunset + Clock) with Fluid Cross-Fade on City Selector Interaction */}
-            <div className="relative w-full h-[78px] flex items-center justify-center shrink-0 -mt-2">
-              {/* Layer 1: Live Solar Horizon Curve & Current Conditions */}
+            {/* Center Current Conditions (Golden Solar Horizon Curve + Sunrise/Sunset + Cleanly Spaced Center Temp) */}
+            <div className="relative w-full h-[68px] flex items-center justify-center shrink-0 -mt-1">
               <div
                 className={`relative w-full h-full flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                  editingWeatherCity
-                    ? 'opacity-0 scale-[0.96] -translate-y-1.5 pointer-events-none'
-                    : weatherTransitioning || weatherLoading
-                    ? 'opacity-40 scale-[0.985] translate-y-0.5'
-                    : 'opacity-100 scale-100 translate-y-0'
+                  isSwitchingCity
+                    ? 'opacity-70 scale-[0.98] translate-y-0.5'
+                    : 'opacity-100 scale-100 translate-y-0 blur-0'
                 }`}
               >
                 <svg
-                  width={400}
-                  height={84}
+                  width={392}
+                  height={72}
                   viewBox="0 0 400 84"
                   className="overflow-visible pointer-events-none"
                 >
                   <defs>
-                    <linearGradient id="isleSolarArcGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                      <stop offset="0%" stopColor="#eab308" stopOpacity="0.12" />
-                      <stop offset="22%" stopColor="#facc15" stopOpacity="0.88" />
-                      <stop offset="50%" stopColor="#fde047" stopOpacity="1" />
-                      <stop offset="78%" stopColor="#eab308" stopOpacity="0.85" />
-                      <stop offset="100%" stopColor="#ca8a04" stopOpacity="0.12" />
+                    <linearGradient id="isleSolarArcBaseGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#eab308" stopOpacity="0.08" />
+                      <stop offset="25%" stopColor="#facc15" stopOpacity="0.32" />
+                      <stop offset="50%" stopColor="#fde047" stopOpacity="0.42" />
+                      <stop offset="75%" stopColor="#eab308" stopOpacity="0.32" />
+                      <stop offset="100%" stopColor="#ca8a04" stopOpacity="0.08" />
+                    </linearGradient>
+                    <linearGradient id="isleSolarArcActiveGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#eab308" stopOpacity="0.25" />
+                      <stop offset="50%" stopColor="#facc15" stopOpacity="0.95" />
+                      <stop offset="100%" stopColor="#fde047" stopOpacity="1" />
                     </linearGradient>
                     <radialGradient id="isleSunGlow" cx="50%" cy="50%" r="50%">
-                      <stop offset="0%" stopColor="#fde047" stopOpacity="0.45" />
-                      <stop offset="55%" stopColor="#eab308" stopOpacity="0.14" />
+                      <stop offset="0%" stopColor="#fde047" stopOpacity="0.48" />
+                      <stop offset="55%" stopColor="#eab308" stopOpacity="0.16" />
                       <stop offset="100%" stopColor="#eab308" stopOpacity="0" />
                     </radialGradient>
                   </defs>
 
-                  {/* Ambient Warm Solar Glow Behind Sun */}
-                  <circle cx={sunX} cy={sunY} r={34} fill="url(#isleSunGlow)" />
-
-                  {/* Golden Horizon Arc */}
+                  {/* Full Horizon Base Track */}
                   <path
                     d={`M ${p0x} ${p0y} Q ${p1x} ${p1y} ${p2x} ${p2y}`}
                     fill="none"
-                    stroke="url(#isleSolarArcGrad)"
-                    strokeWidth={4.2}
+                    stroke="url(#isleSolarArcBaseGrad)"
+                    strokeWidth={3.6}
                     strokeLinecap="round"
                   />
 
-                  {/* Sun Core + 8 Surrounding Ray Dots (Matches reference image) */}
-                  <g
-                    transform={`translate(${sunX}, ${sunY})`}
-                    className="transition-transform duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]"
-                  >
-                    <circle cx={0} cy={0} r={12.5} fill="#f7d648" />
+                  {/* Smoothly Animated Traversed Solar Arc up to Current Sun Position */}
+                  <path
+                    d={`M ${p0x} ${p0y} Q ${activeCtrlX} ${activeCtrlY} ${sunX} ${sunY}`}
+                    fill="none"
+                    stroke="url(#isleSolarArcActiveGrad)"
+                    strokeWidth={4}
+                    strokeLinecap="round"
+                  />
+
+                  {/* Ambient Warm Solar Glow Behind Sun (Follows exact Bezier curve coordinates) */}
+                  <circle cx={sunX} cy={sunY} r={30} fill="url(#isleSunGlow)" />
+
+                  {/* Sun Core + 8 Surrounding Ray Dots */}
+                  <g transform={`translate(${sunX}, ${sunY})`}>
+                    <circle cx={0} cy={0} r={10.5} fill="#f7d648" />
                     {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => {
                       const rad = (deg * Math.PI) / 180;
-                      const rx = Math.cos(rad) * 18.5;
-                      const ry = Math.sin(rad) * 18.5;
-                      return <circle key={deg} cx={rx} cy={ry} r={1.8} fill="#f7d648" />;
+                      const rx = Math.cos(rad) * 16.5;
+                      const ry = Math.sin(rad) * 16.5;
+                      return <circle key={deg} cx={rx} cy={ry} r={1.6} fill="#f7d648" />;
                     })}
                   </g>
                 </svg>
 
                 {/* Left Sunrise Label */}
-                <div className="absolute left-9 bottom-1.5 flex flex-col items-center leading-tight">
-                  <span className="text-[10.5px] font-medium text-white/85">Sunrise</span>
-                  <span className="text-[11px] font-semibold text-white tabular-nums mt-0.5">
+                <div
+                  className={`absolute left-9 bottom-0.5 flex flex-col items-center leading-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isSwitchingCity
+                      ? 'opacity-60 scale-95 translate-y-0.5'
+                      : 'opacity-100 scale-100 translate-y-0'
+                  }`}
+                >
+                  <span className="text-[9.5px] font-medium text-white/65">Sunrise</span>
+                  <span className="text-[10.5px] font-semibold text-white tabular-nums">
                     {weatherData.sunrise}
                   </span>
                 </div>
 
-                {/* Center Large Thin Digital Time */}
-                <div className="absolute inset-x-0 bottom-0.5 flex justify-center pointer-events-none">
-                  <span className="text-[28px] font-light text-white tracking-wider tabular-nums leading-none">
-                    {timeStr}
+                {/* Center Temperature & Condition Readout (Positioned cleanly below the elevated solar curve apex) */}
+                <div
+                  className={`absolute inset-x-0 -bottom-1 flex flex-col items-center justify-center pointer-events-none transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isSwitchingCity
+                      ? 'opacity-60 scale-95 translate-y-0.5'
+                      : 'opacity-100 scale-100 translate-y-0'
+                  }`}
+                >
+                  <span className="text-[19px] font-bold text-white tracking-tight tabular-nums leading-none">
+                    {weatherData.currentTemp}°C
+                  </span>
+                  <span className="text-[9px] font-medium text-[#f7d648]/90 tracking-tight mt-1">
+                    {weatherConditionText}
                   </span>
                 </div>
 
                 {/* Right Sunset Label */}
-                <div className="absolute right-9 bottom-1.5 flex flex-col items-center leading-tight">
-                  <span className="text-[10.5px] font-medium text-white/85">Sunset</span>
-                  <span className="text-[11px] font-semibold text-white tabular-nums mt-0.5">
+                <div
+                  className={`absolute right-9 bottom-0.5 flex flex-col items-center leading-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isSwitchingCity
+                      ? 'opacity-60 scale-95 translate-y-0.5'
+                      : 'opacity-100 scale-100 translate-y-0'
+                  }`}
+                >
+                  <span className="text-[9.5px] font-medium text-white/65">Sunset</span>
+                  <span className="text-[10.5px] font-semibold text-white tabular-nums">
                     {weatherData.sunset}
                   </span>
                 </div>
               </div>
-
-              {/* Layer 2: Interactive City Selector Quick-Pick Overlay (Cross-Fades smoothly when editingWeatherCity is open) */}
-              <div
-                className={`absolute inset-0 px-7 flex flex-col justify-center gap-1.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                  editingWeatherCity
-                    ? 'opacity-100 scale-100 translate-y-0 pointer-events-auto'
-                    : 'opacity-0 scale-[0.97] translate-y-1.5 pointer-events-none'
-                }`}
-              >
-                <div className="flex items-center justify-between text-[10px] text-white/55">
-                  <span>Pilih kota cepat atau ketik di atas:</span>
-                  <span className="text-white/80 font-medium tabular-nums">
-                    Saat ini: {weatherData.city} · {weatherData.currentTemp}°C
-                  </span>
-                </div>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <button
-                    type="button"
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      setEditingWeatherCity(false);
-                      fetchWeatherData('');
-                    }}
-                    className="px-2 py-1 bg-white/10 hover:bg-white/20 border border-white/15 rounded-[2px] text-[10px] font-semibold text-[#f7d648] transition cursor-pointer"
-                  >
-                    Auto Lokasi
-                  </button>
-                  {quickCities.map((cityItem) => (
-                    <button
-                      key={cityItem}
-                      type="button"
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        setWeatherCityInput(cityItem);
-                        setEditingWeatherCity(false);
-                        fetchWeatherData(cityItem);
-                      }}
-                      className={`px-2 py-1 border rounded-[2px] text-[10px] font-medium transition cursor-pointer ${
-                        weatherData.city.toLowerCase() === cityItem.toLowerCase()
-                          ? 'bg-white/20 border-white/40 text-white'
-                          : 'bg-white/[0.06] hover:bg-white/15 border-white/10 text-white/75 hover:text-white'
-                      }`}
-                    >
-                      {cityItem}
-                    </button>
-                  ))}
-                </div>
-              </div>
             </div>
 
-            {/* Bottom Dark Wave Silhouette (Clipped & Feathered Inside Island Curve) + 7 Hourly Forecast Columns with Fluid Cross-Fade */}
-            <div className="relative w-full pt-1 pb-0.5 px-6 z-10 shrink-0 overflow-hidden rounded-b-[30px]">
-              {/* Subtle Wave Backdrop with Soft Bottom-Edge & Corner Fade */}
+            {/* Bottom Translucent Wave Silhouette + 7 Hourly Forecast Columns */}
+            <div className="relative w-full pt-0.5 pb-0.5 px-7 z-10 shrink-0 overflow-hidden rounded-b-[30px]">
+              {/* Subtle Translucent Wave Backdrop (Preserves Dynamic Music Album Wash) */}
               <svg
-                viewBox="0 0 440 58"
+                viewBox="0 0 440 52"
                 preserveAspectRatio="none"
-                className="absolute inset-x-3 bottom-0 w-[calc(100%-24px)] h-[52px] pointer-events-none"
+                className="absolute inset-x-3 bottom-0 w-[calc(100%-24px)] h-[46px] pointer-events-none"
               >
                 <defs>
                   <linearGradient id="isleWeatherWaveFill" x1="0%" y1="0%" x2="0%" y2="100%">
-                    <stop offset="0%" stopColor="rgb(28, 31, 38)" stopOpacity="0.68" />
-                    <stop offset="68%" stopColor="rgb(18, 20, 26)" stopOpacity="0.38" />
+                    <stop offset="0%" stopColor="rgb(255, 255, 255)" stopOpacity="0.06" />
+                    <stop offset="65%" stopColor="rgb(0, 0, 0)" stopOpacity="0.14" />
                     <stop offset="100%" stopColor="rgb(0, 0, 0)" stopOpacity="0" />
                   </linearGradient>
                 </defs>
                 <path
-                  d="M0,20 Q95,-2 215,20 T440,14 L440,58 L0,58 Z"
+                  d="M0,18 Q95,-2 215,18 T440,12 L440,52 L0,52 Z"
                   fill="url(#isleWeatherWaveFill)"
                 />
               </svg>
 
               <div
                 className={`relative z-10 grid grid-cols-7 gap-1 items-center justify-items-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                  editingWeatherCity
-                    ? 'opacity-35 scale-[0.98] translate-y-0.5'
-                    : weatherTransitioning || weatherLoading
-                    ? 'opacity-25 scale-[0.985] translate-y-1'
-                    : 'opacity-100 scale-100 translate-y-0'
+                  isSwitchingCity
+                    ? 'opacity-65 scale-[0.98] translate-y-0.5'
+                    : 'opacity-100 scale-100 translate-y-0 blur-0'
                 }`}
               >
                 {weatherData.hourly.slice(0, 7).map((item, idx) => (
-                  <div key={`${item.time}-${idx}`} className="flex flex-col items-center gap-0.5">
-                    <span className="text-[9.5px] font-medium text-white/60 tabular-nums">
+                  <div key={`${item.time}-${idx}`} className="flex flex-col items-center gap-0">
+                    <span className="text-[9px] font-medium text-white/60 tabular-nums">
                       {item.time}
                     </span>
-                    <div className="my-0.5">{renderHourlyWeatherIcon(item.code, idx)}</div>
-                    <span className="text-[10.5px] font-bold text-white tabular-nums">
+                    <div className="my-0.5">{renderHourlyWeatherIcon(item.code, item.time)}</div>
+                    <span className="text-[10px] font-bold text-white tabular-nums">
                       {item.temp}°
                     </span>
                   </div>
@@ -6579,6 +6861,10 @@ export default function App() {
           voiceLevelRef={voiceEnergyRef}
           nudgeTrigger={nudgeCount}
           onMouseEnter={() => {
+            if (hoverLeaveTimerRef.current !== null) {
+              window.clearTimeout(hoverLeaveTimerRef.current);
+              hoverLeaveTimerRef.current = null;
+            }
             setDesktopClickThrough(false);
             if (activeAlert) {
               setAlertHovered(true);
@@ -6587,20 +6873,26 @@ export default function App() {
             }
           }}
           onMouseLeave={() => {
-            setDesktopClickThrough(true);
-            if (activeAlert) {
-              setAlertHovered(false);
-            } else {
-              if (lyricsMode) {
-                // Keep Island open while in lyrics view per user requirement
-                return;
-              }
-              setIsHovered(false);
-              setIsDragOver(false);
-              if (dragAutoOpened) {
-                setDragAutoOpened(false);
-              }
+            if (hoverLeaveTimerRef.current !== null) {
+              window.clearTimeout(hoverLeaveTimerRef.current);
             }
+            hoverLeaveTimerRef.current = window.setTimeout(() => {
+              hoverLeaveTimerRef.current = null;
+              setDesktopClickThrough(true);
+              if (activeAlert) {
+                setAlertHovered(false);
+              } else {
+                if (lyricsMode) {
+                  // Keep Island open while in lyrics view per user requirement
+                  return;
+                }
+                setIsHovered(false);
+                setIsDragOver(false);
+                if (dragAutoOpened) {
+                  setDragAutoOpened(false);
+                }
+              }
+            }, 450);
           }}
           onClick={(e) => {
             e.stopPropagation();
@@ -7144,6 +7436,26 @@ export default function App() {
                   <div className="flex flex-col items-end justify-between h-full py-0.5 shrink-0 pl-1">
                     <div className="flex items-center gap-1.5">
                       <button
+                        onClick={() =>
+                          setAssistantModel((m) =>
+                            m === 'gemini-3.1-flash-lite' ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite'
+                          )
+                        }
+                        className={`px-1.5 py-0.5 rounded-full text-[9px] font-semibold transition flex items-center gap-1 ${
+                          assistantModel === 'gemini-3.1-flash-lite'
+                            ? 'bg-amber-400/20 text-amber-300 border border-amber-400/35'
+                            : 'bg-purple-500/20 text-purple-300 border border-purple-400/35'
+                        }`}
+                        title="Klik untuk ganti model AI: Fast (Gemini 3.1 Flash Lite) / Thinking (Muse Spark 1.3)"
+                      >
+                        {assistantModel === 'gemini-3.1-flash-lite' ? (
+                          <FastLightningSvg size={10} />
+                        ) : (
+                          <ThinkingBrainSvg size={10} />
+                        )}
+                        <span>{assistantModel === 'gemini-3.1-flash-lite' ? 'Fast' : 'Thinking'}</span>
+                      </button>
+                      <button
                         onClick={() => {
                           const nextLang = voiceLang === 'id-ID' ? 'en-US' : 'id-ID';
                           setVoiceLang(nextLang);
@@ -7244,6 +7556,34 @@ export default function App() {
                     </div>
 
                     <div className="flex items-center gap-1 shrink-0">
+                      {/* Model Selector Pill: Fast (gemini-3.1-flash-lite) vs Thinking (muse-spark-1.3-contributor) */}
+                      <div className="flex items-center bg-white/[0.08] hover:bg-white/[0.12] border border-white/10 rounded-full p-0.5 text-[9px] transition mr-0.5">
+                        <button
+                          onClick={() => setAssistantModel('gemini-3.1-flash-lite')}
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded-full transition ${
+                            assistantModel === 'gemini-3.1-flash-lite'
+                              ? 'bg-amber-400 text-black font-bold shadow-xs'
+                              : 'text-white/60 hover:text-white font-medium'
+                          }`}
+                          title="Mode Cepat: Gemini 3.1 Flash Lite (Respon Kilat via Google AI Studio)"
+                        >
+                          <FastLightningSvg size={10} />
+                          <span>Fast</span>
+                        </button>
+                        <button
+                          onClick={() => setAssistantModel('muse-spark-1.3-contributor')}
+                          className={`flex items-center gap-1 px-2 py-0.5 rounded-full transition ${
+                            assistantModel === 'muse-spark-1.3-contributor'
+                              ? 'bg-gradient-to-r from-purple-500 to-indigo-500 text-white font-bold shadow-xs'
+                              : 'text-white/60 hover:text-white font-medium'
+                          }`}
+                          title="Mode Thinking: Muse Spark 1.3 Contributor (Analisis Mendalam via Bynara)"
+                        >
+                          <ThinkingBrainSvg size={10} />
+                          <span>Thinking</span>
+                        </button>
+                      </div>
+
                       <div className="flex items-center bg-white/[0.07] rounded-full p-0.5 text-[9px] mr-0.5">
                         <button
                           onClick={() => {
@@ -7313,7 +7653,12 @@ export default function App() {
                           />
                         </div>
                         <GeminiThinkingIndicator
-                          label={agentHeadline || 'Isle Assistant thinking...'}
+                          label={
+                            agentHeadline ||
+                            (assistantModel === 'gemini-3.1-flash-lite'
+                              ? 'Gemini 3.1 Flash Lite thinking...'
+                              : 'Muse Spark Thinking...')
+                          }
                         />
                       </div>
                     ) : showAllChatHistory ? (
@@ -7340,7 +7685,7 @@ export default function App() {
                                   />
                                 )}
                                 <div className="text-[11.5px] text-white/90 leading-relaxed select-text break-words">
-                                  {m.text}
+                                  {renderAssistantFormattedText(m.text)}
                                 </div>
                               </div>
                             </div>
@@ -7370,9 +7715,11 @@ export default function App() {
                             />
                           )}
                           <div className="text-[11.5px] text-white/92 leading-relaxed select-text break-words flex-1 min-w-0">
-                            {animatingMsgId === latestAssistantMessage.id
-                              ? latestAssistantMessage.text.slice(0, revealedChars)
-                              : latestAssistantMessage.text}
+                            {renderAssistantFormattedText(
+                              animatingMsgId === latestAssistantMessage.id
+                                ? latestAssistantMessage.text.slice(0, revealedChars)
+                                : latestAssistantMessage.text
+                            )}
                             {animatingMsgId === latestAssistantMessage.id && (
                               <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-white/70 animate-pulse rounded-xs" />
                             )}
@@ -7612,7 +7959,9 @@ export default function App() {
                             ? 'Listening...'
                             : pendingImage
                             ? 'Tanyakan sesuatu tentang gambar ini...'
-                            : 'Type here, paste image, or "ambil screenshot"'
+                            : assistantModel === 'gemini-3.1-flash-lite'
+                            ? 'Tanya cepat dengan Gemini 3.1 Flash Lite... (Enter)'
+                            : 'Tanya mendalam dengan Muse Spark Thinking... (Enter)'
                         }
                         className="flex-1 bg-transparent text-[11.5px] text-white placeholder-white/35 focus:outline-none min-w-0"
                       />
@@ -7670,24 +8019,156 @@ export default function App() {
                   : 'opacity-0 scale-[0.84] -translate-y-3 blur-[6px] pointer-events-none'
               }`}
             >
-              {/* ── Top Header Row on Non-Music/Weather Pages (Clean Minimalist Title + Battery & Clock in Corner) ── */}
-              {activePage !== 'music' && activePage !== 'weather' && (
+              {/* ── Top Header Row on Non-Music Pages (Clean Title / Weather City Search on Left + Battery, Date & Clock on Right) ── */}
+              {activePage !== 'music' && (
                 <div className="w-full flex items-center justify-between px-6 pt-2.5 pb-1 z-20 shrink-0 animate-[ isleFadeIn_200ms_ease-out ]">
-                  {/* Clean Page Title + Shelf "Clear" Action */}
-                  <div className="flex items-center gap-2">
-                    <span className="text-[12.5px] font-bold text-white tracking-tight">
-                      {ISLAND_PAGES.find((p) => p.id === activePage)?.label || activePage}
-                    </span>
-                    {activePage === 'shelf' && shelfFiles.length > 0 && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setShelfFiles([]);
-                        }}
-                        className="px-2.5 py-0.5 rounded-full bg-white/12 hover:bg-white/22 text-[10px] font-semibold text-white/90 transition animate-[ isleFadeIn_160ms_ease-out ]"
+                  {/* Left: Page Title OR Interactive Weather City & Manual Search Input */}
+                  <div className="flex items-center gap-2 min-w-0">
+                    {activePage === 'weather' ? (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="relative flex items-center h-[20px] min-w-[140px]"
                       >
-                        Clear
-                      </button>
+                        {/* Minimalist Inline Search Input (Fluidly morphs in when editingWeatherCity is true) */}
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const trimmed = weatherCityInput.trim();
+                            setEditingWeatherCity(false);
+                            if (trimmed) {
+                              fetchWeatherData(trimmed);
+                            }
+                          }}
+                          className={`absolute left-0 flex items-center gap-1 bg-white/[0.08] border border-white/15 focus-within:border-[#f7d648]/60 rounded-md px-2 py-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] origin-left ${
+                            editingWeatherCity
+                              ? 'opacity-100 scale-100 translate-x-0 pointer-events-auto w-[148px]'
+                              : 'opacity-0 scale-90 -translate-x-1 pointer-events-none w-[95px]'
+                          }`}
+                        >
+                          <svg
+                            width={10}
+                            height={10}
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="#f7d648"
+                            strokeWidth={2.4}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            className="shrink-0 opacity-85"
+                          >
+                            <circle cx={11} cy={11} r={7} />
+                            <line x1={21} y1={21} x2={16.65} y2={16.65} />
+                          </svg>
+                          <input
+                            type="text"
+                            ref={(el) => {
+                              if (editingWeatherCity && el) {
+                                window.requestAnimationFrame(() => el.focus());
+                              }
+                            }}
+                            value={weatherCityInput}
+                            onChange={(e) => setWeatherCityInput(e.target.value)}
+                            onBlur={() => {
+                              setEditingWeatherCity(false);
+                            }}
+                            onKeyDown={(e) => {
+                              e.stopPropagation();
+                              if (e.key === 'Escape') {
+                                setEditingWeatherCity(false);
+                              }
+                            }}
+                            placeholder="Ketik kota..."
+                            className="w-full bg-transparent text-[10.5px] font-medium text-white placeholder-white/40 focus:outline-none"
+                          />
+                          <button
+                            type="button"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setEditingWeatherCity(false);
+                              fetchWeatherData('');
+                            }}
+                            title="Deteksi lokasi otomatis (GPS/IP)"
+                            className="text-white/45 hover:text-[#f7d648] transition-colors cursor-pointer shrink-0"
+                          >
+                            <svg
+                              width={10}
+                              height={10}
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth={2.2}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <circle cx={12} cy={12} r={3} />
+                              <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
+                            </svg>
+                          </button>
+                        </form>
+
+                        {/* Clean Minimalist City Trigger (Fluidly morphs into search input on click) */}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setWeatherCityInput('');
+                            setEditingWeatherCity(true);
+                          }}
+                          title="Klik untuk cari kota lain"
+                          className={`inline-flex items-center gap-1.5 text-left group cursor-pointer transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] origin-left ${
+                            editingWeatherCity
+                              ? 'opacity-0 scale-90 translate-x-1 pointer-events-none'
+                              : 'opacity-100 scale-100 translate-x-0 pointer-events-auto'
+                          }`}
+                        >
+                          <svg
+                            width={11}
+                            height={11}
+                            viewBox="0 0 24 24"
+                            fill="#f7d648"
+                            className={`shrink-0 transition-transform duration-300 group-hover:scale-110 ${
+                              weatherLoading ? 'animate-pulse' : ''
+                            }`}
+                          >
+                            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 010-5 2.5 2.5 0 010 5z" />
+                          </svg>
+                          <span className="text-[12px] font-bold text-white group-hover:text-[#f7d648] tracking-tight truncate max-w-[125px] transition-colors">
+                            {weatherData.city}
+                          </span>
+                          <svg
+                            width={10}
+                            height={10}
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth={2.2}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            className="text-white/35 group-hover:text-white/80 transition-colors shrink-0"
+                          >
+                            <circle cx={11} cy={11} r={7} />
+                            <line x1={21} y1={21} x2={16.65} y2={16.65} />
+                          </svg>
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="text-[12.5px] font-bold text-white tracking-tight">
+                          {ISLAND_PAGES.find((p) => p.id === activePage)?.label || activePage}
+                        </span>
+                        {activePage === 'shelf' && shelfFiles.length > 0 && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setShelfFiles([]);
+                            }}
+                            className="px-2.5 py-0.5 rounded-full bg-white/12 hover:bg-white/22 text-[10px] font-semibold text-white/90 transition animate-[ isleFadeIn_160ms_ease-out ]"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </>
                     )}
                   </div>
 
