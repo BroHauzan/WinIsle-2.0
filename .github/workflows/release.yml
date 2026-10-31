@@ -52,10 +52,30 @@ jobs:
         shell: pwsh
         run: |
           npm install --legacy-peer-deps --no-package-lock
-          npm install --no-save @rolldown/binding-win32-x64-msvc@1.2.15 --legacy-peer-deps
-          $winNode = "node_modules/@rolldown/binding-win32-x64-msvc/rolldown-binding.win32-x64-msvc.node"
-          if (Test-Path $winNode) {
-            Copy-Item $winNode -Destination "node_modules/rolldown/rolldown-binding.win32-x64-msvc.node" -Force
+          npm install --no-save --legacy-peer-deps `
+            @rolldown/binding-win32-x64-msvc@^1.2.15 `
+            lightningcss-win32-x64-msvc `
+            @tailwindcss/oxide-win32-x64-msvc@^4.3.3 `
+            @tauri-apps/cli-win32-x64-msvc@^2.12.4
+
+          # Ensure lightningcss.win32-x64-msvc.node is copied to all expected locations
+          $lcssPkg = Get-ChildItem -Path "node_modules" -Filter "lightningcss.win32-x64-msvc.node" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($lcssPkg) {
+            # Root lightningcss
+            if (Test-Path "node_modules/lightningcss") {
+              Copy-Item $lcssPkg.FullName -Destination "node_modules/lightningcss/lightningcss.win32-x64-msvc.node" -Force
+            }
+            # Nested lightningcss in @tailwindcss/node
+            $tailLcss = "node_modules/@tailwindcss/node/node_modules/lightningcss"
+            if (Test-Path $tailLcss) {
+              Copy-Item $lcssPkg.FullName -Destination "$tailLcss/lightningcss.win32-x64-msvc.node" -Force
+            }
+          }
+
+          # Ensure rolldown-binding.win32-x64-msvc.node is copied to rolldown
+          $rdPkg = Get-ChildItem -Path "node_modules" -Filter "rolldown-binding.win32-x64-msvc.node" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($rdPkg -and (Test-Path "node_modules/rolldown")) {
+            Copy-Item $rdPkg.FullName -Destination "node_modules/rolldown/rolldown-binding.win32-x64-msvc.node" -Force
           }
 
       - name: Build Web App
