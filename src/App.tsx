@@ -1,0 +1,8058 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BeatEqualizerBars } from './components/BeatEqualizerBars';
+import { BotCanvas } from './components/BotCanvas';
+import { IslandSurface } from './components/IslandSurface';
+import {
+  AlarmBellSvg,
+  BackwardSkipSvg,
+  BellOutlineSvg,
+  BoltChargingSvg,
+  CalendarGridSvg,
+  CapsLockArrowSvg,
+  CheckTickSvg,
+  ChevronDownSvg,
+  ChevronLeftSvg,
+  ChevronRightSvg,
+  CloseCrossSvg,
+  CoffeeCupSvg,
+  EditPencilSvg,
+  FileDocumentBadgeSvg,
+  ForwardSkipSvg,
+  GearSettingsSvg,
+  GlobeTimezoneSvg,
+  KeyboardSymbolicSvg,
+  LyricsQuoteBubbleSvg,
+  MailEnvelopeSvg,
+  MessageBubbleSvg,
+  MicSymbolicSvg,
+  MoonFilledSvg,
+  MusicNoteSvg,
+  PauseFilledSvg,
+  PlayFilledSvg,
+  PlusSvg,
+  RotateResetSvg,
+  SendArrowSvg,
+  ShelfTraySvg,
+  SparkleFourPointSvg,
+  SpeakerWaveSvg,
+  StopSquareSvg,
+  SunBrightnessSvg,
+  TargetFocusSvg,
+  TaskCheckBoxSvg,
+  TimerStopwatchSvg,
+  VideoCameraSvg,
+} from './components/IsleIcons';
+import { BotColorName, BotForm, BotShapeName, paletteFor } from './core/bot';
+import { parseLrc, SAMPLE_TRACKS } from './core/lrc';
+import { getWsBaseUrl } from './utils/apiBase';
+
+type IslandPage =
+  | 'music'
+  | 'notifications'
+  | 'pomodoro'
+  | 'todolist'
+  | 'shelf'
+  | 'calendar'
+  | 'weather';
+
+const ISLAND_PAGES: { id: IslandPage; label: string }[] = [
+  { id: 'music', label: 'Music' },
+  { id: 'notifications', label: 'Notifications' },
+  { id: 'pomodoro', label: 'Focus' },
+  { id: 'todolist', label: 'Tasks' },
+  { id: 'shelf', label: 'Shelf' },
+  { id: 'calendar', label: 'Calendar' },
+  { id: 'weather', label: 'Weather' },
+];
+
+interface ToDoItem {
+  id: number;
+  title: string;
+  time?: string;
+  done: boolean;
+}
+
+export type ShelfFileExt = 'pdf' | 'docx' | 'msi' | 'img' | 'other';
+
+interface ShelfFile {
+  id: number;
+  name: string;
+  size: string;
+  ext: ShelfFileExt;
+}
+
+const SAMPLE_DRAGGABLE_FILES: { name: string; size: string; ext: ShelfFileExt }[] = [
+  {
+    name: 'Katalis+pendidikan+vol+2+no+2+juni+2025.pdf',
+    size: '1.0 MB',
+    ext: 'pdf',
+  },
+  {
+    name: 'JUKNIS_TOURNAMENT_FREE_FIRE_BR.docx',
+    size: '28 KB',
+    ext: 'docx',
+  },
+  {
+    name: 'LastFM_Scrobbler_3.1.29.msi',
+    size: '1.3 MB',
+    ext: 'msi',
+  },
+];
+
+function detectFileExt(filename: string): ShelfFileExt {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.pdf')) return 'pdf';
+  if (lower.endsWith('.doc') || lower.endsWith('.docx') || lower.endsWith('.rtf')) return 'docx';
+  if (
+    lower.endsWith('.msi') ||
+    lower.endsWith('.exe') ||
+    lower.endsWith('.zip') ||
+    lower.endsWith('.rar')
+  )
+    return 'msi';
+  if (
+    lower.endsWith('.png') ||
+    lower.endsWith('.jpg') ||
+    lower.endsWith('.jpeg') ||
+    lower.endsWith('.webp') ||
+    lower.endsWith('.svg')
+  )
+    return 'img';
+  return 'other';
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '24 KB';
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function truncateMiddleFileName(name: string, maxChars = 11): string {
+  if (name.length <= maxChars) return name;
+  return `${name.slice(0, maxChars - 2)}..`;
+}
+
+interface NotificationItem {
+  id: number;
+  iconType: 'calendar' | 'download' | 'message';
+  title: string;
+  subtitle: string;
+  timeAgo: string;
+  unread: boolean;
+}
+
+interface CalendarEventItem {
+  id: number;
+  title: string;
+  time: string;
+  color: string;
+}
+
+type SystemAlertType =
+  | 'volume'
+  | 'mute'
+  | 'brightness'
+  | 'capslock'
+  | 'charging'
+  | 'lowbattery'
+  | 'meeting'
+  | 'permission'
+  | 'notification'
+  | 'alarm'
+  | 'action_confirm';
+
+export interface SmartAlarm {
+  id: string;
+  time: string; // "HH:mm" (24-hour format)
+  title: string;
+  enabled: boolean;
+  createdAt: number;
+}
+
+export interface WeatherHourItem {
+  time: string;
+  temp: number;
+  code: number;
+}
+
+export interface WeatherData {
+  city: string;
+  currentTemp: number;
+  weatherCode: number;
+  isDay: boolean;
+  sunrise: string;
+  sunset: string;
+  hourly: WeatherHourItem[];
+}
+
+interface ActiveAlert {
+  id: number;
+  type: SystemAlertType;
+  value?: number;
+  muted?: boolean;
+  capsOn?: boolean;
+  permissionState?: 'pending' | 'allowed' | 'denied';
+  alarmId?: string;
+  alarmTitle?: string;
+  alarmTime?: string;
+  confirmTitle?: string;
+  confirmSubtitle?: string;
+  confirmBadge?: string;
+  confirmCategory?: 'task' | 'timer' | 'alarm' | 'weather' | 'music' | 'system';
+  targetPageIdx?: number;
+}
+
+interface SearchSourceItem {
+  title: string;
+  uri: string;
+}
+
+interface FoundFileItem {
+  name: string;
+  path: string;
+  size: string;
+  ext: string;
+}
+
+interface CommandCardData {
+  purpose: string;
+  command: string;
+  output?: string;
+  uri?: string;
+  riskLabel?: string;
+  riskLevel?: 'amber' | 'green';
+}
+
+interface RealMediaTrack {
+  title: string;
+  artist: string;
+  coverUrl?: string;
+  audioUrl?: string;
+  isFlac?: boolean;
+  durationMs: number;
+  lrc: string;
+  syncType?: 'WORD' | 'LINE';
+  provider?: string;
+  wordsByLine?: any[];
+  lrclibId?: number;
+  youtubeVideoId?: string;
+  youtubeMusicUrl?: string;
+  spotifyUrl?: string;
+  sourceType?: 'internal' | 'external';
+  externalApp?: string;
+  tintRgb: [number, number, number];
+}
+
+interface PendingImageAttachment {
+  dataUrl: string;
+  base64: string;
+  mimeType: string;
+  name: string;
+}
+
+interface ChatMessage {
+  id: number;
+  role: 'user' | 'assistant' | 'command';
+  text: string;
+  imageUrl?: string;
+  command?: string;
+  commandStatus?: 'running' | 'done' | 'denied';
+  timestamp?: string;
+  searchSources?: SearchSourceItem[];
+  commandCard?: CommandCardData;
+  foundFiles?: FoundFileItem[];
+}
+
+interface GeminiAssistantResponse {
+  reply: string;
+  activeStepHeadline?: string;
+  agentSteps?: string[];
+  action?: string;
+  actionParam?: string;
+  searchSources?: SearchSourceItem[];
+  commandCard?: CommandCardData;
+  foundFiles?: FoundFileItem[];
+  trackData?: {
+    title: string;
+    artist: string;
+    coverUrl?: string;
+    audioUrl?: string;
+    isFlac?: boolean;
+    durationMs?: number;
+    youtubeVideoId?: string;
+    youtubeMusicUrl?: string;
+    spotifyUrl?: string;
+    lrc?: string;
+    syncType?: 'WORD' | 'LINE';
+    provider?: string;
+    wordsByLine?: any[];
+    lrclibId?: number;
+  };
+  source?: string;
+  error?: string;
+  code?: string;
+}
+
+// Convert Float32 microphone samples (-1..1) at 16kHz into Base64-encoded 16-bit little-endian PCM for gemini-3.8-live
+function float32ToPcm16Base64(float32: Float32Array): string {
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const bytes = new Uint8Array(int16.buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
+
+// Convert Base64-encoded 16-bit little-endian PCM (24kHz) from gemini-3.8-live into Float32Array for Web Audio playback
+function pcm16Base64ToFloat32(base64: string): Float32Array {
+  const binary = window.atob(base64);
+  const byteLength = binary.length - (binary.length % 2);
+  const bytes = new Uint8Array(byteLength);
+  for (let i = 0; i < byteLength; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const int16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768.0;
+  }
+  return float32;
+}
+
+const MONTH_NAMES = [
+  'JANUARY',
+  'FEBRUARY',
+  'MARCH',
+  'APRIL',
+  'MAY',
+  'JUNE',
+  'JULY',
+  'AUGUST',
+  'SEPTEMBER',
+  'OCTOBER',
+  'NOVEMBER',
+  'DECEMBER',
+];
+
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Reusable Gemini-Style "Thinking" Animated Dots Component
+const GeminiThinkingIndicator: React.FC<{ label?: string }> = ({ label = 'Thinking' }) => (
+  <div className="inline-flex items-center gap-2 py-0.5">
+    <span className="text-[12px] font-semibold gemini-thinking-shimmer tracking-tight">
+      {label}
+    </span>
+    <span className="inline-flex items-center gap-1 pt-0.5">
+      <span
+        className="w-1.5 h-1.5 rounded-full bg-[#a5b4fc]"
+        style={{ animation: 'geminiDotBounce 1.2s infinite ease-in-out 0ms' }}
+      />
+      <span
+        className="w-1.5 h-1.5 rounded-full bg-[#60a5fa]"
+        style={{ animation: 'geminiDotBounce 1.2s infinite ease-in-out 160ms' }}
+      />
+      <span
+        className="w-1.5 h-1.5 rounded-full bg-[#38bdf8]"
+        style={{ animation: 'geminiDotBounce 1.2s infinite ease-in-out 320ms' }}
+      />
+    </span>
+  </div>
+);
+
+declare global {
+  interface Window {
+    electronAPI?: {
+      isElectron?: boolean;
+      setIgnoreMouseEvents?: (ignore: boolean, options?: { forward?: boolean }) => void;
+      onToggleAssistant?: (callback: () => void) => () => void;
+      onToggleMiniCapsule?: (callback: () => void) => () => void;
+    };
+  }
+}
+
+export default function App() {
+  // ── Clock & Status (Optimized: State only updates when minute rolls over, eliminating 59/60 idle re-renders) ──
+  const [nowDate, setNowDate] = useState(() => new Date());
+
+  useEffect(() => {
+    const checkMinute = () => {
+      const d = new Date();
+      setNowDate((prev) => {
+        if (
+          d.getMinutes() === prev.getMinutes() &&
+          d.getHours() === prev.getHours() &&
+          d.getDate() === prev.getDate()
+        ) {
+          return prev;
+        }
+        return d;
+      });
+    };
+    const t = setInterval(checkMinute, 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const headerDateStr = useMemo(() => {
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const d = days[nowDate.getDay()];
+    const date = String(nowDate.getDate()).padStart(2, '0');
+    const m = SHORT_MONTHS[nowDate.getMonth()];
+    return `${d} ${date} ${m}`;
+  }, [nowDate]);
+
+  const timeStr = useMemo(() => {
+    const hh = String(nowDate.getHours()).padStart(2, '0');
+    const mm = String(nowDate.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }, [nowDate]);
+
+  const fullHeaderDateStr = useMemo(() => {
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const d = days[nowDate.getDay()];
+    const date = String(nowDate.getDate());
+    const m = SHORT_MONTHS[nowDate.getMonth()];
+    const y = nowDate.getFullYear();
+    const hh = String(nowDate.getHours()).padStart(2, '0');
+    const mm = String(nowDate.getMinutes()).padStart(2, '0');
+    return `${d} ${date} ${m} ${y} ${hh}:${mm}`;
+  }, [nowDate]);
+
+  const worldClocks = useMemo(() => {
+    const fmt = (offsetHours: number) => {
+      const utc = nowDate.getTime() + nowDate.getTimezoneOffset() * 60000;
+      const target = new Date(utc + offsetHours * 3600000);
+      return `${String(target.getHours()).padStart(2, '0')}:${String(target.getMinutes()).padStart(2, '0')}`;
+    };
+    return [
+      { city: 'New York', time: fmt(-4) },
+      { city: 'London', time: fmt(1) },
+      { city: 'Tokyo', time: fmt(9) },
+    ];
+  }, [nowDate]);
+
+  // ── Persistent Active Page State (Remembers Pomodoro / Calendar / Shelf when closed & reopened) ──
+  // Default to Music Player (pageIndex 0) on startup per user request
+  const [pageIndex, setPageIndex] = useState<number>(0);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_active_page_index', String(pageIndex));
+    } catch {
+      // ignore storage errors
+    }
+  }, [pageIndex]);
+
+  // ── Dual-Layer Simultaneous Carousel Slide State (Matches video 00:01-00:04) ──
+  const [prevPageIndex, setPrevPageIndex] = useState<number | null>(null);
+  const [slideDir, setSlideDir] = useState<'left' | 'right'>('right');
+  const [slideTick, setSlideTick] = useState(0);
+  const pageTransTimerRef = useRef<number | null>(null);
+
+  const navigateToPage = useCallback(
+    (nextIdx: number, explicitDir?: 'left' | 'right') => {
+      const normalized = ((nextIdx % ISLAND_PAGES.length) + ISLAND_PAGES.length) % ISLAND_PAGES.length;
+      setPageIndex((currIdx) => {
+        if (normalized === currIdx) return currIdx;
+        const dir: 'left' | 'right' =
+          explicitDir ?? (normalized > currIdx ? 'right' : 'left');
+        setSlideDir(dir);
+        setPrevPageIndex(currIdx);
+        setSlideTick((t) => t + 1);
+
+        if (pageTransTimerRef.current) {
+          window.clearTimeout(pageTransTimerRef.current);
+        }
+        pageTransTimerRef.current = window.setTimeout(() => {
+          setPrevPageIndex(null);
+          pageTransTimerRef.current = null;
+        }, 280);
+
+        return normalized;
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    return () => {
+      if (pageTransTimerRef.current) {
+        window.clearTimeout(pageTransTimerRef.current);
+      }
+    };
+  }, []);
+
+  // ── Alt+Q Default Mode Preference ('conversation' = Auto-Focus Typing, 'voice-pill' = Voice Agent) ──
+  const [defaultAltQMode, setDefaultAltQMode] = useState<'conversation' | 'voice-pill'>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_altq_mode');
+      if (saved === 'voice-pill' || saved === 'conversation') return saved;
+    } catch {
+      // ignore
+    }
+    return 'conversation';
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_altq_mode', defaultAltQMode);
+    } catch {
+      // ignore
+    }
+  }, [defaultAltQMode]);
+
+  // ── Island Presentation State (starts collapsed as a compact notch) ──
+  const [isHovered, setIsHovered] = useState(false);
+  const [isPinnedOpen, setIsPinnedOpen] = useState(false);
+  const [dragAutoOpened, setDragAutoOpened] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantMode, setAssistantMode] = useState<'voice-pill' | 'conversation'>(defaultAltQMode);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [nudgeCount, setNudgeCount] = useState(0);
+
+  // ── Mini Capsule Auto-Hide Mode (Alt + H: Auto-hides to top edge so Chrome tabs are never blocked, reveals on top-edge hover) ──
+  const [miniCapsuleMode, setMiniCapsuleMode] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('isle_mini_capsule_mode') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [topEdgeHover, setTopEdgeHover] = useState<boolean>(false);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_mini_capsule_mode', String(miniCapsuleMode));
+    } catch {
+      // ignore
+    }
+  }, [miniCapsuleMode]);
+
+  useEffect(() => {
+    if (!miniCapsuleMode) {
+      setTopEdgeHover(false);
+      return;
+    }
+    const onMove = (e: MouseEvent) => {
+      const centerDist = Math.abs(e.clientX - window.innerWidth / 2);
+      if (e.clientY <= 6 && centerDist <= 260) {
+        setTopEdgeHover(true);
+      } else if (e.clientY > 44 && !isHovered && !isPinnedOpen && !assistantOpen) {
+        setTopEdgeHover(false);
+      }
+    };
+    window.addEventListener('mousemove', onMove, { passive: true });
+    return () => window.removeEventListener('mousemove', onMove);
+  }, [miniCapsuleMode, isHovered, isPinnedOpen, assistantOpen]);
+
+  // ── Google Gemini API Key State & Storage (Hardcoded for WinIsle) ──
+  const HARDCODED_GEMINI_KEY = 'AQ.Ab8RN6KdBVqg30x69prVlTWNqkpxqGYvT0ozWdATn5ni9d46ng';
+  const [geminiApiKey] = useState<string>(HARDCODED_GEMINI_KEY);
+  const [hasServerKey, setHasServerKey] = useState(true);
+  const [serverMaskedKey, setServerMaskedKey] = useState<string>('AQ.Ab8••••46ng');
+
+  useEffect(() => {
+    fetch('/api/gemini/config')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.hasKey) {
+          setHasServerKey(true);
+          setServerMaskedKey(data.maskedKey || 'AQ.Ab8••••46ng');
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Input ref for immediate auto-focus when opening Assistant in Type mode (Alt+Q)
+  const assistantInputRef = useRef<HTMLInputElement | null>(null);
+
+  // ── Electron Frameless Overlay Click-Through Controller ──
+  // Tracks whether transparent area outside the Dynamic Island should ignore mouse events
+  const clickThroughStateRef = useRef<boolean | null>(null);
+  const setDesktopClickThrough = useCallback((ignore: boolean) => {
+    if (typeof window === 'undefined' || !window.electronAPI?.setIgnoreMouseEvents) return;
+    if (clickThroughStateRef.current === ignore) return;
+    clickThroughStateRef.current = ignore;
+    if (ignore) {
+      window.electronAPI.setIgnoreMouseEvents(true, { forward: true });
+    } else {
+      window.electronAPI.setIgnoreMouseEvents(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.setIgnoreMouseEvents) return;
+
+    // Start with click-through enabled for transparent area, forwarding mousemove events
+    setDesktopClickThrough(true);
+
+    let rafId = 0;
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (rafId) return;
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        const surface = document.getElementById('dynamic-island-surface');
+        if (!surface) {
+          setDesktopClickThrough(true);
+          return;
+        }
+        const rect = surface.getBoundingClientRect();
+        const insideBounds =
+          clientX >= rect.left - 4 &&
+          clientX <= rect.right + 4 &&
+          clientY >= Math.max(0, rect.top - 2) &&
+          clientY <= rect.bottom + 6;
+
+        setDesktopClickThrough(!insideBounds);
+      });
+    };
+
+    window.addEventListener('mousemove', handleGlobalMouseMove, { passive: true });
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      window.removeEventListener('mousemove', handleGlobalMouseMove);
+    };
+  }, [setDesktopClickThrough]);
+
+  useEffect(() => {
+    if (assistantOpen && assistantMode === 'conversation') {
+      setDesktopClickThrough(false);
+      const timer = window.setTimeout(() => {
+        assistantInputRef.current?.focus();
+      }, 40);
+      return () => window.clearTimeout(timer);
+    }
+  }, [assistantOpen, assistantMode, setDesktopClickThrough]);
+
+  // ── Real Laptop Battery Status API + Manual Test Override ──
+  const [batteryLevel, setBatteryLevel] = useState<number>(82);
+  const [isCharging, setIsCharging] = useState<boolean>(true);
+  const [manualBatteryOverride, setManualBatteryOverride] = useState<boolean>(false);
+
+  // ── System Hardware & Alert State (Volume: 0..100 step 2, Brightness: 0..10 step 1) ──
+  // Persisted in localStorage and synced with Windows CoreAudio Master Volume when running locally on Windows
+  const [volume, setVolume] = useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_user_volume');
+      if (saved !== null) {
+        const parsed = parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 100) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return 20;
+  });
+  const [muted, setMuted] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('isle_user_muted') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [brightness, setBrightness] = useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_user_brightness');
+      if (saved !== null) {
+        const parsed = parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 10) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return 7;
+  });
+  const [capsLockOn, setCapsLockOn] = useState(false);
+  const [activeAlert, setActiveAlert] = useState<ActiveAlert | null>(null);
+  const [alertHovered, setAlertHovered] = useState(false);
+  const alertTimerRef = useRef<number | null>(null);
+  const lastLocalHardwareChangeRef = useRef<number>(0);
+  const osHardwareAvailableRef = useRef<boolean>(false);
+
+  const syncHardwareToOs = useCallback(
+    (nextPatch: { volume?: number; muted?: boolean; brightness?: number }) => {
+      lastLocalHardwareChangeRef.current = Date.now();
+      try {
+        const winAny = window as any;
+        if (typeof winAny.electronAPI?.setHardwareStatus === 'function') {
+          winAny.electronAPI.setHardwareStatus(nextPatch);
+        } else if (typeof winAny.chrome?.webview?.postMessage === 'function') {
+          winAny.chrome.webview.postMessage({ type: 'hardwareControl', ...nextPatch });
+        }
+      } catch {
+        // ignore
+      }
+      if (osHardwareAvailableRef.current) {
+        fetch('/api/system/hardware-control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(nextPatch),
+        }).catch(() => {});
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_user_volume', String(volume));
+    } catch {
+      // ignore
+    }
+    syncHardwareToOs({ volume, muted });
+  }, [volume, muted, syncHardwareToOs]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_user_muted', String(muted));
+    } catch {
+      // ignore
+    }
+  }, [muted]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_user_brightness', String(brightness));
+    } catch {
+      // ignore
+    }
+    syncHardwareToOs({ brightness });
+  }, [brightness, syncHardwareToOs]);
+
+  const triggerAlert = useCallback(
+    (
+      type: SystemAlertType,
+      opts?: {
+        value?: number;
+        muted?: boolean;
+        capsOn?: boolean;
+        alarmId?: string;
+        alarmTitle?: string;
+        alarmTime?: string;
+        confirmTitle?: string;
+        confirmSubtitle?: string;
+        confirmBadge?: string;
+        confirmCategory?: 'task' | 'timer' | 'alarm' | 'weather' | 'music' | 'system';
+        targetPageIdx?: number;
+      }
+    ) => {
+      if (alertTimerRef.current) {
+        window.clearTimeout(alertTimerRef.current);
+      }
+      // Collapse open island temporarily so top-edge HUD alert is shown cleanly (pageIndex is preserved!)
+      setIsPinnedOpen(false);
+      setIsHovered(false);
+      setDragAutoOpened(false);
+      setAssistantOpen(false);
+
+      const newAlert: ActiveAlert = {
+        id: Date.now(),
+        type,
+        value: opts?.value,
+        muted: opts?.muted,
+        capsOn: opts?.capsOn,
+        permissionState: type === 'permission' ? 'pending' : undefined,
+        alarmId: opts?.alarmId,
+        alarmTitle: opts?.alarmTitle,
+        alarmTime: opts?.alarmTime,
+        confirmTitle: opts?.confirmTitle,
+        confirmSubtitle: opts?.confirmSubtitle,
+        confirmBadge: opts?.confirmBadge,
+        confirmCategory: opts?.confirmCategory,
+        targetPageIdx: opts?.targetPageIdx,
+      };
+      setActiveAlert(newAlert);
+
+      const duration =
+        type === 'volume' || type === 'mute' || type === 'brightness' || type === 'capslock'
+          ? 2000
+          : type === 'action_confirm'
+          ? 2300
+          : type === 'permission'
+          ? 9000
+          : type === 'alarm'
+          ? 20000
+          : 3600;
+
+      alertTimerRef.current = window.setTimeout(() => {
+        setActiveAlert((curr) => (curr && curr.id === newAlert.id ? null : curr));
+        if (type === 'action_confirm' && typeof opts?.targetPageIdx === 'number') {
+          navigateToPage(opts.targetPageIdx);
+          setIsPinnedOpen(true);
+        }
+      }, duration);
+    },
+    [navigateToPage]
+  );
+
+  // Seamless fluid confirmation alert whenever AI executes a task, timer, alarm, weather, or system command
+  const triggerActionConfirmation = useCallback(
+    (
+      confirmTitle: string,
+      confirmSubtitle: string,
+      confirmBadge: string,
+      confirmCategory: 'task' | 'timer' | 'alarm' | 'weather' | 'music' | 'system',
+      targetPageIdx?: number
+    ) => {
+      triggerAlert('action_confirm', {
+        confirmTitle,
+        confirmSubtitle,
+        confirmBadge,
+        confirmCategory,
+        targetPageIdx,
+      });
+    },
+    [triggerAlert]
+  );
+
+  // Real Windows / System Hardware Status Detection (Volume, Brightness, Battery Level & Charging)
+  useEffect(() => {
+    // 1. Poll system hardware status from backend OS probe (syncs Windows Master Volume when running on Windows)
+    let pollId = 0;
+    const fetchOsHardware = () => {
+      // Avoid overwriting right while user is actively scrolling volume/brightness
+      if (Date.now() - lastLocalHardwareChangeRef.current < 2200) return;
+      fetch('/api/system/hardware-status')
+        .then((r) => r.json())
+        .then((data) => {
+          if (data && data.osHardwareAvailable) {
+            osHardwareAvailableRef.current = true;
+            if (typeof data.batteryLevel === 'number') {
+              setBatteryLevel((prev) => (prev !== data.batteryLevel ? data.batteryLevel : prev));
+            }
+            if (typeof data.isCharging === 'boolean') {
+              setIsCharging((prev) => (prev !== data.isCharging ? data.isCharging : prev));
+            }
+            if (typeof data.volume === 'number') {
+              setVolume((prev) => (prev !== data.volume ? data.volume : prev));
+            }
+            if (typeof data.muted === 'boolean') {
+              setMuted((prev) => (prev !== data.muted ? data.muted : prev));
+            }
+            if (typeof data.brightness === 'number') {
+              setBrightness((prev) => (prev !== data.brightness ? data.brightness : prev));
+            }
+          }
+        })
+        .catch(() => {});
+    };
+
+    fetchOsHardware();
+    // Dynamic polling rate: 4s when active, 12s when hidden/backgrounded to preserve CPU
+    const scheduleNextPoll = () => {
+      const interval = document.hidden ? 12000 : 4000;
+      pollId = window.setTimeout(() => {
+        fetchOsHardware();
+        scheduleNextPoll();
+      }, interval);
+    };
+    scheduleNextPoll();
+
+    // Listen to native desktop wrapper hardware events (Electron / WebView2) if present
+    const onNativeHardwareMsg = (ev: MessageEvent) => {
+      const payload = ev.data;
+      if (payload && typeof payload === 'object' && payload.type === 'osHardwareStatus') {
+        if (typeof payload.volume === 'number') setVolume(payload.volume);
+        if (typeof payload.muted === 'boolean') setMuted(payload.muted);
+        if (typeof payload.brightness === 'number') setBrightness(payload.brightness);
+      }
+    };
+    window.addEventListener('message', onNativeHardwareMsg);
+
+    // 2. Real Browser / OS Battery API integration (adjusts dynamically to charger events)
+    let batteryObj: any = null;
+    const syncBattery = () => {
+      if (!batteryObj) return;
+      if (typeof batteryObj.level === 'number') {
+        setBatteryLevel(Math.round(batteryObj.level * 100));
+      }
+      if (typeof batteryObj.charging === 'boolean') {
+        setIsCharging(batteryObj.charging);
+      }
+    };
+
+    const onChargingChange = () => {
+      if (!batteryObj) return;
+      const lvl =
+        typeof batteryObj.level === 'number' ? Math.round(batteryObj.level * 100) : batteryLevel;
+      const chg = Boolean(batteryObj.charging);
+      setBatteryLevel(lvl);
+      setIsCharging(chg);
+      triggerAlert(!chg && lvl <= 20 ? 'lowbattery' : 'charging', { value: lvl });
+    };
+
+    const onLevelChange = () => {
+      if (!batteryObj) return;
+      const lvl =
+        typeof batteryObj.level === 'number' ? Math.round(batteryObj.level * 100) : batteryLevel;
+      const chg = Boolean(batteryObj.charging);
+      setBatteryLevel(lvl);
+      setIsCharging(chg);
+      if (!chg && (lvl === 20 || lvl === 15 || lvl === 10)) {
+        triggerAlert('lowbattery', { value: lvl });
+      }
+    };
+
+    if (typeof navigator !== 'undefined' && 'getBattery' in navigator) {
+      (navigator as any)
+        .getBattery()
+        .then((bat: any) => {
+          batteryObj = bat;
+          syncBattery();
+          bat.addEventListener?.('levelchange', onLevelChange);
+          bat.addEventListener?.('chargingchange', onChargingChange);
+        })
+        .catch(() => {
+          // Fallback if unsupported by browser
+        });
+    }
+
+    return () => {
+      window.clearTimeout(pollId);
+      window.removeEventListener('message', onNativeHardwareMsg);
+      if (batteryObj) {
+        batteryObj.removeEventListener?.('levelchange', onLevelChange);
+        batteryObj.removeEventListener?.('chargingchange', onChargingChange);
+      }
+    };
+  }, [triggerAlert]);
+
+  // Hold alert open while pointer hovers over it
+  useEffect(() => {
+    if (!activeAlert) return;
+    if (alertHovered) {
+      if (alertTimerRef.current) window.clearTimeout(alertTimerRef.current);
+    } else {
+      alertTimerRef.current = window.setTimeout(() => {
+        setActiveAlert(null);
+      }, 1500);
+    }
+    return () => {
+      if (alertTimerRef.current) window.clearTimeout(alertTimerRef.current);
+    };
+  }, [alertHovered, activeAlert]);
+
+  // ── Page 5: Shelf State & Drag-and-Drop Auto-Expand Controller ──
+  const [shelfFiles, setShelfFiles] = useState<ShelfFile[]>([]);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [shelfToast, setShelfToast] = useState<string | null>(null);
+  const lastDropTimeRef = useRef<number>(0);
+  const dragLeaveTimerRef = useRef<number | null>(null);
+
+  const [lyricsMode, setLyricsMode] = useState(false);
+  const activePage = ISLAND_PAGES[pageIndex].id;
+  const isExpanded =
+    (isHovered || isPinnedOpen || dragAutoOpened || isDragOver || assistantOpen || lyricsMode) &&
+    !activeAlert;
+
+  // Trigger lightweight native memory trimming whenever the island collapses back to compact notch
+  useEffect(() => {
+    if (!isExpanded) {
+      const timer = window.setTimeout(() => {
+        (window as any).electronAPI?.trimMemory?.();
+      }, 400);
+      return () => window.clearTimeout(timer);
+    }
+  }, [isExpanded]);
+
+  // Helper to safely add files to Shelf with Chaos Engineering guards (max 6 files, deduplication, sanitized names)
+  const addFilesToShelf = useCallback(
+    (incoming: { name: string; size: string; ext?: ShelfFileExt }[]) => {
+      const now = Date.now();
+      if (now - lastDropTimeRef.current < 180) return; // Ignore duplicate rapid drop events
+      lastDropTimeRef.current = now;
+
+      if (!incoming || incoming.length === 0) return;
+
+      setShelfFiles((prev) => {
+        if (prev.length >= 6) {
+          setShelfToast('Shelf full (max 6 files)');
+          window.setTimeout(() => setShelfToast(null), 2200);
+          return prev;
+        }
+        const added: ShelfFile[] = incoming.slice(0, 6 - prev.length).map((item, idx) => {
+          const cleanName =
+            item.name
+              .replace(/[\u0000-\u001F<>:"/\\|?*]/g, '')
+              .trim()
+              .slice(0, 64) || 'Document.pdf';
+          return {
+            id: now + idx + Math.floor(Math.random() * 1000),
+            name: cleanName,
+            size: item.size || '120 KB',
+            ext: item.ext || detectFileExt(cleanName),
+          };
+        });
+        return [...prev, ...added];
+      });
+    },
+    []
+  );
+
+  // Global Window Drag-Over Detector: Auto-opens closed Island to Shelf when dragging files near top of screen
+  useEffect(() => {
+    const handleWindowDragOver = (e: DragEvent) => {
+      const types = Array.from(e.dataTransfer?.types || []);
+      const hasFilePayload =
+        types.includes('Files') ||
+        types.includes('application/x-isle-file') ||
+        types.includes('text/plain');
+      if (!hasFilePayload) return;
+
+      // Trigger auto-open when dragging within top 260px of screen (or anywhere if already over island)
+      if (e.clientY <= 260) {
+        e.preventDefault();
+        if (dragLeaveTimerRef.current) {
+          window.clearTimeout(dragLeaveTimerRef.current);
+          dragLeaveTimerRef.current = null;
+        }
+        setActiveAlert(null);
+        setAssistantOpen(false);
+        setSettingsOpen(false);
+        setLyricsMode(false);
+        if (!isPinnedOpen && !isHovered) {
+          setDragAutoOpened(true);
+        }
+        if (ISLAND_PAGES[pageIndex].id !== 'shelf') {
+          navigateToPage(4, 'right');
+        }
+        setIsDragOver(true);
+      }
+    };
+
+    const handleWindowDragLeave = (e: DragEvent) => {
+      if (e.clientY <= 0 || e.clientX <= 0 || e.clientX >= window.innerWidth || e.clientY > 290) {
+        if (dragLeaveTimerRef.current) window.clearTimeout(dragLeaveTimerRef.current);
+        dragLeaveTimerRef.current = window.setTimeout(() => {
+          setIsDragOver(false);
+          setDragAutoOpened(false);
+        }, 220);
+      }
+    };
+
+    const handleWindowDrop = (e: DragEvent) => {
+      if (e.clientY <= 260) {
+        e.preventDefault();
+        setIsDragOver(false);
+        // Parse sample file JSON payload if dragged from the sample bar
+        const sampleJson = e.dataTransfer?.getData('application/x-isle-file');
+        if (sampleJson) {
+          try {
+            const parsed = JSON.parse(sampleJson);
+            if (parsed && typeof parsed.name === 'string') {
+              addFilesToShelf([
+                {
+                  name: parsed.name,
+                  size: parsed.size || '1.0 MB',
+                  ext: parsed.ext || detectFileExt(parsed.name),
+                },
+              ]);
+              return;
+            }
+          } catch {
+            // ignore malformed JSON
+          }
+        }
+        // Parse real OS files dropped from File Explorer / Finder
+        const osFiles = Array.from(e.dataTransfer?.files || []);
+        if (osFiles.length > 0) {
+          addFilesToShelf(
+            osFiles.map((f) => ({
+              name: f.name,
+              size: formatBytes(f.size),
+              ext: detectFileExt(f.name),
+            }))
+          );
+        }
+      }
+    };
+
+    window.addEventListener('dragover', handleWindowDragOver);
+    window.addEventListener('dragleave', handleWindowDragLeave);
+    window.addEventListener('drop', handleWindowDrop);
+    return () => {
+      window.removeEventListener('dragover', handleWindowDragOver);
+      window.removeEventListener('dragleave', handleWindowDragLeave);
+      window.removeEventListener('drop', handleWindowDrop);
+    };
+  }, [addFilesToShelf, isHovered, isPinnedOpen, navigateToPage, pageIndex]);
+
+  // ── Bot Look Customization ──
+  const [botShape] = useState<BotShapeName>('squircle');
+  const [botColor] = useState<BotColorName>('cloud');
+  const botPalette = useMemo(() => paletteFor(botColor, 'classic'), [botColor]);
+
+  // ── Page 1: Real Media Detection, Audio Stream, Song Queue, Smart Mood Shuffle & Synced Lyrics ──
+  // Starts in clean idle "Media" state (zero fake songs!). Automatically detects playing music or plays requested songs.
+  const [activeTrack, setActiveTrack] = useState<RealMediaTrack | null>(null);
+  const [musicQueue, setMusicQueue] = useState<RealMediaTrack[]>([]);
+  const [musicHistory, setMusicHistory] = useState<RealMediaTrack[]>([]);
+  const [moodShuffleEnabled, setMoodShuffleEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('isle_mood_shuffle_enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  // Tracks shuffle status of external apps (Spotify, YouTube Music, OS Media Session) separately from internal AI shuffle
+  const [externalShuffleEnabled, setExternalShuffleEnabled] = useState<boolean>(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [positionMs, setPositionMs] = useState(0);
+  const [mediaLoading, setMediaLoading] = useState(false);
+  const [bluetoothEnabled, setBluetoothEnabled] = useState(true);
+  const [wifiEnabled, setWifiEnabled] = useState(true);
+  const [flacEnabled, setFlacEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('isle_flac_enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_flac_enabled', String(flacEnabled));
+    } catch {
+      // ignore
+    }
+  }, [flacEnabled]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_mood_shuffle_enabled', String(moodShuffleEnabled));
+    } catch {
+      // ignore
+    }
+  }, [moodShuffleEnabled]);
+
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const audioFileInputRef = useRef<HTMLInputElement | null>(null);
+  const ytIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const lyricsContainerRef = useRef<HTMLDivElement | null>(null);
+  const activeLyricLineRef = useRef<HTMLDivElement | null>(null);
+  const lastPlayedSongQueryRef = useRef<string>('');
+  const lastPlayedSongTimeRef = useRef<number>(0);
+  const ytPlayerStateRef = useRef<number>(-1);
+  const ytListeningAckRef = useRef<boolean>(false);
+  const activeTrackRef = useRef<RealMediaTrack | null>(null);
+  const musicQueueRef = useRef<RealMediaTrack[]>([]);
+  const musicHistoryRef = useRef<RealMediaTrack[]>([]);
+  const moodShuffleEnabledRef = useRef<boolean>(moodShuffleEnabled);
+  const externalShuffleEnabledRef = useRef<boolean>(externalShuffleEnabled);
+  const positionMsRef = useRef<number>(0);
+  const lastManualSeekTimeRef = useRef<number>(0);
+  const externalSeekOffsetRef = useRef<number>(0);
+  const lastRawExternalPosRef = useRef<number>(0);
+  const shuffleBufferRef = useRef<RealMediaTrack | null>(null);
+  const shufflePrefetchingRef = useRef<boolean>(false);
+  const handleTrackEndedRef = useRef<() => void>(() => {});
+  const lastEndedTriggerRef = useRef<number>(0);
+
+  useEffect(() => {
+    activeTrackRef.current = activeTrack;
+  }, [activeTrack]);
+  useEffect(() => {
+    musicQueueRef.current = musicQueue;
+  }, [musicQueue]);
+  useEffect(() => {
+    musicHistoryRef.current = musicHistory;
+  }, [musicHistory]);
+  useEffect(() => {
+    moodShuffleEnabledRef.current = moodShuffleEnabled;
+  }, [moodShuffleEnabled]);
+  useEffect(() => {
+    externalShuffleEnabledRef.current = externalShuffleEnabled;
+  }, [externalShuffleEnabled]);
+  useEffect(() => {
+    positionMsRef.current = positionMs;
+  }, [positionMs]);
+
+  // Extract dominant color from album cover for warm ambient wash in Lyrics Mode (matches video 00:04-00:10)
+  useEffect(() => {
+    const coverUrl = activeTrack?.coverUrl;
+    if (!coverUrl) return;
+    let cancelled = false;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (cancelled) return;
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 16;
+        canvas.height = 16;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, 16, 16);
+        const data = ctx.getImageData(0, 0, 16, 16).data;
+        let rSum = 0;
+        let gSum = 0;
+        let bSum = 0;
+        let count = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+          if (lum > 24 && lum < 235) {
+            rSum += r;
+            gSum += g;
+            bSum += b;
+            count++;
+          }
+        }
+        if (count > 0) {
+          const nr = Math.min(1, Math.max(0.18, rSum / count / 255));
+          const ng = Math.min(1, Math.max(0.15, gSum / count / 255));
+          const nb = Math.min(1, Math.max(0.12, bSum / count / 255));
+          setActiveTrack((prev) =>
+            prev && prev.coverUrl === coverUrl ? { ...prev, tintRgb: [nr, ng, nb] } : prev
+          );
+        }
+      } catch {
+        // Keep default warm amber tint if CORS blocks pixel read
+      }
+    };
+    img.src = coverUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTrack?.coverUrl]);
+
+  const currentTrack = useMemo<RealMediaTrack>(
+    () =>
+      activeTrack || {
+        title: 'Media',
+        artist: '',
+        coverUrl: '',
+        audioUrl: '',
+        durationMs: 0,
+        lrc: '',
+        tintRgb: [0.54, 0.36, 0.16] as [number, number, number],
+      },
+    [activeTrack]
+  );
+
+  const parsedLyrics = useMemo(
+    () => parseLrc(currentTrack.lrc || '', currentTrack.wordsByLine),
+    [currentTrack.lrc, currentTrack.wordsByLine]
+  );
+
+  const activeLineIndex = useMemo(() => {
+    if (!parsedLyrics || parsedLyrics.length === 0) return -1;
+    let curr = -1;
+    for (let i = 0; i < parsedLyrics.length; i++) {
+      if (positionMs >= parsedLyrics[i].timeMs) {
+        curr = i;
+      } else {
+        break;
+      }
+    }
+    return curr;
+  }, [parsedLyrics, positionMs]);
+
+  // Auto-scroll active lyric line smoothly to the vertical center of the lyrics container
+  useEffect(() => {
+    if (!lyricsMode) return;
+    const container = lyricsContainerRef.current;
+    const lineEl = activeLyricLineRef.current;
+    if (container && lineEl) {
+      const targetTop =
+        lineEl.offsetTop - container.clientHeight / 2 + lineEl.clientHeight / 2;
+      container.scrollTo({
+        top: Math.max(0, targetTop),
+        behavior: 'smooth',
+      });
+    }
+  }, [lyricsMode, activeLineIndex]);
+
+  // ── Equalizer Visualizer is delegated to BeatEqualizerBars (Direct SVG DOM mutation with zero React re-renders) ──
+
+  // Ensure active track always fetches synced lyrics from multi-provider chain if lrc is missing
+  useEffect(() => {
+    if (!activeTrack || activeTrack.lrc || !activeTrack.title || activeTrack.title === 'Media') {
+      return;
+    }
+    let cancelled = false;
+    const fetchMissingLyrics = async () => {
+      try {
+        const params = new URLSearchParams({
+          track_name: activeTrack.title,
+          artist_name: activeTrack.artist || '',
+          q: `${activeTrack.title} ${activeTrack.artist || ''}`.trim(),
+        });
+        const res = await fetch(`/api/music/lyrics?${params.toString()}`);
+        const data = await res.json();
+        if (!cancelled && data?.lrc) {
+          setActiveTrack((prev) =>
+            prev && prev.title === activeTrack.title
+              ? {
+                  ...prev,
+                  lrc: data.lrc,
+                  syncType: data.syncType,
+                  provider: data.provider,
+                  wordsByLine: data.wordsByLine,
+                  lrclibId: data.lrclibId,
+                }
+              : prev
+          );
+        }
+      } catch {
+        // ignore
+      }
+    };
+    fetchMissingLyrics();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTrack?.title, activeTrack?.artist, activeTrack?.lrc]);
+
+  // Listen to postMessages from embedded YouTube IFrame for full song stream timing
+  // Guards against premature playerState === 0 events during initial buffer so tracks never jump mid-song
+  useEffect(() => {
+    const canTriggerNaturalEnd = () => {
+      const tr = activeTrackRef.current;
+      if (!tr || tr.sourceType === 'external') return false;
+      const elapsedSinceStart = Date.now() - lastPlayedSongTimeRef.current;
+      const dur = tr.durationMs && tr.durationMs > 20000 ? tr.durationMs : 180000;
+      const pos = positionMsRef.current;
+      return elapsedSinceStart > 8000 && pos >= Math.max(20000, dur - 8000);
+    };
+
+    const handleYtMessage = (event: MessageEvent) => {
+      try {
+        if (typeof event.data !== 'string') return;
+        const data = JSON.parse(event.data);
+        if (data.event) {
+          ytListeningAckRef.current = true;
+        }
+        if ((data.event === 'infoDelivery' || data.event === 'initialDelivery') && data.info) {
+          if (typeof data.info.currentTime === 'number' && data.info.currentTime > 0) {
+            const nextPos = Math.round(data.info.currentTime * 1000);
+            positionMsRef.current = nextPos;
+            setPositionMs(nextPos);
+          }
+          if (typeof data.info.duration === 'number' && data.info.duration > 40) {
+            const ytDurMs = Math.round(data.info.duration * 1000);
+            setActiveTrack((prev) =>
+              prev && prev.sourceType !== 'external' && Math.abs(prev.durationMs - ytDurMs) > 1000
+                ? { ...prev, durationMs: ytDurMs }
+                : prev
+            );
+          }
+          if (typeof data.info.playerState === 'number') {
+            ytPlayerStateRef.current = data.info.playerState;
+            if (data.info.playerState === 1) {
+              setIsPlaying(true);
+            } else if (data.info.playerState === 2) {
+              setIsPlaying(false);
+            } else if (data.info.playerState === 0 && canTriggerNaturalEnd()) {
+              handleTrackEndedRef.current();
+            }
+          }
+        } else if (data.event === 'onStateChange' && typeof data.info === 'number') {
+          ytPlayerStateRef.current = data.info;
+          if (data.info === 1) {
+            setIsPlaying(true);
+          } else if (data.info === 2) {
+            setIsPlaying(false);
+          } else if (data.info === 0 && canTriggerNaturalEnd()) {
+            handleTrackEndedRef.current();
+          }
+        }
+      } catch {
+        // ignore non-json messages
+      }
+    };
+    window.addEventListener('message', handleYtMessage);
+    return () => window.removeEventListener('message', handleYtMessage);
+  }, []);
+
+  // Ensure YouTube IFrame JS API handshake succeeds so real-time currentTime & state events always stream
+  useEffect(() => {
+    if (!activeTrack?.youtubeVideoId) return;
+    ytListeningAckRef.current = false;
+    ytPlayerStateRef.current = -1;
+
+    const sendHandshake = () => {
+      const cw = ytIframeRef.current?.contentWindow;
+      if (!cw) return;
+      try {
+        cw.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), '*');
+        cw.postMessage(
+          JSON.stringify({
+            event: 'command',
+            func: 'addEventListener',
+            args: ['onStateChange'],
+          }),
+          '*'
+        );
+      } catch {
+        // ignore
+      }
+    };
+
+    sendHandshake();
+    const id = window.setInterval(() => {
+      if (!ytListeningAckRef.current) {
+        sendHandshake();
+      }
+    }, 400);
+
+    return () => window.clearInterval(id);
+  }, [activeTrack?.youtubeVideoId]);
+
+  // Sync YouTube IFrame volume & mute state
+  useEffect(() => {
+    const cw = ytIframeRef.current?.contentWindow;
+    if (!cw || !activeTrack?.youtubeVideoId) return;
+    try {
+      cw.postMessage(
+        JSON.stringify({ event: 'command', func: muted ? 'mute' : 'unMute', args: '' }),
+        '*'
+      );
+      cw.postMessage(
+        JSON.stringify({
+          event: 'command',
+          func: 'setVolume',
+          args: [muted ? 0 : volume],
+        }),
+        '*'
+      );
+    } catch {
+      // ignore
+    }
+  }, [volume, muted, activeTrack?.youtubeVideoId]);
+
+  // Send media transport, shuffle, or seek command to External App (Spotify, YouTube Music, or Windows GSMTC OS Media Session)
+  const sendExternalMediaCommand = useCallback(
+    async (
+      action: 'play_pause' | 'play' | 'pause' | 'next' | 'prev' | 'shuffle' | 'seek',
+      targetShuffle?: boolean,
+      positionMs?: number
+    ) => {
+      try {
+        // 1. Electron / WebView2 Native Bridge if running inside desktop shell
+        const winAny = window as any;
+        if (typeof winAny.electronAPI?.mediaControl === 'function') {
+          winAny.electronAPI.mediaControl(action, targetShuffle, positionMs);
+        } else if (typeof winAny.chrome?.webview?.postMessage === 'function') {
+          winAny.chrome.webview.postMessage({
+            type: 'mediaControl',
+            action,
+            targetShuffle,
+            positionMs,
+            sourceApp: activeTrackRef.current?.externalApp,
+          });
+        }
+
+        // 2. Server-side Windows GSMTC / OS Media Controller endpoint
+        const res = await fetch('/api/music/os-control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action,
+            targetShuffle,
+            positionMs,
+            sourceApp: activeTrackRef.current?.externalApp,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (typeof data?.shuffleActive === 'boolean') {
+            setExternalShuffleEnabled(data.shuffleActive);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    },
+    []
+  );
+
+  // Load & play a track (Internal AI Player or External OS Media Session)
+  const loadAndPlayRealTrack = useCallback(
+    (trackInfo: {
+      title: string;
+      artist: string;
+      coverUrl?: string;
+      audioUrl?: string;
+      isFlac?: boolean;
+      durationMs?: number;
+      youtubeVideoId?: string;
+      youtubeMusicUrl?: string;
+      spotifyUrl?: string;
+      lrc?: string;
+      syncType?: 'WORD' | 'LINE';
+      provider?: string;
+      wordsByLine?: any[];
+      lrclibId?: number;
+      sourceType?: 'internal' | 'external';
+      externalApp?: string;
+    }) => {
+      const isExternal = trackInfo.sourceType === 'external';
+      const isLocalBlob = Boolean(trackInfo.audioUrl && trackInfo.audioUrl.startsWith('blob:'));
+      const isDirectFlacStream = Boolean(
+        !isExternal && trackInfo.isFlac && trackInfo.audioUrl && trackInfo.audioUrl.startsWith('http')
+      );
+      const useHtmlAudio = !isExternal && (isLocalBlob || isDirectFlacStream);
+      const safeDurationMs =
+        typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 40000
+          ? trackInfo.durationMs
+          : 210000;
+
+      const nextTrack: RealMediaTrack = {
+        title: trackInfo.title || 'Media',
+        artist: trackInfo.artist || '',
+        coverUrl: trackInfo.coverUrl || '',
+        audioUrl: useHtmlAudio ? trackInfo.audioUrl : '',
+        isFlac: Boolean(trackInfo.isFlac || flacEnabled),
+        durationMs: safeDurationMs,
+        youtubeVideoId: isExternal || isLocalBlob ? undefined : trackInfo.youtubeVideoId,
+        youtubeMusicUrl: trackInfo.youtubeMusicUrl,
+        spotifyUrl: trackInfo.spotifyUrl,
+        lrc: trackInfo.lrc || '',
+        syncType: trackInfo.syncType,
+        provider: trackInfo.provider,
+        wordsByLine: trackInfo.wordsByLine,
+        lrclibId: trackInfo.lrclibId,
+        sourceType: isExternal ? 'external' : 'internal',
+        externalApp: trackInfo.externalApp,
+        tintRgb: [0.54, 0.36, 0.16],
+      };
+      ytPlayerStateRef.current = -1;
+      ytListeningAckRef.current = false;
+      activeTrackRef.current = nextTrack;
+      setActiveTrack(nextTrack);
+      positionMsRef.current = 0;
+      setPositionMs(0);
+      setIsPlaying(true);
+      lastPlayedSongQueryRef.current = (nextTrack.title || '').toLowerCase();
+      lastPlayedSongTimeRef.current = Date.now();
+
+      if (audioElRef.current) {
+        audioElRef.current.pause();
+        audioElRef.current.currentTime = 0;
+        if (useHtmlAudio && nextTrack.audioUrl) {
+          audioElRef.current.src = nextTrack.audioUrl;
+          audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0, volume / 100));
+          audioElRef.current
+            .play()
+            .then(() => setIsPlaying(true))
+            .catch(() => {
+              // If direct FLAC stream fails CORS/codec, fall back seamlessly to YouTube Full Audio
+              setActiveTrack((prev) => (prev ? { ...prev, audioUrl: '' } : prev));
+              setIsPlaying(true);
+            });
+        } else {
+          audioElRef.current.removeAttribute('src');
+          audioElRef.current.load();
+        }
+      }
+    },
+    [flacEnabled, muted, volume]
+  );
+
+  // Source-Aware Play / Pause Toggle:
+  // - If playing from External App (Spotify, YouTube Music, OS Media), sends play_pause to external session
+  // - If playing from Internal AI Player, controls internal YouTube / HTML5 audio stream
+  const handleTogglePlay = useCallback(() => {
+    if (activeTrackRef.current?.sourceType === 'external') {
+      setIsPlaying((curr) => !curr);
+      sendExternalMediaCommand('play_pause');
+      return;
+    }
+
+    setIsPlaying((currPlaying) => {
+      const nextPlaying = !currPlaying;
+      ytPlayerStateRef.current = nextPlaying ? 1 : 2;
+      if (activeTrack?.youtubeVideoId && !activeTrack?.audioUrl && ytIframeRef.current?.contentWindow) {
+        ytIframeRef.current.contentWindow.postMessage(
+          JSON.stringify({
+            event: 'command',
+            func: nextPlaying ? 'playVideo' : 'pauseVideo',
+            args: '',
+          }),
+          '*'
+        );
+      }
+      if (audioElRef.current && activeTrack?.audioUrl) {
+        if (nextPlaying) {
+          audioElRef.current.play().catch(() => {});
+        } else {
+          audioElRef.current.pause();
+        }
+      }
+      return nextPlaying;
+    });
+  }, [activeTrack?.audioUrl, activeTrack?.youtubeVideoId, sendExternalMediaCommand]);
+
+  // Source-Aware Shuffle Toggle:
+  // - If music is from External App (Spotify / YouTube Music / OS Media), toggles the external app's native shuffle
+  // - If music is from Internal AI Player (or idle), toggles Internal AI Mood Shuffle without interrupting current playback
+  const handleToggleShuffle = useCallback(() => {
+    if (activeTrackRef.current?.sourceType === 'external') {
+      const nextExternalShuffle = !externalShuffleEnabledRef.current;
+      externalShuffleEnabledRef.current = nextExternalShuffle;
+      setExternalShuffleEnabled(nextExternalShuffle);
+      sendExternalMediaCommand('shuffle', nextExternalShuffle);
+      return;
+    }
+    setMoodShuffleEnabled((prev) => !prev);
+  }, [sendExternalMediaCommand]);
+
+  const handleSeek = useCallback(
+    (nextMs: number) => {
+      const clampedMs = Math.max(0, Math.round(nextMs));
+      lastManualSeekTimeRef.current = Date.now();
+      positionMsRef.current = clampedMs;
+      setPositionMs(clampedMs);
+
+      if (activeTrackRef.current?.sourceType === 'external') {
+        externalSeekOffsetRef.current = clampedMs - lastRawExternalPosRef.current;
+        sendExternalMediaCommand('seek', undefined, clampedMs);
+        return;
+      }
+
+      if (activeTrack?.youtubeVideoId && !activeTrack?.audioUrl && ytIframeRef.current?.contentWindow) {
+        ytIframeRef.current.contentWindow.postMessage(
+          JSON.stringify({ event: 'command', func: 'seekTo', args: [clampedMs / 1000, true] }),
+          '*'
+        );
+      }
+      if (audioElRef.current && activeTrack?.audioUrl) {
+        audioElRef.current.currentTime = clampedMs / 1000;
+      }
+    },
+    [activeTrack?.audioUrl, activeTrack?.youtubeVideoId, sendExternalMediaCommand]
+  );
+
+  // Build exclusion params (both titles & videoIds) so Shuffle never repeats the current or recent songs
+  const buildShuffleExclusionParams = useCallback((base?: RealMediaTrack | null) => {
+    const refTrack = base || activeTrackRef.current;
+    const excludedTitles = [
+      refTrack?.title || '',
+      shuffleBufferRef.current?.title || '',
+      ...musicHistoryRef.current.slice(0, 10).map((t) => t.title),
+      ...musicQueueRef.current.slice(0, 6).map((t) => t.title),
+    ]
+      .filter(Boolean)
+      .join('|');
+
+    const excludedVideoIds = [
+      refTrack?.youtubeVideoId || '',
+      shuffleBufferRef.current?.youtubeVideoId || '',
+      ...musicHistoryRef.current.slice(0, 10).map((t) => t.youtubeVideoId || ''),
+      ...musicQueueRef.current.slice(0, 6).map((t) => t.youtubeVideoId || ''),
+    ]
+      .filter(Boolean)
+      .join('|');
+
+    return { excludedTitles, excludedVideoIds };
+  }, []);
+
+  // Background pre-fetcher for Internal AI Mood Shuffle so clicking Next (>>) switches tracks instantaneously
+  const prefetchNextShuffleTrack = useCallback(
+    async (seed?: RealMediaTrack | null) => {
+      const base = seed || activeTrackRef.current;
+      if (!base || base.sourceType === 'external') return;
+      if (shufflePrefetchingRef.current || shuffleBufferRef.current) return;
+
+      shufflePrefetchingRef.current = true;
+      try {
+        const { excludedTitles, excludedVideoIds } = buildShuffleExclusionParams(base);
+        const params = new URLSearchParams({
+          title: base.title || '',
+          artist: base.artist || '',
+          exclude: excludedTitles,
+          excludeVideoIds: excludedVideoIds,
+          flac: flacEnabled ? 'true' : 'false',
+        });
+        const res = await fetch(`/api/music/mood-shuffle?${params.toString()}`);
+        const data = await res.json();
+        if (data?.found && data?.track) {
+          const t = data.track;
+          const isSameAsActive =
+            activeTrackRef.current &&
+            ((t.youtubeVideoId && t.youtubeVideoId === activeTrackRef.current.youtubeVideoId) ||
+              t.title?.toLowerCase() === activeTrackRef.current.title?.toLowerCase());
+          if (!isSameAsActive) {
+            shuffleBufferRef.current = {
+              ...t,
+              sourceType: 'internal',
+              tintRgb: [0.54, 0.36, 0.16],
+            };
+          }
+        }
+      } catch {
+        // ignore
+      } finally {
+        shufflePrefetchingRef.current = false;
+      }
+    },
+    [buildShuffleExclusionParams, flacEnabled]
+  );
+
+  // Whenever an internal track is playing and Mood Shuffle is enabled, pre-buffer the next mood track in the background
+  // IMPORTANT: Toggling moodShuffleEnabled ON never interrupts the currently playing track!
+  useEffect(() => {
+    if (moodShuffleEnabled && activeTrack && activeTrack.sourceType !== 'external') {
+      prefetchNextShuffleTrack(activeTrack);
+    }
+  }, [moodShuffleEnabled, activeTrack?.title, activeTrack?.youtubeVideoId, prefetchNextShuffleTrack]);
+
+  // Search song & synced lyrics via /api/music/search (Internal AI Player)
+  const handleSearchAndPlayMedia = useCallback(
+    async (queryStr: string) => {
+      const q = queryStr.trim();
+      if (!q) return;
+      lastPlayedSongQueryRef.current = q.toLowerCase();
+      lastPlayedSongTimeRef.current = Date.now();
+      setMediaLoading(true);
+      try {
+        const res = await fetch(
+          `/api/music/search?q=${encodeURIComponent(q)}&flac=${flacEnabled ? 'true' : 'false'}`
+        );
+        const data = await res.json();
+        if (data?.found && data?.track) {
+          if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
+            setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+          }
+          shuffleBufferRef.current = null;
+          loadAndPlayRealTrack({ ...data.track, sourceType: 'internal' });
+        }
+      } catch {
+        // ignore
+      } finally {
+        setMediaLoading(false);
+      }
+    },
+    [flacEnabled, loadAndPlayRealTrack]
+  );
+
+  // Enqueue a resolved track (plays immediately if nothing is playing right now)
+  const enqueueResolvedTrack = useCallback(
+    (trackInfo: any) => {
+      if (!trackInfo) return;
+      const safeDurationMs =
+        typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 40000
+          ? trackInfo.durationMs
+          : 210000;
+      const queuedItem: RealMediaTrack = {
+        title: trackInfo.title || 'Media',
+        artist: trackInfo.artist || '',
+        coverUrl: trackInfo.coverUrl || '',
+        audioUrl: trackInfo.audioUrl || '',
+        isFlac: Boolean(trackInfo.isFlac || flacEnabled),
+        durationMs: safeDurationMs,
+        youtubeVideoId: trackInfo.youtubeVideoId,
+        youtubeMusicUrl: trackInfo.youtubeMusicUrl,
+        spotifyUrl: trackInfo.spotifyUrl,
+        lrc: trackInfo.lrc || '',
+        syncType: trackInfo.syncType,
+        provider: trackInfo.provider,
+        wordsByLine: trackInfo.wordsByLine,
+        lrclibId: trackInfo.lrclibId,
+        sourceType: 'internal',
+        tintRgb: [0.54, 0.36, 0.16],
+      };
+
+      if (!activeTrackRef.current || activeTrackRef.current.sourceType === 'external') {
+        loadAndPlayRealTrack(queuedItem);
+        return;
+      }
+
+      setMusicQueue((prev) => [...prev, queuedItem]);
+    },
+    [flacEnabled, loadAndPlayRealTrack]
+  );
+
+  // Search song & add to Music Queue (Antrian Lagu)
+  const handleQueueSongMedia = useCallback(
+    async (queryStr: string) => {
+      const q = queryStr.trim();
+      if (!q) return;
+      if (!activeTrackRef.current || activeTrackRef.current.sourceType === 'external') {
+        handleSearchAndPlayMedia(q);
+        return;
+      }
+      try {
+        const res = await fetch(
+          `/api/music/search?q=${encodeURIComponent(q)}&flac=${flacEnabled ? 'true' : 'false'}`
+        );
+        const data = await res.json();
+        if (data?.found && data?.track) {
+          enqueueResolvedTrack(data.track);
+        }
+      } catch {
+        // ignore
+      }
+    },
+    [enqueueResolvedTrack, flacEnabled, handleSearchAndPlayMedia]
+  );
+
+  // Smart Mood Shuffle (Internal AI Player): Play pre-buffered shuffle track immediately or fetch a new mood-matched song
+  const triggerSmartMoodShuffle = useCallback(
+    async (seedTrack?: RealMediaTrack | null) => {
+      const base = seedTrack || activeTrackRef.current;
+
+      // 1. If we already pre-buffered a distinct next shuffle track, play it immediately with zero wait!
+      const buffered = shuffleBufferRef.current;
+      if (
+        buffered &&
+        (!base ||
+          ((!buffered.youtubeVideoId || buffered.youtubeVideoId !== base.youtubeVideoId) &&
+            buffered.title.toLowerCase() !== base.title.toLowerCase()))
+      ) {
+        shuffleBufferRef.current = null;
+        if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
+          setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+        }
+        loadAndPlayRealTrack({ ...buffered, sourceType: 'internal' });
+        window.setTimeout(() => prefetchNextShuffleTrack(buffered), 400);
+        return;
+      }
+
+      // 2. Otherwise fetch live from /api/music/mood-shuffle with strict title & videoId exclusion
+      const { excludedTitles, excludedVideoIds } = buildShuffleExclusionParams(base);
+      setMediaLoading(true);
+      try {
+        const params = new URLSearchParams({
+          title: base?.title || '',
+          artist: base?.artist || '',
+          exclude: excludedTitles,
+          excludeVideoIds: excludedVideoIds,
+          flac: flacEnabled ? 'true' : 'false',
+        });
+        const res = await fetch(`/api/music/mood-shuffle?${params.toString()}`);
+        const data = await res.json();
+        if (data?.found && data?.track) {
+          if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
+            setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+          }
+          shuffleBufferRef.current = null;
+          loadAndPlayRealTrack({ ...data.track, sourceType: 'internal' });
+        }
+      } catch {
+        // ignore
+      } finally {
+        setMediaLoading(false);
+      }
+    },
+    [buildShuffleExclusionParams, flacEnabled, loadAndPlayRealTrack, prefetchNextShuffleTrack]
+  );
+
+  // Automatically advance to next queued song OR trigger Smart Mood Shuffle ONLY when an internal track genuinely finishes
+  const handleTrackEnded = useCallback(() => {
+    if (activeTrackRef.current?.sourceType === 'external') return;
+    const now = Date.now();
+    if (now - lastEndedTriggerRef.current < 2500) return;
+    lastEndedTriggerRef.current = now;
+
+    const currentQ = musicQueueRef.current;
+    if (currentQ.length > 0) {
+      const [nextTrack, ...restQueue] = currentQ;
+      setMusicQueue(restQueue);
+      if (activeTrackRef.current) {
+        setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+      }
+      loadAndPlayRealTrack({ ...nextTrack, sourceType: 'internal' });
+      return;
+    }
+
+    if (moodShuffleEnabledRef.current && activeTrackRef.current) {
+      triggerSmartMoodShuffle(activeTrackRef.current);
+      return;
+    }
+
+    setIsPlaying(false);
+    positionMsRef.current = 0;
+    setPositionMs(0);
+  }, [loadAndPlayRealTrack, triggerSmartMoodShuffle]);
+
+  useEffect(() => {
+    handleTrackEndedRef.current = handleTrackEnded;
+  }, [handleTrackEnded]);
+
+  // Poll OS Media Session (/api/music/os-now-playing) to detect External Apps (Spotify, YouTube Music, OS Media)
+  // and synchronize external shuffle state
+  const refreshExternalOsMedia = useCallback(async () => {
+    try {
+      const res = await fetch('/api/music/os-now-playing');
+      const data = await res.json();
+      if (typeof data?.shuffleActive === 'boolean') {
+        setExternalShuffleEnabled(data.shuffleActive);
+      }
+      // Only take over activeTrack if no internal AI track is currently active (or if activeTrack is already external)
+      const curr = activeTrackRef.current;
+      if (data?.playing && data?.track && (!curr || curr.sourceType === 'external')) {
+        const extTrack: RealMediaTrack = {
+          ...data.track,
+          sourceType: 'external',
+          externalApp: data.sourceApp || data.track.externalApp || 'Spotify',
+          youtubeVideoId: undefined,
+          audioUrl: '',
+          tintRgb: curr?.tintRgb || [0.54, 0.36, 0.16],
+        };
+        const isDifferentSong =
+          !curr ||
+          curr.title.toLowerCase() !== extTrack.title.toLowerCase() ||
+          curr.artist.toLowerCase() !== extTrack.artist.toLowerCase();
+        if (isDifferentSong) {
+          activeTrackRef.current = extTrack;
+          setActiveTrack(extTrack);
+          externalSeekOffsetRef.current = 0;
+          const initPos = typeof data.positionMs === 'number' ? data.positionMs : 0;
+          lastRawExternalPosRef.current = initPos;
+          positionMsRef.current = initPos;
+          setPositionMs(initPos);
+        } else if (typeof data.positionMs === 'number') {
+          lastRawExternalPosRef.current = data.positionMs;
+          const timeSinceManualSeek = Date.now() - lastManualSeekTimeRef.current;
+          // If the OS session natively accepted our seek (within 2.5s of our position), clear offset
+          if (Math.abs(positionMsRef.current - data.positionMs) <= 2500) {
+            externalSeekOffsetRef.current = 0;
+          } else if (timeSinceManualSeek > 10000 && externalSeekOffsetRef.current === 0) {
+            // Only snap to OS position if user hasn't manually seeked lyrics in this session
+            positionMsRef.current = data.positionMs;
+            setPositionMs(data.positionMs);
+          }
+        }
+        setIsPlaying(!data.isPaused);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshExternalOsMedia();
+    const id = window.setInterval(refreshExternalOsMedia, 6000);
+    return () => window.clearInterval(id);
+  }, [refreshExternalOsMedia]);
+
+  // Next Track button (>>):
+  // - External App (Spotify / YouTube Music / OS Media): sends 'next' directly to external app
+  // - Internal AI Player: plays next queued song OR next mood-shuffle track immediately
+  const handleNextTrack = useCallback(() => {
+    if (activeTrackRef.current?.sourceType === 'external') {
+      sendExternalMediaCommand('next');
+      positionMsRef.current = 0;
+      setPositionMs(0);
+      window.setTimeout(() => refreshExternalOsMedia(), 650);
+      return;
+    }
+
+    const currentQ = musicQueueRef.current;
+    if (currentQ.length > 0) {
+      const [nextTrack, ...restQueue] = currentQ;
+      setMusicQueue(restQueue);
+      if (activeTrackRef.current) {
+        setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+      }
+      loadAndPlayRealTrack({ ...nextTrack, sourceType: 'internal' });
+      return;
+    }
+
+    if (activeTrackRef.current) {
+      triggerSmartMoodShuffle(activeTrackRef.current);
+      return;
+    }
+    handleSeek(0);
+  }, [
+    handleSeek,
+    loadAndPlayRealTrack,
+    refreshExternalOsMedia,
+    sendExternalMediaCommand,
+    triggerSmartMoodShuffle,
+  ]);
+
+  // Previous Track button (<<):
+  // - External App (Spotify / YouTube Music / OS Media): sends 'prev' directly to external app
+  // - Internal AI Player: returns to previous song in history (or rewinds to 0:00 if no history)
+  const handlePrevTrack = useCallback(() => {
+    if (activeTrackRef.current?.sourceType === 'external') {
+      sendExternalMediaCommand('prev');
+      positionMsRef.current = 0;
+      setPositionMs(0);
+      window.setTimeout(() => refreshExternalOsMedia(), 650);
+      return;
+    }
+
+    if (musicHistoryRef.current.length > 0 && (positionMsRef.current < 5000 || moodShuffleEnabledRef.current)) {
+      const [prevTrack, ...restHistory] = musicHistoryRef.current;
+      setMusicHistory(restHistory);
+      if (activeTrackRef.current) {
+        setMusicQueue((q) => [activeTrackRef.current!, ...q]);
+      }
+      loadAndPlayRealTrack({ ...prevTrack, sourceType: 'internal' });
+      return;
+    }
+    handleSeek(0);
+  }, [handleSeek, loadAndPlayRealTrack, refreshExternalOsMedia, sendExternalMediaCommand]);
+
+  // Handle local audio file (.mp3, .wav, .flac, .m4a) + automatic LRCLIB lyrics fetch
+  const handleLocalAudioFile = useCallback(
+    async (file: File) => {
+      const objectUrl = URL.createObjectURL(file);
+      const rawName = file.name.replace(/\.[^/.]+$/, '').replace(/[_]+/g, ' ').trim();
+      const parts = rawName.split(' - ');
+      const artistGuess = parts.length > 1 ? parts[0].trim() : '';
+      const titleGuess = parts.length > 1 ? parts.slice(1).join(' - ').trim() : rawName;
+
+      loadAndPlayRealTrack({
+        title: titleGuess || rawName,
+        artist: artistGuess || 'Local Audio',
+        audioUrl: objectUrl,
+        durationMs: 180000,
+        lrc: '',
+        sourceType: 'internal',
+      });
+
+      // Automatically fetch synced lyrics from multi-provider chain
+      try {
+        const params = new URLSearchParams({
+          track_name: titleGuess,
+          artist_name: artistGuess,
+          q: rawName,
+        });
+        const res = await fetch(`/api/music/lyrics?${params.toString()}`);
+        const data = await res.json();
+        if (data?.lrc) {
+          setActiveTrack((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  title: data.title || prev.title,
+                  artist: data.artist || prev.artist,
+                  lrc: data.lrc,
+                  syncType: data.syncType,
+                  provider: data.provider,
+                  wordsByLine: data.wordsByLine,
+                  lrclibId: data.lrclibId,
+                }
+              : prev
+          );
+        }
+      } catch {
+        // ignore
+      }
+    },
+    [loadAndPlayRealTrack]
+  );
+
+  // Sync HTMLAudioElement volume with Dynamic Island volume & mute state
+  useEffect(() => {
+    if (audioElRef.current) {
+      audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0, volume / 100));
+    }
+  }, [volume, muted]);
+
+  // High-precision playback & lyrics sync clock with context-aware throttled React state updates
+  useEffect(() => {
+    if (!isPlaying || !activeTrack) return;
+
+    let lastWallMs = performance.now();
+    let lastReactSync = 0;
+
+    const interval = window.setInterval(() => {
+      const nowWallMs = performance.now();
+      const dtMs = Math.min(250, Math.max(0, Math.round(nowWallMs - lastWallMs)));
+      lastWallMs = nowWallMs;
+
+      // When document is hidden (background / minimized), track position accurately via ref without UI renders
+      if (document.hidden) {
+        const dur =
+          activeTrack.durationMs && activeTrack.durationMs > 5000
+            ? activeTrack.durationMs
+            : 210000;
+        const nextVal = positionMsRef.current + dtMs;
+        if (nextVal >= dur) {
+          if (activeTrack.sourceType !== 'external') {
+            window.setTimeout(() => handleTrackEndedRef.current(), 0);
+          } else {
+            window.setTimeout(() => refreshExternalOsMedia(), 300);
+          }
+          positionMsRef.current = 0;
+        } else {
+          positionMsRef.current = nextVal;
+        }
+        return;
+      }
+
+      // 1. If HTML5 <audio> is actively playing a local blob or HTTP FLAC stream, read its exact hardware currentTime
+      const audioEl = audioElRef.current;
+      if (audioEl && activeTrack.audioUrl && !audioEl.paused && audioEl.currentTime > 0) {
+        const nextPos = Math.round(audioEl.currentTime * 1000);
+        positionMsRef.current = nextPos;
+
+        // Context-aware React state throttle:
+        // - lyricsMode: 80ms (karaoke word sync)
+        // - expanded: 250ms (fluid progress bar + clock)
+        // - collapsed notch: 1000ms (1 render/sec)
+        const syncThreshold = lyricsMode ? 80 : isExpanded ? 250 : 1000;
+        if (nowWallMs - lastReactSync >= syncThreshold) {
+          lastReactSync = nowWallMs;
+          setPositionMs(nextPos);
+        }
+        return;
+      }
+
+      // 2. If backed by YouTube stream, only pause advancement if YouTube explicitly reports paused (2) or buffering (3),
+      //    or during the initial 750ms iframe warmup when ytPlayerStateRef is still -1
+      if (activeTrack.youtubeVideoId && activeTrack.sourceType !== 'external') {
+        if (ytPlayerStateRef.current === 2 || ytPlayerStateRef.current === 3) {
+          return;
+        }
+        if (
+          ytPlayerStateRef.current === -1 &&
+          Date.now() - lastPlayedSongTimeRef.current < 750
+        ) {
+          return;
+        }
+      }
+
+      // 3. Advance positionMs smoothly using real wall-clock delta
+      const dur =
+        activeTrack.durationMs && activeTrack.durationMs > 5000
+          ? activeTrack.durationMs
+          : 210000;
+      const prev = positionMsRef.current;
+      if (prev + dtMs >= dur) {
+        if (activeTrack.sourceType !== 'external') {
+          window.setTimeout(() => handleTrackEndedRef.current(), 0);
+        } else {
+          window.setTimeout(() => refreshExternalOsMedia(), 300);
+        }
+        positionMsRef.current = 0;
+        setPositionMs(0);
+        return;
+      }
+      const nextVal = prev + dtMs;
+      positionMsRef.current = nextVal;
+
+      const syncThreshold = lyricsMode ? 80 : isExpanded ? 250 : 1000;
+      if (nowWallMs - lastReactSync >= syncThreshold) {
+        lastReactSync = nowWallMs;
+        setPositionMs(nextVal);
+      }
+    }, 60);
+
+    return () => window.clearInterval(interval);
+  }, [isPlaying, activeTrack, refreshExternalOsMedia, isExpanded, lyricsMode]);
+
+  // Immediate sync when opening/expanding Island so progress & lyrics are accurate on the exact frame
+  useEffect(() => {
+    if (isExpanded && isPlaying) {
+      setPositionMs(positionMsRef.current);
+    }
+  }, [isExpanded, isPlaying]);
+
+  const formatTrackTime = (ms: number, remaining = false) => {
+    const sec = Math.max(0, Math.floor(ms / 1000));
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${remaining ? '-' : ''}${m}:${s}`;
+  };
+
+  // ── Page 2: Real Notifications & Do Not Disturb State (Persisted, Zero Fake Placeholders) ──
+  const [dndEnabled, setDndEnabled] = useState(false);
+  const [notifications, setNotifications] = useState<NotificationItem[]>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_notifications_v2');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+  const [newNotifInput, setNewNotifInput] = useState('');
+  const [replyingNotifId, setReplyingNotifId] = useState<number | null>(null);
+  const [replyNotifText, setReplyNotifText] = useState('');
+  const [browserNotifPerm, setBrowserNotifPerm] = useState<string>(() =>
+    typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'unsupported'
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_notifications_v2', JSON.stringify(notifications.slice(0, 30)));
+    } catch {
+      // ignore
+    }
+  }, [notifications]);
+
+  const unreadNotifCount = useMemo(
+    () => notifications.filter((n) => n.unread).length,
+    [notifications]
+  );
+
+  const pushRealNotification = useCallback(
+    (title: string, subtitle: string, iconType: 'calendar' | 'download' | 'message' = 'message') => {
+      const cleanTitle = title.trim().slice(0, 80);
+      const cleanSub = subtitle.trim().slice(0, 140);
+      if (!cleanTitle) return;
+
+      const now = new Date();
+      const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+      setNotifications((prev) => [
+        {
+          id: Date.now() + Math.floor(Math.random() * 1000),
+          iconType,
+          title: cleanTitle,
+          subtitle: cleanSub || 'Isle System Notification',
+          timeAgo: stamp,
+          unread: true,
+        },
+        ...prev.slice(0, 24),
+      ]);
+
+      if (!dndEnabled && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+        try {
+          new Notification(cleanTitle, { body: cleanSub });
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [dndEnabled]
+  );
+
+  // ── Page 3: Focus / Pomodoro State ──
+  const [pomoMode, setPomoMode] = useState<'focus' | 'break'>('focus');
+  const [pomoTotalSeconds, setPomoTotalSeconds] = useState(25 * 60);
+  const [pomoRemainingSeconds, setPomoRemainingSeconds] = useState(25 * 60);
+  const [pomoRunning, setPomoRunning] = useState(false);
+  const [pomoSessionsCompleted, setPomoSessionsCompleted] = useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_pomo_sessions_v2');
+      return saved ? Math.max(0, parseInt(saved, 10) || 0) : 0;
+    } catch {
+      return 0;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_pomo_sessions_v2', String(pomoSessionsCompleted));
+    } catch {
+      // ignore
+    }
+  }, [pomoSessionsCompleted]);
+
+  useEffect(() => {
+    if (!pomoRunning) return;
+    let lastSec = Math.floor(Date.now() / 1000);
+    const t = setInterval(() => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const elapsed = Math.max(1, nowSec - lastSec);
+      lastSec = nowSec;
+      setPomoRemainingSeconds((prev) => {
+        if (prev <= elapsed) {
+          setPomoRunning(false);
+          if (pomoMode === 'focus') {
+            setPomoSessionsCompleted((s) => s + 1);
+            pushRealNotification('Focus Session Selesai!', 'Waktu fokus selesai — saatnya istirahat sejenak.', 'calendar');
+          } else {
+            pushRealNotification('Waktu Break Selesai!', 'Siap kembali lanjut fokus?', 'calendar');
+          }
+          return 0;
+        }
+        return prev - elapsed;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [pomoRunning, pomoMode, pushRealNotification]);
+
+  const formatPomoTime = (sec: number) => {
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${m}:${s}`;
+  };
+
+  // ── Page 4: Real Tasks / ToDoList State (Persisted, Zero Fake Placeholders) ──
+  const [tasks, setTasks] = useState<ToDoItem[]>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_tasks_v2');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+  const [addingTask, setAddingTask] = useState(false);
+  const [newTaskInput, setNewTaskInput] = useState('');
+  const [newTaskTime, setNewTaskTime] = useState<string>(() => {
+    const d = new Date(Date.now() + 30 * 60 * 1000);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  });
+  const [editingTaskTimeId, setEditingTaskTimeId] = useState<number | null>(null);
+  const completedCount = useMemo(() => tasks.filter((t) => t.done).length, [tasks]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_tasks_v2', JSON.stringify(tasks.slice(0, 40)));
+    } catch {
+      // ignore
+    }
+  }, [tasks]);
+
+  // ── Page 6: Real Calendar State (Synced to Live System Clock & Persisted in localStorage) ──
+  const [calYear, setCalYear] = useState(() => new Date().getFullYear());
+  const [calMonth, setCalMonth] = useState(() => new Date().getMonth());
+  const [selectedDay, setSelectedDay] = useState(() => new Date().getDate());
+  const [newEventInput, setNewEventInput] = useState('');
+  const [showWorldClocks, setShowWorldClocks] = useState(false);
+  const [eventsByDate, setEventsByDate] = useState<Record<string, CalendarEventItem[]>>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_calendar_events_v2');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return {};
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_calendar_events_v2', JSON.stringify(eventsByDate));
+    } catch {
+      // ignore
+    }
+  }, [eventsByDate]);
+
+  const calendarCells = useMemo(() => {
+    const firstDayOfWeek = new Date(calYear, calMonth, 1).getDay();
+    const daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+    const cells: (number | null)[] = [];
+    for (let i = 0; i < firstDayOfWeek; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+    return cells;
+  }, [calYear, calMonth]);
+
+  const currentDateKey = `${calYear}-${calMonth}-${selectedDay}`;
+  const selectedDayEvents = eventsByDate[currentDateKey] || [];
+
+  const handleAddCalendarEvent = useCallback(
+    (rawText: string) => {
+      const trimmed = rawText.trim().slice(0, 100);
+      if (!trimmed) return;
+      const match = trimmed.match(/^(.*?)\s+(\d{1,2}[:.]\d{2})$/);
+      const title = match ? match[1].trim() : trimmed;
+      const time = match ? match[2].replace('.', ':') : timeStr;
+
+      setEventsByDate((prev) => {
+        const existing = prev[currentDateKey] || [];
+        if (existing.length >= 25) return prev; // Chaos cap
+        return {
+          ...prev,
+          [currentDateKey]: [
+            ...existing,
+            { id: Date.now() + Math.floor(Math.random() * 1000), title, time, color: '#ff9f0a' },
+          ],
+        };
+      });
+      pushRealNotification(
+        `Jadwal: ${title}`,
+        `${selectedDay} ${SHORT_MONTHS[calMonth]} ${calYear} · ${time}`,
+        'calendar'
+      );
+      setNewEventInput('');
+    },
+    [calMonth, calYear, currentDateKey, pushRealNotification, selectedDay, timeStr]
+  );
+
+  // ── Smart Alarms (Persisted in localStorage & triggered via Island notch) ──
+  const [smartAlarms, setSmartAlarms] = useState<SmartAlarm[]>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_smart_alarms');
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore
+    }
+    return [
+      {
+        id: 'alarm-default-1',
+        time: '09:00',
+        title: 'Morning Standup',
+        enabled: true,
+        createdAt: Date.now(),
+      },
+    ];
+  });
+
+  const [calendarSubTab, setCalendarSubTab] = useState<'events' | 'alarms'>('events');
+  const [newAlarmTime, setNewAlarmTime] = useState('09:30');
+  const [newAlarmTitle, setNewAlarmTitle] = useState('');
+  const lastTriggeredMinuteRef = useRef<string>('');
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_smart_alarms', JSON.stringify(smartAlarms));
+    } catch {
+      // ignore
+    }
+  }, [smartAlarms]);
+
+  // Tick checker: Trigger Dynamic Island Reminder Alert when an enabled Smart Alarm OR a scheduled Task matches HH:mm
+  useEffect(() => {
+    if (!timeStr) return;
+    const currentMinKey = `${nowDate.toDateString()}-${timeStr}`;
+    if (lastTriggeredMinuteRef.current === currentMinKey) return;
+
+    const matchedAlarm = smartAlarms.find((a) => a.enabled && a.time === timeStr);
+    if (matchedAlarm) {
+      lastTriggeredMinuteRef.current = currentMinKey;
+      triggerAlert('alarm', {
+        alarmId: matchedAlarm.id,
+        alarmTitle: matchedAlarm.title,
+        alarmTime: matchedAlarm.time,
+      });
+      pushRealNotification(
+        `Alarm: ${matchedAlarm.title}`,
+        `Waktu alarm tercapai pukul ${matchedAlarm.time}`,
+        'calendar'
+      );
+      return;
+    }
+
+    const matchedTask = tasks.find((t) => !t.done && t.time && t.time === timeStr);
+    if (matchedTask) {
+      lastTriggeredMinuteRef.current = currentMinKey;
+      triggerAlert('alarm', {
+        alarmId: `task-${matchedTask.id}`,
+        alarmTitle: `Task: ${matchedTask.title}`,
+        alarmTime: matchedTask.time,
+      });
+      pushRealNotification(
+        `Pengingat Task: ${matchedTask.title}`,
+        `Jadwal task pukul ${matchedTask.time} telah tiba`,
+        'calendar'
+      );
+    }
+  }, [timeStr, smartAlarms, tasks, nowDate, triggerAlert, pushRealNotification]);
+
+  const handleToggleAlarm = useCallback((id: string) => {
+    setSmartAlarms((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, enabled: !a.enabled } : a))
+    );
+  }, []);
+
+  const handleDeleteAlarm = useCallback((id: string) => {
+    setSmartAlarms((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const handleAddSmartAlarm = useCallback(
+    (time: string, rawTitle: string) => {
+      const cleanTitle = rawTitle.trim() || `Alarm ${time}`;
+      const newAlarm: SmartAlarm = {
+        id: `alarm-${Date.now()}`,
+        time: time || '09:00',
+        title: cleanTitle,
+        enabled: true,
+        createdAt: Date.now(),
+      };
+      setSmartAlarms((prev) => [newAlarm, ...prev.slice(0, 19)]);
+      setNewAlarmTitle('');
+      pushRealNotification('Smart Alarm Dibuat', `${cleanTitle} pada ${time}`, 'calendar');
+    },
+    [pushRealNotification]
+  );
+
+  const handleSnoozeAlarm = useCallback(
+    (alarmId?: string) => {
+      setActiveAlert(null);
+      const snoozeDate = new Date(Date.now() + 5 * 60 * 1000);
+      const shh = String(snoozeDate.getHours()).padStart(2, '0');
+      const smm = String(snoozeDate.getMinutes()).padStart(2, '0');
+      const snoozeTime = `${shh}:${smm}`;
+
+      if (alarmId && alarmId.startsWith('task-')) {
+        const taskIdNum = parseInt(alarmId.replace('task-', ''), 10);
+        setTasks((prev) =>
+          prev.map((t) => (t.id === taskIdNum ? { ...t, time: snoozeTime } : t))
+        );
+      } else if (alarmId) {
+        setSmartAlarms((prev) =>
+          prev.map((a) => (a.id === alarmId ? { ...a, time: snoozeTime, enabled: true } : a))
+        );
+      }
+      pushRealNotification(
+        'Pengingat Ditunda 5 Menit',
+        `Akan muncul kembali di Dynamic Island pukul ${snoozeTime}`,
+        'calendar'
+      );
+    },
+    [pushRealNotification]
+  );
+
+  // ── Page 7: Real-Time Weather & Solar Arc State (Auto Location + Manual City Override) ──
+  const [weatherData, setWeatherData] = useState<WeatherData>(() => {
+    const h = new Date().getHours();
+    return {
+      city: 'Mendeteksi...',
+      currentTemp: 28,
+      weatherCode: 2,
+      isDay: h >= 6 && h < 18,
+      sunrise: '5:49',
+      sunset: '17:52',
+      hourly: Array.from({ length: 7 }, (_, i) => ({
+        time: `${String((h + i) % 24).padStart(2, '0')}:00`,
+        temp: 28 - (i % 3),
+        code: i < 3 ? 2 : 3,
+      })),
+    };
+  });
+  const [editingWeatherCity, setEditingWeatherCity] = useState(false);
+  const [weatherCityInput, setWeatherCityInput] = useState('');
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherTransitioning, setWeatherTransitioning] = useState(false);
+
+  const fetchWeatherData = useCallback(async (customCity?: string) => {
+    setWeatherLoading(true);
+    if (customCity !== undefined) {
+      setWeatherTransitioning(true);
+    }
+    try {
+      const savedCity =
+        customCity !== undefined
+          ? customCity.trim()
+          : window.localStorage.getItem('isle_weather_city') || '';
+
+      let url = '/api/weather';
+      if (savedCity) {
+        url = `/api/weather?city=${encodeURIComponent(savedCity)}`;
+      }
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.ok) {
+          setWeatherData({
+            city: data.city || savedCity || 'Jakarta',
+            currentTemp: typeof data.currentTemp === 'number' ? data.currentTemp : 28,
+            weatherCode: typeof data.weatherCode === 'number' ? data.weatherCode : 2,
+            isDay: Boolean(data.isDay ?? true),
+            sunrise: data.sunrise || '5:49',
+            sunset: data.sunset || '17:52',
+            hourly: Array.isArray(data.hourly) ? data.hourly.slice(0, 7) : [],
+          });
+          if (customCity !== undefined) {
+            try {
+              if (customCity.trim()) {
+                window.localStorage.setItem('isle_weather_city', customCity.trim());
+              } else {
+                window.localStorage.removeItem('isle_weather_city');
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      setWeatherLoading(false);
+      window.setTimeout(() => setWeatherTransitioning(false), 160);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchWeatherData();
+    const id = window.setInterval(() => fetchWeatherData(), 10 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [fetchWeatherData]);
+
+  // ── Unified Command Executor for Voice & Chat AI (Tasks, Timers, Smart Alarms, Weather, Lyrics Seek, Volume, Brightness, Music) ──
+  const executeIslandCommand = useCallback(
+    (raw: string): { handled: boolean; reply?: string } => {
+      const p = raw.trim().toLowerCase();
+      if (!p) return { handled: false };
+
+      const INDO_NUMS: Record<string, number> = {
+        satu: 1, se: 1, dua: 2, tiga: 3, empat: 4, lima: 5, enam: 6,
+        tujuh: 7, delapan: 8, sembilan: 9, sepuluh: 10, sebelas: 11,
+        duabelas: 12, limabelas: 15, duapuluh: 20, tigapuluh: 30, setengah: 0.5,
+      };
+
+      const parseNum = (str: string): number => {
+        const clean = str.trim().toLowerCase();
+        if (INDO_NUMS[clean] !== undefined) return INDO_NUMS[clean];
+        const n = parseFloat(clean);
+        return Number.isFinite(n) ? n : 1;
+      };
+
+      // 0a. Scheduled Task / To-Do ("tambahin task olahraga di jam 5 pagi", "tambahkan tugas untuk besok", "buat task meeting jam 14:30")
+      const todoCmdMatch = raw.match(
+        /\b(?:tambah(?:in|kan)?|buat(?:in|kan)?|bikin(?:in|kan)?|catat(?:kan)?|jadwalkan|masukin|masukkan|add|create|set)\s+(?:jadwal\s+)?(?:task|tugas|todo|to-do|kerjaan|agenda)\s+(.+)/i
+      );
+      if (todoCmdMatch && todoCmdMatch[1]) {
+        let rawTask = todoCmdMatch[1].trim();
+        const isTomorrow = /\bbesok\b/i.test(rawTask);
+        let taskTime = isTomorrow ? '09:00' : timeStr;
+        const todTimeMatch = rawTask.match(
+          /^(.*?)\s*(?:di\s+|pada\s+)?(?:jam|pukul|at)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam|am|pm)?\b(.*)$/i
+        );
+        if (todTimeMatch) {
+          let hh = parseInt(todTimeMatch[2], 10);
+          const mm = todTimeMatch[3] ? parseInt(todTimeMatch[3], 10) : 0;
+          const period = (todTimeMatch[4] || '').toLowerCase();
+          if ((period === 'sore' || period === 'malam' || period === 'pm') && hh < 12) hh += 12;
+          if (period === 'siang' && hh >= 1 && hh <= 4) hh += 12;
+          if ((period === 'pagi' || period === 'am') && hh === 12) hh = 0;
+          taskTime = `${String(Math.min(23, Math.max(0, hh))).padStart(2, '0')}:${String(
+            Math.min(59, Math.max(0, mm))
+          ).padStart(2, '0')}`;
+          rawTask = `${todTimeMatch[1] || ''} ${todTimeMatch[5] || ''}`.replace(/\s+/g, ' ').trim();
+        }
+        const strippedTitle = rawTask
+          .replace(/^(?:baru|untuk|buat|yaitu|di)\s+/i, '')
+          .replace(/\s+(?:di|pada)$/i, '')
+          .trim();
+        const cleanTitle =
+          !strippedTitle || /^besok$/i.test(strippedTitle)
+            ? 'Tugas Besok'
+            : strippedTitle;
+
+        setTasks((prev) => [
+          ...prev.slice(-29),
+          {
+            id: Date.now(),
+            title: cleanTitle,
+            time: taskTime,
+            done: false,
+          },
+        ]);
+        pushRealNotification(
+          `Task Dijadwalkan: ${cleanTitle}`,
+          `Pengingat aktif pukul ${taskTime}`,
+          'calendar'
+        );
+        triggerActionConfirmation('Task Dijadwalkan', cleanTitle, taskTime, 'task', 3);
+        return {
+          handled: true,
+          reply: `Siap! Task "${cleanTitle}" sudah ditambahkan untuk pukul ${taskTime}.`,
+        };
+      }
+
+      // 0b. Custom Timer / Pomodoro Duration ("set timer 15 menit", "atur timer 10 menit", "timer 20 menit")
+      const timerCmdMatch =
+        raw.match(
+          /\b(?:set|atur|buat|pasang|mulai|start|nyalain|nyalakan)\s+(?:waktu\s+)?(?:timer|fokus|pomodoro|hitung mundur)\s*(?:selama|untuk)?\s*(satu|dua|tiga|empat|lima|sepuluh|limabelas|duapuluh|tigapuluh|\d{1,3})\s*(menit|detik|jam|min|m|s)\b/i
+        ) ||
+        raw.match(
+          /\b(?:timer|pomodoro)\s+(satu|dua|tiga|empat|lima|sepuluh|limabelas|duapuluh|tigapuluh|\d{1,3})\s*(menit|detik|jam|min|m|s)\b/i
+        );
+      if (timerCmdMatch && timerCmdMatch[1]) {
+        const val = parseNum(timerCmdMatch[1]);
+        const unit = (timerCmdMatch[2] || 'menit').toLowerCase();
+        const totalSec =
+          unit === 'detik' || unit === 's'
+            ? Math.max(5, Math.round(val))
+            : unit === 'jam'
+            ? Math.round(val * 3600)
+            : Math.max(60, Math.round(val * 60));
+        setPomoMode('focus');
+        setPomoTotalSeconds(totalSec);
+        setPomoRemainingSeconds(totalSec);
+        setPomoRunning(true);
+        const badgeStr = formatPomoTime(totalSec);
+        pushRealNotification('Timer Fokus Dimulai', `Durasi diatur ke ${badgeStr}`, 'calendar');
+        triggerActionConfirmation('Timer Fokus Aktif', 'Hitung mundur berjalan', badgeStr, 'timer', 2);
+        return {
+          handled: true,
+          reply: `Timer fokus selama ${badgeStr} sudah dimulai di Dynamic Island.`,
+        };
+      }
+
+      // 1. Reminder & Smart Alarm System ("dalam satu menit ingetin aku manasin motor", "pasang alarm jam 5 pagi", etc.)
+      const relMatch1 = raw.match(
+        /(?:dalam|setelah)?\s*(satu|se|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|\d+)\s*(menit|jam)\s*(?:lagi)?\s*(?:ingetin|ingatkan|remind me to|remind me|alarm|pengingat)?\s*(?:aku|saya)?\s*(.*)/i
+      );
+      const relMatch2 = raw.match(
+        /(?:ingetin|ingatkan|remind me to|remind me|buatkan pengingat|pasang alarm|alarm)\s*(?:aku|saya)?\s*(.*?)\s*(?:dalam|setelah)\s*(satu|se|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|\d+)\s*(menit|jam)/i
+      );
+      const relMatch3 = raw.match(
+        /(?:ingetin|ingatkan|remind me)\s*(?:aku|saya)?\s*(satu|se|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|\d+)\s*(menit|jam)\s*(?:lagi)?\s*(?:untuk|buat)?\s*(.*)/i
+      );
+
+      let minutesToAdd: number | null = null;
+      let extractedTitle = '';
+
+      if (relMatch1 && (p.includes('inget') || p.includes('alarm') || p.includes('remind') || p.includes('pengingat'))) {
+        const numVal = parseNum(relMatch1[1]);
+        const unit = relMatch1[2].toLowerCase();
+        minutesToAdd = unit === 'jam' ? numVal * 60 : numVal;
+        extractedTitle = relMatch1[3]?.trim() || '';
+      } else if (relMatch2) {
+        const numVal = parseNum(relMatch2[3]);
+        const unit = relMatch2[4].toLowerCase();
+        minutesToAdd = unit === 'jam' ? numVal * 60 : numVal;
+        extractedTitle = relMatch2[1]?.trim() || '';
+      } else if (relMatch3) {
+        const numVal = parseNum(relMatch3[1]);
+        const unit = relMatch3[2].toLowerCase();
+        minutesToAdd = unit === 'jam' ? numVal * 60 : numVal;
+        extractedTitle = relMatch3[3]?.trim() || '';
+      }
+
+      // Absolute time matching: "ingatkan jam 18:30 meeting", "pasang alarm jam 5 pagi lari"
+      const absMatch = raw.match(
+        /(?:ingetin|ingatkan|remind me|alarm|pasang alarm|set alarm|buat alarm)\s*(?:aku|saya)?\s*(?:di\s+|pada\s+)?(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam|am|pm)?\s*(?:buat|untuk)?\s*(.*)/i
+      );
+      let targetTimeStr = '';
+
+      if (minutesToAdd !== null && minutesToAdd > 0) {
+        const targetDate = new Date(Date.now() + Math.round(minutesToAdd * 60 * 1000));
+        const th = String(targetDate.getHours()).padStart(2, '0');
+        const tm = String(targetDate.getMinutes()).padStart(2, '0');
+        targetTimeStr = `${th}:${tm}`;
+      } else if (absMatch) {
+        let hh = parseInt(absMatch[1], 10);
+        const mm = absMatch[2] ? parseInt(absMatch[2], 10) : 0;
+        const period = (absMatch[3] || '').toLowerCase();
+        if ((period === 'sore' || period === 'malam' || period === 'pm') && hh < 12) hh += 12;
+        if (period === 'siang' && hh >= 1 && hh <= 4) hh += 12;
+        if ((period === 'pagi' || period === 'am') && hh === 12) hh = 0;
+        targetTimeStr = `${String(Math.min(23, Math.max(0, hh))).padStart(2, '0')}:${String(
+          Math.min(59, Math.max(0, mm))
+        ).padStart(2, '0')}`;
+        extractedTitle = absMatch[4]?.trim() || '';
+      }
+
+      if (targetTimeStr) {
+        let cleanTitle = extractedTitle
+          .replace(/^(?:untuk|buat|tentang|soal)\s+/i, '')
+          .replace(/\b(?:dalam|setelah|lagi|ingetin|ingatkan|aku|saya)\b/gi, '')
+          .trim();
+        if (!cleanTitle) cleanTitle = 'Pengingat';
+
+        // Add to Smart Alarms
+        const newAlarm: SmartAlarm = {
+          id: `alarm-${Date.now()}`,
+          time: targetTimeStr,
+          title: cleanTitle,
+          enabled: true,
+          createdAt: Date.now(),
+        };
+        setSmartAlarms((prev) => [newAlarm, ...prev.slice(0, 19)]);
+
+        // Add to Todo List
+        setTasks((prev) => [
+          ...prev.slice(-29),
+          {
+            id: Date.now(),
+            title: cleanTitle,
+            time: targetTimeStr,
+            done: false,
+          },
+        ]);
+
+        // Push desktop notification & seamless Island confirmation alert
+        pushRealNotification(
+          'Smart Alarm & Pengingat Diset',
+          `"${cleanTitle}" diset pukul ${targetTimeStr}`,
+          'calendar'
+        );
+        setCalendarSubTab('alarms');
+        triggerActionConfirmation('Smart Alarm Aktif', cleanTitle, targetTimeStr, 'alarm', 5);
+
+        return {
+          handled: true,
+          reply: `Siap! Pengingat "${cleanTitle}" sudah dipasang pukul ${targetTimeStr} di Smart Alarm dan Tasks.`,
+        };
+      }
+
+      // 1b. Weather & City Lookup ("cek cuaca", "cuaca di Bandung", "buka weather")
+      const weatherCityMatch = raw.match(
+        /\b(?:cek\s+cuaca|lihat\s+cuaca|info\s+cuaca|cuaca|weather|prakiraan\s+cuaca)\s+(?:di\s+|untuk\s+|kota\s+|in\s+)([a-zA-Z\s]{2,30})$/i
+      );
+      if (weatherCityMatch && weatherCityMatch[1]) {
+        const city = weatherCityMatch[1]
+          .replace(/\b(sekarang|hari ini|besok|dong|ya|bro|saat ini)\b/gi, '')
+          .trim();
+        if (city) {
+          fetchWeatherData(city);
+          triggerActionConfirmation('Cuaca Diperbarui', `Lokasi: ${city}`, `${weatherData.currentTemp}°`, 'weather', 6);
+          return {
+            handled: true,
+            reply: `Menampilkan cuaca terkini dan kurva matahari untuk ${city}.`,
+          };
+        }
+      }
+      if (
+        /\b(buka cuaca|buka menu cuaca|buka weather|open weather|cek cuaca|lihat cuaca|info cuaca|cuaca hari ini|cuaca sekarang)\b/i.test(
+          p
+        )
+      ) {
+        fetchWeatherData();
+        triggerActionConfirmation(
+          'Menu Weather',
+          weatherData.city,
+          `${weatherData.currentTemp}°`,
+          'weather',
+          6
+        );
+        return {
+          handled: true,
+          reply: `Membuka menu Weather untuk ${weatherData.city} (${weatherData.currentTemp}°C).`,
+        };
+      }
+
+      // 1c. Mini Capsule Auto-Hide Mode (Alt + H) — Instant hide/restore with zero alert popup
+      if (/\b(mini capsule|kapsul mini|sembunyikan pulau|auto hide|mode sembunyi|alt\s*\+\s*h)\b/i.test(p)) {
+        const nextMini = !miniCapsuleMode;
+        setActiveAlert(null);
+        setMiniCapsuleMode(nextMini);
+        if (nextMini) {
+          setIsPinnedOpen(false);
+          setIsHovered(false);
+          setAssistantOpen(false);
+          setLyricsMode(false);
+          setSettingsOpen(false);
+          setTopEdgeHover(false);
+        }
+        return {
+          handled: true,
+          reply: nextMini
+            ? 'Mode Mini Capsule aktif.'
+            : 'Mode normal aktif.',
+        };
+      }
+
+      // 2. Brightness controls
+      if (
+        /\b(naikin|tambah|tambahin|tingkatin|lebih terang|terangin|cerahkan)\b.*\b(kecerahan|layar|brightness)\b|\b(kecerahan|layar|brightness)\b.*\b(naik|tambah|up)\b/.test(
+          p
+        )
+      ) {
+        setBrightness((curr) => {
+          const next = Math.min(10, curr + 2);
+          triggerAlert('brightness', { value: next });
+          return next;
+        });
+        return { handled: true, reply: 'Kecerahan layar telah dinaikkan.' };
+      }
+      if (
+        /\b(turunin|kurangi|kurangin|lebih gelap|gelapin|redupkan|turunkan)\b.*\b(kecerahan|layar|brightness)\b|\b(kecerahan|layar|brightness)\b.*\b(turun|kurang|down)\b/.test(
+          p
+        )
+      ) {
+        setBrightness((curr) => {
+          const next = Math.max(1, curr - 2);
+          triggerAlert('brightness', { value: next });
+          return next;
+        });
+        return { handled: true, reply: 'Kecerahan layar telah diturunkan.' };
+      }
+      const briNumMatch = p.match(/\b(?:brightness|kecerahan)\b.*?(\d{1,3})/);
+      if (briNumMatch) {
+        const rawNum = parseInt(briNumMatch[1], 10);
+        const val = Math.min(10, Math.max(1, rawNum > 10 ? Math.round(rawNum / 10) : rawNum));
+        setBrightness(val);
+        triggerAlert('brightness', { value: val });
+        return { handled: true, reply: `Kecerahan diatur ke tingkat ${val}.` };
+      }
+
+      // 3. Volume controls
+      if (
+        /\b(naikin|gedein|tambah|tambahin|kerasin|perbesar|tinggikan)\b.*\b(volume|suara)\b|\b(volume|suara)\b.*\b(naik|up|tambah)\b/.test(
+          p
+        )
+      ) {
+        setMuted(false);
+        setVolume((curr) => {
+          const next = Math.min(100, curr + 15);
+          triggerAlert('volume', { value: next });
+          return next;
+        });
+        return { handled: true, reply: 'Volume dinaikkan.' };
+      }
+      if (
+        /\b(turunin|kecilin|kurangi|kurangin|pelanin|rendahkan|kecilkan)\b.*\b(volume|suara)\b|\b(volume|suara)\b.*\b(turun|down|kecil)\b/.test(
+          p
+        )
+      ) {
+        setVolume((curr) => {
+          const next = Math.max(0, curr - 15);
+          triggerAlert('volume', { value: next });
+          return next;
+        });
+        return { handled: true, reply: 'Volume diturunkan.' };
+      }
+      if (/\b(mute|bisukan|senyapkan|matikan suara)\b/.test(p)) {
+        setMuted(true);
+        triggerAlert('mute', { muted: true });
+        return { handled: true, reply: 'Volume dibisukan (Muted).' };
+      }
+      if (/\b(unmute|bunyikan|nyalakan suara|suara on)\b/.test(p)) {
+        setMuted(false);
+        triggerAlert('volume', { value: volume });
+        return { handled: true, reply: 'Suara dinyalakan kembali.' };
+      }
+      const volNumMatch = p.match(/\bvolume\b.*?(\d{1,3})/);
+      if (volNumMatch) {
+        const v = Math.min(100, Math.max(0, parseInt(volNumMatch[1], 10)));
+        setMuted(v === 0);
+        setVolume(v);
+        triggerAlert('volume', { value: v });
+        return { handled: true, reply: `Volume diatur ke ${v}%.` };
+      }
+
+      // 4. Music & Lyrics Seek Controls ("loncat ke menit 1:30", "buka lirik", Queue, Mood Shuffle, Play, Pause, Skip)
+      const seekMinSecMatch = raw.match(
+        /\b(?:loncat|lompat|skip|majukan|mundurkan|seek|geser)\s+(?:lagu|musik|lirik)?\s*(?:ke\s+)?(?:menit\s+|waktu\s+|detik\s+)?(\d{1,2})[:.](\d{2})\b/i
+      );
+      if (seekMinSecMatch) {
+        const targetMs =
+          (parseInt(seekMinSecMatch[1], 10) * 60 + parseInt(seekMinSecMatch[2], 10)) * 1000;
+        handleSeek(targetMs);
+        navigateToPage(0);
+        setLyricsMode(true);
+        const stamp = formatTrackTime(targetMs);
+        triggerActionConfirmation('Loncat Lirik & Musik', activeTrack?.title || 'Media', stamp, 'music', 0);
+        return {
+          handled: true,
+          reply: `Melompat ke posisi lirik ${stamp}.`,
+        };
+      }
+      const seekSecMatch = raw.match(
+        /\b(?:loncat|lompat|skip|seek|geser)\s+(?:lagu|musik|lirik)?\s*(?:ke\s+)?detik\s+(\d{1,3})\b/i
+      );
+      if (seekSecMatch) {
+        const targetMs = parseInt(seekSecMatch[1], 10) * 1000;
+        handleSeek(targetMs);
+        navigateToPage(0);
+        setLyricsMode(true);
+        const stamp = formatTrackTime(targetMs);
+        triggerActionConfirmation('Loncat Lirik & Musik', activeTrack?.title || 'Media', stamp, 'music', 0);
+        return {
+          handled: true,
+          reply: `Melompat ke posisi lirik ${stamp}.`,
+        };
+      }
+      if (/\b(buka lirik|tampilkan lirik|lihat lirik|show lyrics|open lyrics)\b/i.test(p)) {
+        navigateToPage(0);
+        setLyricsMode(true);
+        setIsPinnedOpen(true);
+        triggerActionConfirmation('Lyrics Mode', activeTrack?.title || 'Sinkronisasi Lirik', 'ON', 'music', 0);
+        return { handled: true, reply: 'Membuka tampilan lirik lagu.' };
+      }
+
+      const queueSongMatch =
+        raw.match(
+          /\b(?:setelah ini|habis ini|habis lagu ini|abis ini|abis lagu ini|selanjutnya|nanti)\s+(?:tolong\s+)?(?:putar lagu|stel lagu|setel musik|setel lagu|mainkan lagu|putar musik|setel|putar|play|stel)\s+(.+)/i
+        ) ||
+        raw.match(
+          /\b(?:masukin ke antrian|masukkan ke antrian|tambah ke antrian|tambahin ke antrian|antriin lagu|antrikan lagu|antri lagu|add to queue|queue song|queue track|play next)\s+(?:lagu\s+)?(.+)/i
+        );
+      if (queueSongMatch && queueSongMatch[1]) {
+        const songQuery = queueSongMatch[1].trim();
+        const willPlayNow = !activeTrackRef.current;
+        handleQueueSongMedia(songQuery);
+        navigateToPage(0);
+        triggerActionConfirmation(
+          willPlayNow ? 'Memutar Musik' : 'Ditambahkan ke Antrian',
+          songQuery,
+          willPlayNow ? 'PLAY' : '+QUEUE',
+          'music',
+          0
+        );
+        return {
+          handled: true,
+          reply: willPlayNow
+            ? `Karena belum ada lagu yang diputar, langsung memutar "${songQuery}" sekarang.`
+            : `Siap! Lagu "${songQuery}" sudah dimasukkan ke antrian dan akan otomatis diputar setelah lagu ini selesai.`,
+        };
+      }
+
+      if (/\b(hapus antrian|kosongkan antrian|bersihkan antrian|clear queue)\b/i.test(p)) {
+        setMusicQueue([]);
+        triggerActionConfirmation('Antrian Musik', 'Antrian lagu dikosongkan', '0', 'music', 0);
+        return { handled: true, reply: 'Antrian lagu telah dikosongkan.' };
+      }
+
+      if (
+        /\b(matiin|matikan|nonaktifkan|stop|turn off|disable)\b.*\b(shuffle|auto\s*play|mood)\b|\bshuffle\b.*\b(mati|off)\b/i.test(
+          p
+        )
+      ) {
+        if (activeTrackRef.current?.sourceType === 'external') {
+          setExternalShuffleEnabled(false);
+          sendExternalMediaCommand('shuffle', false);
+          triggerActionConfirmation('Shuffle Musik', activeTrackRef.current.externalApp || 'External', 'OFF', 'music', 0);
+          return {
+            handled: true,
+            reply: `Shuffle pada ${activeTrackRef.current.externalApp || 'aplikasi musik eksternal'} telah dinonaktifkan.`,
+          };
+        }
+        setMoodShuffleEnabled(false);
+        triggerActionConfirmation('Mood Shuffle', 'Auto-shuffle dinonaktifkan', 'OFF', 'music', 0);
+        return {
+          handled: true,
+          reply: 'Fitur Mood Shuffle internal telah dinonaktifkan.',
+        };
+      }
+
+      if (
+        /\b(nyalain|nyalakan|aktifkan|hidupkan|mulai|turn on|enable)\b.*\b(shuffle|mood)\b|\b(shuffle lagu|shuffle musik|shuffle mood|mood shuffle|shuffle sesuai mood|acak lagu sesuai mood|shuffle on)\b/i.test(
+          p
+        )
+      ) {
+        if (activeTrackRef.current?.sourceType === 'external') {
+          setExternalShuffleEnabled(true);
+          sendExternalMediaCommand('shuffle', true);
+          triggerActionConfirmation('Shuffle Musik', activeTrackRef.current.externalApp || 'External', 'ON', 'music', 0);
+          return {
+            handled: true,
+            reply: `Shuffle pada ${activeTrackRef.current.externalApp || 'aplikasi musik eksternal'} telah diaktifkan.`,
+          };
+        }
+        setMoodShuffleEnabled(true);
+        navigateToPage(0);
+        triggerActionConfirmation('Mood Shuffle Aktif', 'Mix otomatis sesuai mood lagu', 'AUTO', 'music', 0);
+        if (!activeTrackRef.current) {
+          triggerSmartMoodShuffle(null);
+          return {
+            handled: true,
+            reply: 'Mood Shuffle diaktifkan! Memutar lagu otomatis sesuai mood.',
+          };
+        }
+        return {
+          handled: true,
+          reply: `Mood Shuffle diaktifkan! Setelah "${activeTrackRef.current.title}" selesai, lagu dengan mood serupa akan diputar otomatis.`,
+        };
+      }
+
+      const playSongMatch = raw.match(
+        /\b(?:putar lagu|stel lagu|setel musik|setel lagu|mainkan lagu|play song|play music|putar musik)\s+(.+)/i
+      );
+      if (playSongMatch && playSongMatch[1]) {
+        const songQuery = playSongMatch[1].trim();
+        handleSearchAndPlayMedia(songQuery);
+        navigateToPage(0);
+        triggerActionConfirmation('Memutar Lagu', songQuery, 'PLAY', 'music', 0);
+        return { handled: true, reply: `Mencari dan memutar "${songQuery}" di Dynamic Island.` };
+      }
+      if (/\b(jeda musik|pause musik|stop musik|pause lagu|hentikan musik)\b/.test(p)) {
+        if (isPlaying) handleTogglePlay();
+        triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PAUSED', 'music', 0);
+        return { handled: true, reply: 'Musik dijeda.' };
+      }
+      if (/\b(putar musik|lanjutkan musik|play music|lanjut musik|play lagu)\b/.test(p)) {
+        if (!isPlaying) handleTogglePlay();
+        navigateToPage(0);
+        triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PLAYING', 'music', 0);
+        return { handled: true, reply: 'Musik diputar.' };
+      }
+      if (/\b(skip lagu|lagu selanjutnya|next track|next song)\b/.test(p)) {
+        handleNextTrack();
+        triggerActionConfirmation('Lagu Selanjutnya', 'Beralih ke trek berikutnya', 'NEXT', 'music', 0);
+        return { handled: true, reply: 'Beralih ke lagu selanjutnya.' };
+      }
+      if (/\b(lagu sebelumnya|prev track|previous track|previous song)\b/.test(p)) {
+        handlePrevTrack();
+        triggerActionConfirmation('Lagu Sebelumnya', 'Kembali ke trek sebelumnya', 'PREV', 'music', 0);
+        return { handled: true, reply: 'Kembali ke lagu sebelumnya.' };
+      }
+
+      // 5. Connectivity & System
+      if (
+        /\b(matiin|matikan|nonaktifkan|turn off)\b.*\bbluetooth\b|\bbluetooth\b.*\b(mati|off)\b/.test(
+          p
+        )
+      ) {
+        setBluetoothEnabled(false);
+        pushRealNotification(
+          'Bluetooth Dimatikan',
+          'Radio Bluetooth laptop dinonaktifkan.',
+          'message'
+        );
+        triggerActionConfirmation('Bluetooth', 'Radio Bluetooth laptop dinonaktifkan', 'OFF', 'system');
+        return { handled: true, reply: 'Bluetooth dinonaktifkan.' };
+      }
+      if (
+        /\b(nyalain|nyalakan|aktifkan|turn on)\b.*\bbluetooth\b|\bbluetooth\b.*\b(nyala|on)\b/.test(
+          p
+        )
+      ) {
+        setBluetoothEnabled(true);
+        pushRealNotification(
+          'Bluetooth Diaktifkan',
+          'Radio Bluetooth laptop aktif.',
+          'message'
+        );
+        triggerActionConfirmation('Bluetooth', 'Radio Bluetooth laptop aktif', 'ON', 'system');
+        return { handled: true, reply: 'Bluetooth diaktifkan.' };
+      }
+      if (/\b(matiin|matikan|nonaktifkan)\b.*\b(wifi|wi-fi)\b/.test(p)) {
+        setWifiEnabled(false);
+        pushRealNotification('Wi-Fi Dimatikan', 'Adaptor Wi-Fi dinonaktifkan.', 'message');
+        triggerActionConfirmation('Wi-Fi', 'Adaptor Wi-Fi dinonaktifkan', 'OFF', 'system');
+        return { handled: true, reply: 'Wi-Fi dinonaktifkan.' };
+      }
+      if (/\b(nyalain|nyalakan|aktifkan)\b.*\b(wifi|wi-fi)\b/.test(p)) {
+        setWifiEnabled(true);
+        pushRealNotification('Wi-Fi Diaktifkan', 'Adaptor Wi-Fi terhubung.', 'message');
+        triggerActionConfirmation('Wi-Fi', 'Adaptor Wi-Fi terhubung', 'ON', 'system');
+        return { handled: true, reply: 'Wi-Fi diaktifkan.' };
+      }
+
+      // 6. Pomodoro & DND
+      if (/\b(mulai pomodoro|start pomodoro|mulai fokus)\b/.test(p)) {
+        setPomoRunning(true);
+        triggerActionConfirmation(
+          'Pomodoro Dimulai',
+          'Sesi fokus sedang berjalan',
+          formatPomoTime(pomoRemainingSeconds),
+          'timer',
+          2
+        );
+        return { handled: true, reply: 'Timer Pomodoro dimulai.' };
+      }
+      if (/\b(jeda pomodoro|stop pomodoro|pause pomodoro)\b/.test(p)) {
+        setPomoRunning(false);
+        triggerActionConfirmation(
+          'Pomodoro Dijeda',
+          'Timer fokus dihentikan sementara',
+          formatPomoTime(pomoRemainingSeconds),
+          'timer',
+          2
+        );
+        return { handled: true, reply: 'Timer Pomodoro dijeda.' };
+      }
+      if (/\b(reset pomodoro|reset timer|ulang pomodoro)\b/.test(p)) {
+        setPomoRunning(false);
+        setPomoRemainingSeconds(pomoTotalSeconds);
+        triggerActionConfirmation(
+          'Pomodoro Direset',
+          'Waktu dikembalikan ke awal',
+          formatPomoTime(pomoTotalSeconds),
+          'timer',
+          2
+        );
+        return { handled: true, reply: 'Timer Pomodoro telah direset.' };
+      }
+      if (/\b(jangan ganggu|do not disturb|dnd|mode fokus)\b/.test(p)) {
+        const nextDnd = !dndEnabled;
+        setDndEnabled(nextDnd);
+        triggerActionConfirmation(
+          'Do Not Disturb',
+          nextDnd ? 'Notifikasi disenyapkan' : 'Notifikasi diaktifkan kembali',
+          nextDnd ? 'ON' : 'OFF',
+          'system'
+        );
+        return { handled: true, reply: 'Status Jangan Ganggu (DND) diubah.' };
+      }
+
+      return { handled: false };
+    },
+    [
+      activeTrack?.title,
+      dndEnabled,
+      fetchWeatherData,
+      handleNextTrack,
+      handlePrevTrack,
+      handleQueueSongMedia,
+      handleSearchAndPlayMedia,
+      handleSeek,
+      handleTogglePlay,
+      isPlaying,
+      miniCapsuleMode,
+      navigateToPage,
+      pomoRemainingSeconds,
+      pomoTotalSeconds,
+      pushRealNotification,
+      sendExternalMediaCommand,
+      timeStr,
+      triggerActionConfirmation,
+      triggerAlert,
+      triggerSmartMoodShuffle,
+      volume,
+      weatherData.city,
+      weatherData.currentTemp,
+    ]
+  );
+
+  // ── Voice Assistant (gemini-3.8-live Live API) & Multimodal AI Conversation (gemini-3.8-flash + Vision + Google Search) ──
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const voiceEnergyRef = useRef<number>(0);
+  const [voiceLang, setVoiceLang] = useState<'id-ID' | 'en-US'>('id-ID');
+  const [voiceStatusHint, setVoiceStatusHint] = useState<string | null>(null);
+  const [assistantLoading, setAssistantLoading] = useState(false);
+  const [botForm, setBotForm] = useState<BotForm>('listening');
+  const [assistantInput, setAssistantInput] = useState('');
+  const [pendingImage, setPendingImage] = useState<PendingImageAttachment | null>(null);
+  const [newChatToast, setNewChatToast] = useState(false);
+  const [spamNotice, setSpamNotice] = useState<string | null>(null);
+  const [showAllChatHistory, setShowAllChatHistory] = useState(false);
+  const [latestSearchSources, setLatestSearchSources] = useState<SearchSourceItem[]>([]);
+  const [animatingMsgId, setAnimatingMsgId] = useState<number | null>(null);
+  const [revealedChars, setRevealedChars] = useState<number>(0);
+
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const lastAskTimeRef = useRef<number>(0);
+  const speechRecRef = useRef<any>(null);
+  const voiceSilenceTimerRef = useRef<number | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const inputAudioCtxRef = useRef<AudioContext | null>(null);
+  const outputAudioCtxRef = useRef<AudioContext | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveWsRef = useRef<WebSocket | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const activeAudioNodesRef = useRef<AudioBufferSourceNode[]>([]);
+  const liveInputAccRef = useRef<string>('');
+  const liveOutputAccRef = useRef<string>('');
+  const handleAskGeminiRef = useRef<(promptText: string) => void>(() => {});
+
+  // Real Voice Agent State (No fake transcripts!)
+  const [agentTranscript, setAgentTranscript] = useState('');
+  const [agentHeadline, setAgentHeadline] = useState('');
+
+  // Real Multi-turn Conversation History (Persisted in localStorage, Zero Fake Initial Chat!)
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_chat_messages_v2');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+
+  // Latest AI Assistant Message (for clean single-answer display)
+  const latestAssistantMessage = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant') return messages[i];
+    }
+    return null;
+  }, [messages]);
+
+  // Smooth Typewriter / Streaming Text Reveal Effect when AI answers (Throttled to ~20fps to prevent CPU spikes)
+  useEffect(() => {
+    if (!animatingMsgId || !latestAssistantMessage || latestAssistantMessage.id !== animatingMsgId) {
+      return;
+    }
+    const fullLen = latestAssistantMessage.text.length;
+    if (revealedChars >= fullLen) {
+      setAnimatingMsgId(null);
+      return;
+    }
+    const step = Math.max(6, Math.ceil(fullLen / 22));
+    const timer = window.setTimeout(() => {
+      setRevealedChars((c) => Math.min(fullLen, c + step));
+    }, 48);
+    return () => window.clearTimeout(timer);
+  }, [animatingMsgId, latestAssistantMessage, revealedChars]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_chat_messages_v2', JSON.stringify(messages.slice(-40)));
+    } catch {
+      // ignore
+    }
+  }, [messages]);
+
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (assistantMode === 'conversation' && chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [messages, assistantLoading, assistantMode, assistantOpen, showAllChatHistory, revealedChars]);
+
+  // Stop Gemini Live WebSocket, 16kHz mic capture, 24kHz audio playback, & Web Speech API cleanly
+  const stopVoiceRecognition = useCallback(() => {
+    if (voiceSilenceTimerRef.current) {
+      window.clearTimeout(voiceSilenceTimerRef.current);
+      voiceSilenceTimerRef.current = null;
+    }
+    if (speechRecRef.current) {
+      try {
+        speechRecRef.current.onresult = null;
+        speechRecRef.current.onerror = null;
+        speechRecRef.current.onend = null;
+        speechRecRef.current.stop();
+      } catch {
+        // ignore
+      }
+      speechRecRef.current = null;
+    }
+    if (liveWsRef.current) {
+      try {
+        liveWsRef.current.onclose = null;
+        liveWsRef.current.close();
+      } catch {
+        // ignore
+      }
+      liveWsRef.current = null;
+    }
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect();
+        scriptProcessorRef.current.onaudioprocess = null;
+      } catch {
+        // ignore
+      }
+      scriptProcessorRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (inputAudioCtxRef.current) {
+      inputAudioCtxRef.current.close().catch(() => {});
+      inputAudioCtxRef.current = null;
+    }
+    for (const node of activeAudioNodesRef.current) {
+      try {
+        node.stop();
+      } catch {
+        // ignore
+      }
+    }
+    activeAudioNodesRef.current = [];
+    nextStartTimeRef.current = 0;
+    if (outputAudioCtxRef.current) {
+      outputAudioCtxRef.current.close().catch(() => {});
+      outputAudioCtxRef.current = null;
+    }
+    setVoiceListening(false);
+    setLiveConnected(false);
+  }, []);
+
+  // Cleanly close Assistant AND collapse the entire Dynamic Island back to the compact notch
+  const closeAssistantAndCollapse = useCallback(() => {
+    stopVoiceRecognition();
+    setAssistantOpen(false);
+    setIsPinnedOpen(false);
+    setIsHovered(false);
+    setDragAutoOpened(false);
+    setSettingsOpen(false);
+    setShowAllChatHistory(false);
+  }, [stopVoiceRecognition]);
+
+  // Animate voice energy fallback while loading (if real PCM audio stream isn't driving it)
+  useEffect(() => {
+    if (!voiceListening && !assistantLoading) {
+      voiceEnergyRef.current = 0;
+      return;
+    }
+    const id = setInterval(() => {
+      if (document.hidden) return;
+      if (!micStreamRef.current) {
+        voiceEnergyRef.current = 0.25 + Math.random() * 0.55;
+      }
+    }, 110);
+    return () => clearInterval(id);
+  }, [voiceListening, assistantLoading]);
+
+  const cancelInFlightGemini = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    stopVoiceRecognition();
+    setAssistantLoading(false);
+    setBotForm('listening');
+  }, [stopVoiceRecognition]);
+
+  // Convert an uploaded / pasted / dropped image File into a compressed base64 PendingImageAttachment
+  const attachImageFile = useCallback((file: File) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rawDataUrl = String(reader.result || '');
+      if (!rawDataUrl) return;
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const maxDim = 1280;
+          let w = img.width || 800;
+          let h = img.height || 600;
+          if (w > maxDim || h > maxDim) {
+            if (w > h) {
+              h = Math.round((h * maxDim) / w);
+              w = maxDim;
+            } else {
+              w = Math.round((w * maxDim) / h);
+              h = maxDim;
+            }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, w, h);
+            const outMime = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+            const compressedDataUrl = canvas.toDataURL(outMime, 0.86);
+            const b64 = compressedDataUrl.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+            setPendingImage({
+              dataUrl: compressedDataUrl,
+              base64: b64,
+              mimeType: outMime,
+              name: file.name || 'image.jpg',
+            });
+            return;
+          }
+        } catch {
+          // fallback to rawDataUrl below
+        }
+        const b64 = rawDataUrl.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+        setPendingImage({
+          dataUrl: rawDataUrl,
+          base64: b64,
+          mimeType: file.type || 'image/png',
+          name: file.name || 'image.png',
+        });
+      };
+      img.src = rawDataUrl;
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  // Automatic Screen Capture for "ambil screenshot" / "tangkap layar" / "lihat layarku sekarang" commands
+  const captureCurrentScreenAuto = useCallback(async (): Promise<PendingImageAttachment | null> => {
+    // 1. Try native OS screenshot via /api/system/screenshot (works on Windows host via PowerShell CopyFromScreen)
+    try {
+      const osRes = await fetch('/api/system/screenshot');
+      if (osRes.ok) {
+        const osData = await osRes.json();
+        if (osData?.captured && osData?.data) {
+          const mime = osData.mimeType || 'image/jpeg';
+          return {
+            dataUrl: `data:${mime};base64,${osData.data}`,
+            base64: osData.data,
+            mimeType: mime,
+            name: `screenshot-${Date.now()}.jpg`,
+          };
+        }
+      }
+    } catch {
+      // Fallback to client-side viewport compositor
+    }
+
+    // 2. Client-side Automatic Viewport & Dynamic Island Visual Compositor (Zero permission popup!)
+    try {
+      const canvas = document.createElement('canvas');
+      const w = 1280;
+      const h = 720;
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      // Render desktop background gradient
+      const bgGrad = ctx.createLinearGradient(0, 0, w, h);
+      bgGrad.addColorStop(0, '#0f172a');
+      bgGrad.addColorStop(0.5, '#1e1b4b');
+      bgGrad.addColorStop(1, '#090d16');
+      ctx.fillStyle = bgGrad;
+      ctx.fillRect(0, 0, w, h);
+
+      // Draw Dynamic Island card in top center
+      const islandW = 540;
+      const islandH = 210;
+      const islandX = Math.round((w - islandW) / 2);
+      const islandY = 28;
+      ctx.fillStyle = '#09090b';
+      ctx.beginPath();
+      ctx.roundRect(islandX, islandY, islandW, islandH, 34);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Header inside Island
+      ctx.fillStyle = '#30d158';
+      ctx.beginPath();
+      ctx.arc(islandX + 160, islandY + 28, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#e5e5ea';
+      ctx.font = '600 15px Inter, system-ui, sans-serif';
+      ctx.fillText(
+        `Battery ${batteryLevel}% · ${headerDateStr} ${nowDate.getFullYear()} · ${timeStr}`,
+        islandX + 176,
+        islandY + 33
+      );
+
+      // Active Track / Media info inside Island
+      const trackLabel = activeTrack
+        ? `${activeTrack.title} - ${activeTrack.artist || 'Artist'}`
+        : 'Tidak ada media yang sedang diputar';
+      const sourceLabel = activeTrack
+        ? activeTrack.sourceType === 'external'
+          ? `Sumber: ${activeTrack.externalApp || 'Aplikasi Eksternal'} (Shuffle: ${
+              externalShuffleEnabled ? 'ON' : 'OFF'
+            })`
+          : `Sumber: Internal AI Player (Mood Shuffle: ${moodShuffleEnabled ? 'ON' : 'OFF'}, Antrian: ${
+              musicQueue.length
+            })`
+        : 'Status: Idle / Standby';
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 20px Inter, system-ui, sans-serif';
+      ctx.fillText(trackLabel.slice(0, 44), islandX + 36, islandY + 82);
+
+      ctx.fillStyle = '#a1a1aa';
+      ctx.font = '500 14px Inter, system-ui, sans-serif';
+      ctx.fillText(sourceLabel, islandX + 36, islandY + 108);
+
+      // Active Lyric Line if available
+      if (activeTrack && parsedLyrics.length > 0) {
+        const curLine =
+          parsedLyrics[Math.max(0, activeLineIndex)]?.text || parsedLyrics[0]?.text || '';
+        if (curLine) {
+          ctx.fillStyle = '#fde047';
+          ctx.font = '600 15px Inter, system-ui, sans-serif';
+          ctx.fillText(`♪ "${curLine.slice(0, 52)}"`, islandX + 36, islandY + 140);
+        }
+      }
+
+      // Progress bar inside Island
+      ctx.fillStyle = 'rgba(255,255,255,0.2)';
+      ctx.fillRect(islandX + 36, islandY + 162, islandW - 72, 6);
+      if (activeTrack && activeTrack.durationMs > 0) {
+        const ratio = Math.min(1, Math.max(0, positionMs / activeTrack.durationMs));
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(islandX + 36, islandY + 162, Math.round((islandW - 72) * ratio), 6);
+      }
+
+      // Workspace Status Panel on screen
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
+      ctx.beginPath();
+      ctx.roundRect(120, 275, w - 240, 360, 24);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 22px Inter, system-ui, sans-serif';
+      ctx.fillText('Isle Desktop Workspace — Live Screen Capture', 156, 322);
+
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '500 16px Inter, system-ui, sans-serif';
+      const statusLines = [
+        `• Menu Aktif Dynamic Island: ${activePage.toUpperCase()}${lyricsMode ? ' (Lyrics Mode Terbuka)' : ''}`,
+        `• Musik Sekarang: ${trackLabel} (${formatTrackTime(positionMs)} / ${formatTrackTime(
+          activeTrack?.durationMs || 0
+        )})`,
+        `• Sistem: Volume ${volume}% ${muted ? '(Muted)' : ''} · Brightness ${brightness}/10 · Wi-Fi ${
+          wifiEnabled ? 'ON' : 'OFF'
+        } · Bluetooth ${bluetoothEnabled ? 'ON' : 'OFF'}`,
+        `• Focus Pomodoro: ${formatPomoTime(pomoRemainingSeconds)} (${
+          pomoRunning ? 'Berjalan' : 'Dijeda'
+        }) · Sesi Selesai: ${pomoSessionsCompleted}`,
+        `• To-Do Tasks (${tasks.length}): ${
+          tasks.slice(0, 3).map((t) => `${t.done ? '[✓]' : '[ ]'} ${t.title}`).join(' | ') ||
+          'Belum ada task'
+        }`,
+        `• Shelf Files (${shelfFiles.length}): ${
+          shelfFiles.map((f) => f.name).join(', ') || 'Kosong'
+        }`,
+        `• Smart Alarms: ${
+          smartAlarms.map((a) => `${a.title} (${a.time})`).join(', ') || 'Tidak ada alarm'
+        }`,
+      ];
+      statusLines.forEach((line, idx) => {
+        ctx.fillText(line.slice(0, 92), 156, 364 + idx * 36);
+      });
+
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+      const base64 = dataUrl.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+      return {
+        dataUrl,
+        base64,
+        mimeType: 'image/jpeg',
+        name: `tangkap-layar-${Date.now()}.jpg`,
+      };
+    } catch {
+      return null;
+    }
+  }, [
+    activeLineIndex,
+    activePage,
+    activeTrack,
+    batteryLevel,
+    bluetoothEnabled,
+    brightness,
+    externalShuffleEnabled,
+    headerDateStr,
+    lyricsMode,
+    moodShuffleEnabled,
+    musicQueue.length,
+    muted,
+    nowDate,
+    parsedLyrics,
+    pomoRemainingSeconds,
+    pomoRunning,
+    pomoSessionsCompleted,
+    positionMs,
+    shelfFiles,
+    smartAlarms,
+    tasks,
+    timeStr,
+    volume,
+    wifiEnabled,
+  ]);
+
+  const handleAskGemini = async (promptText: string) => {
+    const rawQ = promptText.trim().slice(0, 1000);
+    // Detect auto-screenshot intent ("ambil screenshot", "tangkap layar", "lihat layarku sekarang", etc.)
+    const isAutoScreenshotIntent =
+      /\b(ambil\s+screenshot|tangkap\s+layar|lihat\s+layarku|lihat\s+layar\s+saya|cek\s+layarku|cek\s+layar\s+saya|apa\s+yang\s+ada\s+di\s+layarku|analisis\s+layarku|baca\s+layarku|screenshot\s+layar|screenshot\s+sekarang|take\s+a?\s*screenshot|capture\s+screen|look\s+at\s+my\s+screen|what\s+is\s+on\s+my\s+screen)\b/i.test(
+        rawQ
+      );
+
+    if (!rawQ && !pendingImage && !isAutoScreenshotIntent) return;
+
+    // Chaos Guard: Block duplicate rapid-fire Enter spam while a request is already in-flight
+    const now = Date.now();
+    if (assistantLoading || now - lastAskTimeRef.current < 350) {
+      setSpamNotice('Please wait — Isle Assistant is still responding...');
+      window.setTimeout(() => setSpamNotice(null), 1800);
+      return;
+    }
+    lastAskTimeRef.current = now;
+    setSpamNotice(null);
+
+    let imageToSend: PendingImageAttachment | null = pendingImage;
+    setPendingImage(null);
+    setAssistantInput('');
+    setShowAllChatHistory(false);
+    const effectivePrompt =
+      rawQ || 'Tolong analisis dan jelaskan apa yang ada pada gambar ini secara ringkas.';
+    setAgentTranscript(effectivePrompt);
+    setAssistantLoading(true);
+    setBotForm('thinking');
+
+    // If user typed a screenshot command ("ambil screenshot", "lihat layarku sekarang", etc.) and didn't attach an image manually,
+    // automatically capture the screen and attach it directly to the chat!
+    if (!imageToSend && isAutoScreenshotIntent) {
+      setAgentHeadline('Menangkap layar saat ini (Auto-Screenshot)...');
+      imageToSend = await captureCurrentScreenAuto();
+    }
+
+    // Only execute local non-vision shortcut commands if there is no image/screenshot to analyze
+    const localCmd = !imageToSend ? executeIslandCommand(effectivePrompt) : { handled: false };
+    setAgentHeadline(
+      localCmd.reply ||
+        (imageToSend ? 'Menganalisis gambar dengan Vision AI...' : 'Isle Assistant thinking...')
+    );
+
+    const userMsgId = now;
+    const historySnapshot = messages.slice(-8).map((m) => ({
+      role: m.role,
+      text: m.text,
+    }));
+
+    setMessages((prev) => [
+      ...prev.slice(-58),
+      {
+        id: userMsgId,
+        role: 'user',
+        text: effectivePrompt,
+        imageUrl: imageToSend?.dataUrl,
+        timestamp: timeStr,
+      },
+    ]);
+
+    // If local command (e.g. play song, set alarm, volume, brightness) was already handled, return immediately to prevent double execution!
+    if (localCmd.handled) {
+      const botMsgId = now + 1;
+      const replyStr = localCmd.reply || 'Perintah telah dijalankan.';
+      setAnimatingMsgId(botMsgId);
+      setRevealedChars(0);
+      setMessages((prev) => [
+        ...prev,
+        { id: botMsgId, role: 'assistant', text: replyStr, timestamp: timeStr },
+      ]);
+      setBotForm('reply');
+      setAssistantLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    try {
+      const res = await fetch('/api/gemini/assistant', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-gemini-key': geminiApiKey || '',
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          prompt: effectivePrompt,
+          image: imageToSend
+            ? {
+                data: imageToSend.base64,
+                mimeType: imageToSend.mimeType,
+              }
+            : undefined,
+          history: historySnapshot,
+          currentState: {
+            activePage,
+            isPlaying,
+            flacEnabled,
+            moodShuffleEnabled:
+              activeTrack?.sourceType === 'external' ? externalShuffleEnabled : moodShuffleEnabled,
+            queueCount: musicQueue.length,
+            trackTitle: activeTrack ? `${activeTrack.title} - ${activeTrack.artist}` : 'Idle',
+            volume,
+            brightness,
+            bluetoothEnabled,
+            wifiEnabled,
+            muted,
+            batteryLevel,
+            isCharging,
+            pomoRunning,
+            pomoRemaining: formatPomoTime(pomoRemainingSeconds),
+            shelfCount: shelfFiles.length,
+            notificationsCount: unreadNotifCount,
+            pendingTasksCount: tasks.length - completedCount,
+          },
+        }),
+      });
+
+      const data: GeminiAssistantResponse = await res.json();
+
+      if (res.status === 429) {
+        setSpamNotice(data.error || 'Rate limit reached. Slow down a bit!');
+        window.setTimeout(() => setSpamNotice(null), 3000);
+      }
+
+      const replyText = data.reply || data.error || 'Done.';
+      setAgentHeadline(replyText);
+      const sources = Array.isArray(data.searchSources) ? data.searchSources : [];
+      setLatestSearchSources(sources);
+
+      const newReplyId = Date.now() + 2;
+      const initialChars = Math.min(replyText.length, Math.max(8, Math.ceil(replyText.length / 18)));
+      setRevealedChars(initialChars);
+      setAnimatingMsgId(newReplyId);
+
+      setMessages((prev) => {
+        const next = [...prev.slice(-58)];
+        next.push({
+          id: newReplyId,
+          role: 'assistant',
+          text: replyText,
+          imageUrl: imageToSend?.dataUrl,
+          timestamp: timeStr,
+          searchSources: sources.length > 0 ? sources : undefined,
+          commandCard: data.commandCard,
+          foundFiles: data.foundFiles,
+        });
+        return next;
+      });
+
+      setBotForm(res.ok ? 'reply' : 'error');
+
+      // Execute island & laptop actions if returned by Gemini
+      if (data.action === 'play_song' && data.trackData) {
+        const queryTitle = (data.trackData.title || '').toLowerCase();
+        const recentlyPlayed =
+          Date.now() - lastPlayedSongTimeRef.current < 6000 &&
+          (queryTitle.includes(lastPlayedSongQueryRef.current) ||
+            lastPlayedSongQueryRef.current.includes(queryTitle));
+        if (!recentlyPlayed) {
+          if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
+            setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+          }
+          shuffleBufferRef.current = null;
+          loadAndPlayRealTrack({ ...data.trackData, sourceType: 'internal' });
+          navigateToPage(0);
+        }
+      } else if (data.action === 'queue_song') {
+        if (data.trackData) {
+          enqueueResolvedTrack(data.trackData);
+        } else if (data.actionParam) {
+          handleQueueSongMedia(data.actionParam);
+        }
+        navigateToPage(0);
+      } else if (data.action === 'clear_queue') {
+        setMusicQueue([]);
+      } else if (data.action === 'shuffle_on') {
+        if (activeTrackRef.current?.sourceType === 'external') {
+          setExternalShuffleEnabled(true);
+          sendExternalMediaCommand('shuffle', true);
+        } else {
+          setMoodShuffleEnabled(true);
+          if (!activeTrackRef.current) {
+            triggerSmartMoodShuffle(null);
+          }
+        }
+        navigateToPage(0);
+      } else if (data.action === 'shuffle_off') {
+        if (activeTrackRef.current?.sourceType === 'external') {
+          setExternalShuffleEnabled(false);
+          sendExternalMediaCommand('shuffle', false);
+        } else {
+          setMoodShuffleEnabled(false);
+        }
+      } else if (data.action === 'bluetooth_off') {
+        setBluetoothEnabled(false);
+        pushRealNotification('Bluetooth Dimatikan', 'Radio Bluetooth laptop dinonaktifkan.', 'message');
+      } else if (data.action === 'bluetooth_on') {
+        setBluetoothEnabled(true);
+        pushRealNotification('Bluetooth Diaktifkan', 'Radio Bluetooth laptop aktif.', 'message');
+      } else if (data.action === 'wifi_off') {
+        setWifiEnabled(false);
+        pushRealNotification('Wi-Fi Dimatikan', 'Adaptor Wi-Fi dinonaktifkan.', 'message');
+      } else if (data.action === 'wifi_on') {
+        setWifiEnabled(true);
+        pushRealNotification('Wi-Fi Diaktifkan', 'Adaptor Wi-Fi terhubung.', 'message');
+      } else if (data.action === 'set_volume' && data.actionParam) {
+        const v = Math.min(100, Math.max(0, Number(data.actionParam) || 50));
+        setMuted(v === 0);
+        setVolume(v);
+      } else if (data.action === 'set_brightness' && data.actionParam) {
+        const b = Math.min(10, Math.max(0, Number(data.actionParam) || 7));
+        setBrightness(b);
+      } else if (data.action === 'play_music') {
+        if (activeTrack) {
+          audioElRef.current?.play().catch(() => {});
+          setIsPlaying(true);
+        }
+        navigateToPage(0);
+      } else if (data.action === 'pause_music') {
+        audioElRef.current?.pause();
+        setIsPlaying(false);
+      } else if (data.action === 'next_track') {
+        handleNextTrack();
+      } else if (data.action === 'prev_track') {
+        handlePrevTrack();
+      } else if (data.action === 'set_volume_30') {
+        setMuted(false);
+        setVolume(30);
+      } else if (data.action === 'mute_volume') {
+        setMuted(true);
+      } else if (data.action === 'unmute_volume') {
+        setMuted(false);
+      } else if (data.action === 'toggle_lyrics') {
+        navigateToPage(0);
+        setLyricsMode(true);
+        triggerActionConfirmation('Lyrics Mode', activeTrack?.title || 'Sinkronisasi Lirik', 'ON', 'music', 0);
+      } else if (data.action === 'seek_music' && data.actionParam) {
+        const sec = Math.max(0, Number(data.actionParam) || 0);
+        const ms = Math.round(sec * 1000);
+        handleSeek(ms);
+        navigateToPage(0);
+        setLyricsMode(true);
+        triggerActionConfirmation('Loncat Lirik & Musik', activeTrack?.title || 'Media', formatTrackTime(ms), 'music', 0);
+      } else if (data.action === 'set_timer' && data.actionParam) {
+        const mins = Math.max(1, Math.min(180, Number(data.actionParam) || 25));
+        const totalSec = mins * 60;
+        setPomoMode('focus');
+        setPomoTotalSeconds(totalSec);
+        setPomoRemainingSeconds(totalSec);
+        setPomoRunning(true);
+        const badge = formatPomoTime(totalSec);
+        pushRealNotification('Timer Fokus Dimulai', `Durasi diatur ke ${badge}`, 'calendar');
+        triggerActionConfirmation('Timer Fokus Aktif', `${mins} menit hitung mundur`, badge, 'timer', 2);
+      } else if (data.action === 'start_pomodoro') {
+        setPomoRunning(true);
+        triggerActionConfirmation(
+          'Pomodoro Dimulai',
+          'Sesi fokus sedang berjalan',
+          formatPomoTime(pomoRemainingSeconds),
+          'timer',
+          2
+        );
+      } else if (data.action === 'pause_pomodoro') {
+        setPomoRunning(false);
+        triggerActionConfirmation(
+          'Pomodoro Dijeda',
+          'Timer fokus dihentikan sementara',
+          formatPomoTime(pomoRemainingSeconds),
+          'timer',
+          2
+        );
+      } else if (data.action === 'reset_pomodoro') {
+        setPomoRunning(false);
+        setPomoRemainingSeconds(pomoTotalSeconds);
+        triggerActionConfirmation(
+          'Pomodoro Direset',
+          'Waktu dikembalikan ke awal',
+          formatPomoTime(pomoTotalSeconds),
+          'timer',
+          2
+        );
+      } else if (data.action === 'open_tasks') {
+        navigateToPage(3);
+      } else if (data.action === 'open_shelf') {
+        navigateToPage(4);
+      } else if (data.action === 'clear_shelf') {
+        setShelfFiles([]);
+        triggerActionConfirmation('Shelf Dibersihkan', 'Semua file telah dihapus', '0', 'system', 4);
+      } else if (data.action === 'open_calendar' || data.action === 'add_calendar_event') {
+        if (data.actionParam) {
+          handleAddCalendarEvent(data.actionParam);
+          triggerActionConfirmation('Jadwal Kalender', data.actionParam, timeStr, 'alarm', 5);
+        } else {
+          navigateToPage(5);
+        }
+      } else if (data.action === 'open_weather') {
+        const requestedCity = data.actionParam?.trim();
+        if (requestedCity) {
+          fetchWeatherData(requestedCity);
+        } else {
+          fetchWeatherData();
+        }
+        triggerActionConfirmation(
+          'Cuaca & Matahari',
+          requestedCity || weatherData.city,
+          `${weatherData.currentTemp}°`,
+          'weather',
+          6
+        );
+      } else if (data.action === 'toggle_mini_capsule') {
+        const nextMini = !miniCapsuleMode;
+        setActiveAlert(null);
+        setMiniCapsuleMode(nextMini);
+        if (nextMini) {
+          setIsPinnedOpen(false);
+          setIsHovered(false);
+          setAssistantOpen(false);
+          setLyricsMode(false);
+          setSettingsOpen(false);
+          setTopEdgeHover(false);
+        }
+      } else if (data.action === 'open_notifications') {
+        navigateToPage(1);
+      } else if (data.action === 'toggle_dnd') {
+        const nextDnd = !dndEnabled;
+        setDndEnabled(nextDnd);
+        triggerActionConfirmation(
+          'Do Not Disturb',
+          nextDnd ? 'Notifikasi disenyapkan' : 'Notifikasi aktif',
+          nextDnd ? 'ON' : 'OFF',
+          'system'
+        );
+      } else if (data.action === 'add_todo' && data.actionParam) {
+        const parts = data.actionParam.split('|');
+        const rawTitle = (parts[0] || data.actionParam).trim().slice(0, 80);
+        const explicitTime = parts[1]?.trim();
+        let finalTitle = rawTitle;
+        let finalTime = explicitTime || timeStr;
+
+        if (!explicitTime) {
+          const todTimeMatch = rawTitle.match(
+            /^(.*?)\s*(?:di\s+|pada\s+)?(?:jam|pukul|at)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam|am|pm)?\b(.*)$/i
+          );
+          if (todTimeMatch) {
+            let hh = parseInt(todTimeMatch[2], 10);
+            const mm = todTimeMatch[3] ? parseInt(todTimeMatch[3], 10) : 0;
+            const period = (todTimeMatch[4] || '').toLowerCase();
+            if ((period === 'sore' || period === 'malam' || period === 'pm') && hh < 12) hh += 12;
+            if (period === 'siang' && hh >= 1 && hh <= 4) hh += 12;
+            if ((period === 'pagi' || period === 'am') && hh === 12) hh = 0;
+            finalTime = `${String(Math.min(23, Math.max(0, hh))).padStart(2, '0')}:${String(
+              Math.min(59, Math.max(0, mm))
+            ).padStart(2, '0')}`;
+            finalTitle = `${todTimeMatch[1] || ''} ${todTimeMatch[5] || ''}`.replace(/\s+/g, ' ').trim() || rawTitle;
+          }
+        }
+
+        setTasks((prev) => [
+          ...prev.slice(-29),
+          {
+            id: Date.now(),
+            title: finalTitle,
+            time: finalTime,
+            done: false,
+          },
+        ]);
+        pushRealNotification('Task Dijadwalkan', `${finalTitle} · ${finalTime}`, 'calendar');
+        triggerActionConfirmation('Task Dijadwalkan', finalTitle, finalTime, 'task', 3);
+      } else if (data.action === 'set_alarm_and_reminder' && data.actionParam) {
+        executeIslandCommand(data.actionParam);
+      } else if (data.action === 'volume_up') {
+        setMuted(false);
+        setVolume((curr) => {
+          const next = Math.min(100, curr + 15);
+          triggerAlert('volume', { value: next });
+          return next;
+        });
+      } else if (data.action === 'volume_down') {
+        setVolume((curr) => {
+          const next = Math.max(0, curr - 15);
+          triggerAlert('volume', { value: next });
+          return next;
+        });
+      } else if (data.action === 'brightness_up') {
+        setBrightness((curr) => {
+          const next = Math.min(10, curr + 2);
+          triggerAlert('brightness', { value: next });
+          return next;
+        });
+      } else if (data.action === 'brightness_down') {
+        setBrightness((curr) => {
+          const next = Math.max(1, curr - 2);
+          triggerAlert('brightness', { value: next });
+          return next;
+        });
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        setAgentHeadline('Permintaan dibatalkan');
+        return;
+      }
+      console.error(err);
+      const errMsg = err?.message || 'Koneksi ke server terputus.';
+      setAgentHeadline('Gagal terhubung ke AI');
+      setBotForm('error');
+      const errReplyId = Date.now() + 1;
+      setMessages((prev) => [
+        ...prev.slice(-58),
+        {
+          id: errReplyId,
+          role: 'assistant',
+          text: `⚠️ Maaf, AI belum merespons (${errMsg}). Silakan coba tanyakan kembali.`,
+          timestamp: timeStr,
+        },
+      ]);
+    } finally {
+      abortControllerRef.current = null;
+      setAssistantLoading(false);
+      if (assistantMode === 'conversation') {
+        setTimeout(() => assistantInputRef.current?.focus(), 30);
+      }
+    }
+  };
+
+  // Keep latest handleAskGemini in ref so Voice Recognition never uses a stale closure
+  handleAskGeminiRef.current = handleAskGemini;
+
+  // Real-time two-way voice conversation via Gemini 3.8 Live API WebSocket + Web Speech API
+  const startBrowserVoiceRecognition = useCallback(
+    (forceStart = false) => {
+      if (voiceListening && !forceStart) {
+        stopVoiceRecognition();
+        setAgentHeadline('Sesi suara dihentikan');
+        return;
+      }
+
+      stopVoiceRecognition();
+      setVoiceStatusHint(null);
+      setVoiceListening(true);
+      setBotForm('listening');
+      setAgentTranscript('');
+      setAgentHeadline('Menghubungkan Isle Assistant...');
+      liveInputAccRef.current = '';
+      liveOutputAccRef.current = '';
+
+      // 1. Connect to Server-Side Gemini 3.8 Live API WebSocket (/api/gemini/live)
+      const wsBase = getWsBaseUrl();
+      const wsUrl = `${wsBase}/api/gemini/live?lang=${encodeURIComponent(voiceLang)}${
+        geminiApiKey ? `&key=${encodeURIComponent(geminiApiKey)}` : ''
+      }`;
+
+      let wsConnected = false;
+      try {
+        const ws = new WebSocket(wsUrl);
+        liveWsRef.current = ws;
+
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtx) {
+          outputAudioCtxRef.current = new AudioCtx({ sampleRate: 24000 });
+          nextStartTimeRef.current = 0;
+        }
+
+        ws.onopen = () => {
+          wsConnected = true;
+          setLiveConnected(true);
+          setAgentHeadline('Isle Assistant aktif — silakan bicara sekarang');
+        };
+
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'connected') {
+              setLiveConnected(true);
+              setAgentHeadline('Isle Assistant terhubung · Silakan bicara');
+            } else if (msg.type === 'inputTranscription' && msg.text) {
+              liveInputAccRef.current = (liveInputAccRef.current + ' ' + msg.text).trim();
+              setAgentTranscript(liveInputAccRef.current);
+              setAssistantInput(liveInputAccRef.current);
+            } else if (msg.type === 'outputTranscription' && msg.text) {
+              liveOutputAccRef.current = (liveOutputAccRef.current + msg.text).trim();
+              setAgentHeadline(liveOutputAccRef.current);
+              setBotForm('reply');
+            } else if (msg.type === 'modelText' && msg.text) {
+              liveOutputAccRef.current = (liveOutputAccRef.current + msg.text).trim();
+              setAgentHeadline(liveOutputAccRef.current);
+            } else if (msg.type === 'audio' && msg.audio && outputAudioCtxRef.current) {
+              // Play 24kHz PCM audio chunk gaplessly
+              const outCtx = outputAudioCtxRef.current;
+              if (outCtx.state === 'suspended') {
+                outCtx.resume().catch(() => {});
+              }
+              const float32 = pcm16Base64ToFloat32(msg.audio);
+              if (float32.length > 0) {
+                // Compute output voice energy for BotCanvas animation
+                let sum = 0;
+                for (let i = 0; i < float32.length; i += 8) {
+                  sum += Math.abs(float32[i]);
+                }
+                const avg = sum / (float32.length / 8);
+                voiceEnergyRef.current = Math.min(1, Math.max(0.25, avg * 4.5));
+
+                const audioBuffer = outCtx.createBuffer(1, float32.length, 24000);
+                audioBuffer.getChannelData(0).set(float32);
+                const sourceNode = outCtx.createBufferSource();
+                sourceNode.buffer = audioBuffer;
+                sourceNode.connect(outCtx.destination);
+
+                const startTime = Math.max(outCtx.currentTime, nextStartTimeRef.current);
+                sourceNode.start(startTime);
+                nextStartTimeRef.current = startTime + audioBuffer.duration;
+                activeAudioNodesRef.current.push(sourceNode);
+                sourceNode.onended = () => {
+                  activeAudioNodesRef.current = activeAudioNodesRef.current.filter(
+                    (n) => n !== sourceNode
+                  );
+                };
+              }
+            } else if (msg.type === 'interrupted') {
+              for (const node of activeAudioNodesRef.current) {
+                try {
+                  node.stop();
+                } catch {
+                  // ignore
+                }
+              }
+              activeAudioNodesRef.current = [];
+              nextStartTimeRef.current = 0;
+            } else if (msg.type === 'turnComplete') {
+              const userSpoken = liveInputAccRef.current.trim();
+              const modelSpoken = liveOutputAccRef.current.trim();
+              if (userSpoken) {
+                executeIslandCommand(userSpoken);
+              }
+              if (userSpoken || modelSpoken) {
+                const stamp = `${String(new Date().getHours()).padStart(2, '0')}:${String(
+                  new Date().getMinutes()
+                ).padStart(2, '0')}`;
+                setMessages((prev) => {
+                  const next = [...prev.slice(-56)];
+                  if (userSpoken) {
+                    next.push({
+                      id: Date.now() + 1,
+                      role: 'user',
+                      text: userSpoken,
+                      timestamp: stamp,
+                    });
+                  }
+                  if (modelSpoken) {
+                    next.push({
+                      id: Date.now() + 2,
+                      role: 'assistant',
+                      text: modelSpoken,
+                      timestamp: stamp,
+                    });
+                  }
+                  return next;
+                });
+                liveInputAccRef.current = '';
+                liveOutputAccRef.current = '';
+              }
+            } else if (msg.type === 'error' && msg.error) {
+              setVoiceStatusHint(msg.error);
+            }
+          } catch {
+            // ignore parse errors
+          }
+        };
+
+        ws.onerror = () => {
+          setLiveConnected(false);
+        };
+
+        ws.onclose = () => {
+          setLiveConnected(false);
+        };
+      } catch {
+        // Fallback to SpeechRecognition if WS fails
+      }
+
+      // 2. Capture 16kHz Microphone Audio Stream & Stream PCM chunks to Gemini 3.8 Live WS
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices
+          .getUserMedia({
+            audio: {
+              sampleRate: 16000,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          })
+          .then((stream) => {
+            micStreamRef.current = stream;
+            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+            if (!AudioCtx) return;
+            const inCtx = new AudioCtx({ sampleRate: 16000 });
+            inputAudioCtxRef.current = inCtx;
+            const source = inCtx.createMediaStreamSource(stream);
+            const processor = inCtx.createScriptProcessor(2048, 1, 1);
+            scriptProcessorRef.current = processor;
+
+            processor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              // Update real-time microphone RMS energy for BotCanvas
+              let sum = 0;
+              for (let i = 0; i < inputData.length; i += 4) {
+                sum += inputData[i] * inputData[i];
+              }
+              const rms = Math.sqrt(sum / (inputData.length / 4));
+              voiceEnergyRef.current = Math.min(1, Math.max(0.12, rms * 6.5));
+
+              if (liveWsRef.current && liveWsRef.current.readyState === WebSocket.OPEN) {
+                const base64Pcm = float32ToPcm16Base64(inputData);
+                liveWsRef.current.send(JSON.stringify({ audio: base64Pcm }));
+              }
+            };
+
+            source.connect(processor);
+            processor.connect(inCtx.destination);
+          })
+          .catch(() => {
+            setVoiceStatusHint('Mikrofon belum diizinkan di browser — izinkan akses mikrofon atau ketik langsung.');
+          });
+      }
+
+      // 3. Parallel Browser SpeechRecognition for live local transcript & Search-Grounded action fallback
+      const SpeechRec =
+        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+      if (SpeechRec) {
+        try {
+          const rec = new SpeechRec();
+          speechRecRef.current = rec;
+          rec.lang = voiceLang;
+          rec.interimResults = true;
+          rec.continuous = true;
+          rec.maxAlternatives = 1;
+
+          let latestCombinedTranscript = '';
+          let submitted = false;
+
+          const submitFallbackIfLiveSilent = (textToSubmit: string) => {
+            if (submitted) return;
+            const cleaned = textToSubmit.trim();
+            if (!cleaned) return;
+            // If Gemini 3.8 Live already responded with audio/transcription, execute local command only
+            if (wsConnected && liveOutputAccRef.current.trim().length > 0) {
+              executeIslandCommand(cleaned);
+              return;
+            }
+            submitted = true;
+            stopVoiceRecognition();
+            handleAskGeminiRef.current(cleaned);
+          };
+
+          rec.onresult = (event: any) => {
+            let finalPart = '';
+            let interimPart = '';
+            for (let i = 0; i < event.results.length; i++) {
+              const res = event.results[i];
+              const t = res?.[0]?.transcript || '';
+              if (res.isFinal) {
+                finalPart += t + ' ';
+              } else {
+                interimPart += t;
+              }
+            }
+            const combined = (finalPart + interimPart).trim();
+            if (combined) {
+              latestCombinedTranscript = combined;
+              setAgentTranscript(combined);
+              setAssistantInput(combined);
+
+              if (voiceSilenceTimerRef.current) {
+                window.clearTimeout(voiceSilenceTimerRef.current);
+              }
+              voiceSilenceTimerRef.current = window.setTimeout(() => {
+                submitFallbackIfLiveSilent(latestCombinedTranscript);
+              }, 1250);
+            }
+          };
+
+          rec.onerror = (errEvent: any) => {
+            const errCode = errEvent?.error || '';
+            if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+              setVoiceStatusHint('Izin mikrofon diblokir browser — izinkan akses mikrofon di pengaturan situs.');
+            }
+          };
+
+          rec.start();
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [stopVoiceRecognition, voiceLang, voiceListening]
+  );
+
+  // Clean up voice recognition on unmount
+  useEffect(() => {
+    return () => stopVoiceRecognition();
+  }, [stopVoiceRecognition]);
+
+  // ── Global Keyboard Shortcuts (Alt+Q / Alt+I for AI Assistant Toggle + Full Collapse + Auto-Focus Game Capture) ──
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      const inInput = tag === 'INPUT' || tag === 'TEXTAREA';
+
+      // Alt + H: Toggle Mini Capsule Auto-Hide Mode Instantly (No alert/notification popup)
+      if ((e.altKey || e.metaKey) && e.key.toLowerCase() === 'h') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.repeat) return;
+        if (alertTimerRef.current) {
+          window.clearTimeout(alertTimerRef.current);
+          alertTimerRef.current = null;
+        }
+        setActiveAlert(null);
+        setMiniCapsuleMode((prev) => {
+          const next = !prev;
+          if (next) {
+            setIsPinnedOpen(false);
+            setIsHovered(false);
+            setDragAutoOpened(false);
+            setAssistantOpen(false);
+            setLyricsMode(false);
+            setSettingsOpen(false);
+            setTopEdgeHover(false);
+          }
+          return next;
+        });
+        return;
+      }
+
+      // Alt + Q (or Alt + I): Open AI Assistant OR Collapse entire Dynamic Island back to compact notch
+      if ((e.altKey || e.metaKey) && (e.key.toLowerCase() === 'q' || e.key.toLowerCase() === 'i')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.repeat) return; // Chaos Guard: Holding Alt+Q won't flicker the Assistant
+        setActiveAlert(null);
+        setSettingsOpen(false);
+
+        if (assistantOpen) {
+          // Pressing Alt+Q while AI is already open collapses the ENTIRE Dynamic Island back to compact notch!
+          closeAssistantAndCollapse();
+        } else {
+          setShowAllChatHistory(false);
+          setAssistantOpen(true);
+          setAssistantMode(defaultAltQMode);
+          setIsPinnedOpen(true);
+          if (defaultAltQMode === 'conversation') {
+            stopVoiceRecognition();
+            setTimeout(() => assistantInputRef.current?.focus(), 40);
+          } else {
+            setTimeout(() => startBrowserVoiceRecognition(true), 30);
+          }
+        }
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        if (assistantLoading) {
+          cancelInFlightGemini();
+          return;
+        }
+        if (activeAlert) {
+          setActiveAlert(null);
+        } else if (assistantOpen) {
+          closeAssistantAndCollapse();
+        } else {
+          setIsPinnedOpen(false);
+          setIsHovered(false);
+          setDragAutoOpened(false);
+          setLyricsMode(false);
+          setSettingsOpen(false);
+        }
+        return;
+      }
+
+      // AUTO-FOCUS GAME GUARD: When Assistant is open, any printable keystroke automatically
+      // focuses the AI input box so the user never types into a background game!
+      if (
+        assistantOpen &&
+        !inInput &&
+        e.key.length === 1 &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        stopVoiceRecognition();
+        if (assistantMode !== 'conversation') {
+          setAssistantMode('conversation');
+        }
+        setBotForm('typing');
+        setAssistantInput((prev) => (prev + e.key).slice(0, 1000));
+        setTimeout(() => assistantInputRef.current?.focus(), 10);
+        return;
+      }
+
+      if (e.key === 'CapsLock') {
+        if (e.repeat) return;
+        const nextCaps = !capsLockOn;
+        setCapsLockOn(nextCaps);
+        triggerAlert('capslock', { capsOn: nextCaps });
+        return;
+      }
+
+      if (e.key === 'AudioVolumeMute' || (!inInput && !assistantOpen && e.key.toLowerCase() === 'm')) {
+        if (e.repeat) return;
+        e.preventDefault();
+        const nextMuted = !muted;
+        setMuted(nextMuted);
+        triggerAlert('mute', { value: nextMuted ? 0 : volume, muted: nextMuted });
+        return;
+      }
+
+      // Windows Native Volume Step: +2 per click/press, max 100
+      if (e.key === 'AudioVolumeUp' || (!inInput && !assistantOpen && e.key === ']')) {
+        e.preventDefault();
+        setMuted(false);
+        setVolume((v) => {
+          const next = Math.min(100, v + 2);
+          if (v === 100) setNudgeCount((c) => c + 1);
+          triggerAlert('volume', { value: next, muted: false });
+          return next;
+        });
+        return;
+      }
+
+      // Windows Native Volume Step: -2 per click/press, min 0
+      if (e.key === 'AudioVolumeDown' || (!inInput && !assistantOpen && e.key === '[')) {
+        e.preventDefault();
+        setVolume((v) => {
+          const next = Math.max(0, v - 2);
+          if (v === 0) setNudgeCount((c) => c + 1);
+          setMuted(next === 0);
+          triggerAlert('volume', { value: next, muted: next === 0 });
+          return next;
+        });
+        return;
+      }
+
+      // Laptop Brightness Up: +1 per press, max 10 (Supports BrightnessUp key, F2/F7, Alt+ArrowUp, or B)
+      if (
+        e.key === 'BrightnessUp' ||
+        e.code === 'BrightnessUp' ||
+        (e as any).keyCode === 253 ||
+        (!inInput &&
+          !assistantOpen &&
+          (e.key === 'F2' ||
+            e.key === 'F7' ||
+            e.key.toLowerCase() === 'b' ||
+            (e.altKey && e.key === 'ArrowUp')))
+      ) {
+        e.preventDefault();
+        setBrightness((b) => {
+          const next = Math.min(10, b + 1);
+          if (b === 10) setNudgeCount((c) => c + 1);
+          triggerAlert('brightness', { value: next });
+          return next;
+        });
+        return;
+      }
+
+      // Laptop Brightness Down: -1 per press, min 0 (Supports BrightnessDown key, F1/F6, Alt+ArrowDown, or V)
+      if (
+        e.key === 'BrightnessDown' ||
+        e.code === 'BrightnessDown' ||
+        (e as any).keyCode === 252 ||
+        (!inInput &&
+          !assistantOpen &&
+          (e.key === 'F1' ||
+            e.key === 'F6' ||
+            e.key.toLowerCase() === 'v' ||
+            (e.altKey && e.key === 'ArrowDown')))
+      ) {
+        e.preventDefault();
+        setBrightness((b) => {
+          const next = Math.max(0, b - 1);
+          if (b === 0) setNudgeCount((c) => c + 1);
+          triggerAlert('brightness', { value: next });
+          return next;
+        });
+        return;
+      }
+    };
+
+    const onGlobalMouseDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest('#dynamic-island-surface')) return;
+      if (lyricsMode) return;
+      if (isExpanded && !assistantOpen) {
+        setIsPinnedOpen(false);
+        setIsHovered(false);
+        setDragAutoOpened(false);
+        setIsDragOver(false);
+        setSettingsOpen(false);
+      }
+    };
+
+    const unsubscribeElectronShortcut = window.electronAPI?.onToggleAssistant?.(() => {
+      setActiveAlert(null);
+      setSettingsOpen(false);
+      if (assistantOpen) {
+        closeAssistantAndCollapse();
+        setDesktopClickThrough(true);
+      } else {
+        setDesktopClickThrough(false);
+        setShowAllChatHistory(false);
+        setAssistantOpen(true);
+        setAssistantMode(defaultAltQMode);
+        setIsPinnedOpen(true);
+        if (defaultAltQMode === 'conversation') {
+          stopVoiceRecognition();
+          setTimeout(() => assistantInputRef.current?.focus(), 40);
+        } else {
+          setTimeout(() => startBrowserVoiceRecognition(true), 30);
+        }
+      }
+    });
+
+    const unsubscribeMiniCapsuleShortcut = window.electronAPI?.onToggleMiniCapsule?.(() => {
+      if (alertTimerRef.current) {
+        window.clearTimeout(alertTimerRef.current);
+        alertTimerRef.current = null;
+      }
+      setActiveAlert(null);
+      setMiniCapsuleMode((prev) => {
+        const next = !prev;
+        if (next) {
+          setIsPinnedOpen(false);
+          setIsHovered(false);
+          setDragAutoOpened(false);
+          setAssistantOpen(false);
+          setLyricsMode(false);
+          setSettingsOpen(false);
+          setTopEdgeHover(false);
+          setDesktopClickThrough(true);
+        }
+        return next;
+      });
+    });
+
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('mousedown', onGlobalMouseDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('mousedown', onGlobalMouseDown);
+      unsubscribeElectronShortcut?.();
+      unsubscribeMiniCapsuleShortcut?.();
+    };
+  }, [
+    activeAlert,
+    assistantLoading,
+    assistantMode,
+    assistantOpen,
+    cancelInFlightGemini,
+    capsLockOn,
+    closeAssistantAndCollapse,
+    defaultAltQMode,
+    isExpanded,
+    lyricsMode,
+    muted,
+    setDesktopClickThrough,
+    startBrowserVoiceRecognition,
+    stopVoiceRecognition,
+    triggerActionConfirmation,
+    triggerAlert,
+    volume,
+  ]);
+
+  // ── Carousel Navigation Handlers (Trigger Dual-Layer Simultaneous Slide) ──
+  const goPrevPage = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setLyricsMode(false);
+    navigateToPage(pageIndex - 1, 'left');
+  };
+
+  const goNextPage = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setLyricsMode(false);
+    navigateToPage(pageIndex + 1, 'right');
+  };
+
+  const selectTabPage = (idx: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (idx === pageIndex) return;
+    setLyricsMode(false);
+    navigateToPage(idx, idx > pageIndex ? 'right' : 'left');
+  };
+
+  // ── Tightened Island Target Dimensions ──
+  const { targetW, targetH, targetR, targetS, tintStyle, tintRgb } = useMemo(() => {
+    if (activeAlert) {
+      if (
+        activeAlert.type === 'volume' ||
+        activeAlert.type === 'mute' ||
+        activeAlert.type === 'brightness'
+      ) {
+        return {
+          targetW: 310,
+          targetH: 36,
+          targetR: 15,
+          targetS: 10,
+          tintStyle: 'none' as const,
+          tintRgb: [0.2, 0.5, 0.95] as [number, number, number],
+        };
+      }
+      if (activeAlert.type === 'capslock') {
+        return {
+          targetW: 246,
+          targetH: 36,
+          targetR: 15,
+          targetS: 10,
+          tintStyle: 'none' as const,
+          tintRgb: [0.2, 0.5, 0.95] as [number, number, number],
+        };
+      }
+      if (activeAlert.type === 'charging' || activeAlert.type === 'lowbattery') {
+        return {
+          targetW: 320,
+          targetH: 54,
+          targetR: 22,
+          targetS: 12,
+          tintStyle: 'none' as const,
+          tintRgb: [0.19, 0.82, 0.35] as [number, number, number],
+        };
+      }
+      if (activeAlert.type === 'permission') {
+        return {
+          targetW: 396,
+          targetH: 104,
+          targetR: 26,
+          targetS: 15,
+          tintStyle: 'glow' as const,
+          tintRgb: [0.85, 0.55, 0.18] as [number, number, number],
+        };
+      }
+      if (activeAlert.type === 'alarm') {
+        return {
+          targetW: 420,
+          targetH: 64,
+          targetR: 24,
+          targetS: 14,
+          tintStyle: 'glow' as const,
+          tintRgb: [1, 0.6, 0.1] as [number, number, number],
+        };
+      }
+      if (activeAlert.type === 'action_confirm') {
+        return {
+          targetW: 416,
+          targetH: 56,
+          targetR: 22,
+          targetS: 13,
+          tintStyle: 'glow' as const,
+          tintRgb: [0.95, 0.72, 0.22] as [number, number, number],
+        };
+      }
+      return {
+        targetW: 384,
+        targetH: 56,
+        targetR: 22,
+        targetS: 13,
+        tintStyle: 'none' as const,
+        tintRgb: [0.2, 0.5, 0.95] as [number, number, number],
+      };
+    }
+
+    if (!isExpanded) {
+      // Mini Capsule Auto-Hide Mode (Alt + H): shrinks to an unobtrusive 2px top lip until cursor touches the top edge
+      if (miniCapsuleMode && !topEdgeHover) {
+        return {
+          targetW: 112,
+          targetH: 2,
+          targetR: 1,
+          targetS: 2,
+          tintStyle: 'none' as const,
+          tintRgb: [0.2, 0.5, 0.95] as [number, number, number],
+        };
+      }
+      return {
+        targetW: 156,
+        targetH: 32,
+        targetR: 14,
+        targetS: 9,
+        tintStyle: 'none' as const,
+        tintRgb: [0.2, 0.5, 0.95] as [number, number, number],
+      };
+    }
+
+    if (assistantOpen) {
+      if (assistantMode === 'voice-pill') {
+        return {
+          targetW: 410,
+          targetH: 100,
+          targetR: 24,
+          targetS: 14,
+          tintStyle: 'aura' as const,
+          tintRgb: [0.56, 0.4, 1] as [number, number, number],
+        };
+      }
+      // Sleek Compact AI Width (388px) + Auto-Fitting Height for Full AI Answer + Vision Preview
+      let dynamicAiHeight = pendingImage ? 148 : 112;
+      if (showAllChatHistory) {
+        dynamicAiHeight = 236;
+      } else if (assistantLoading) {
+        dynamicAiHeight = pendingImage ? 146 : 114;
+      } else if (latestAssistantMessage) {
+        const estLines = Math.max(1, Math.ceil(latestAssistantMessage.text.length / 42));
+        const hasSources = Boolean(
+          latestAssistantMessage.searchSources && latestAssistantMessage.searchSources.length > 0
+        );
+        const hasCmdOrFiles = Boolean(
+          latestAssistantMessage.commandCard ||
+            (latestAssistantMessage.foundFiles && latestAssistantMessage.foundFiles.length > 0)
+        );
+        const hasImg = Boolean(latestAssistantMessage.imageUrl || pendingImage);
+        dynamicAiHeight = Math.min(
+          260,
+          Math.max(
+            132,
+            86 +
+              estLines * 17 +
+              (hasSources ? 16 : 0) +
+              (hasCmdOrFiles ? 34 : 0) +
+              (hasImg ? 36 : 0)
+          )
+        );
+      }
+      return {
+        targetW: 388,
+        targetH: dynamicAiHeight,
+        targetR: 24,
+        targetS: 14,
+        tintStyle: 'aura' as const,
+        tintRgb: [0.56, 0.4, 1] as [number, number, number],
+      };
+    }
+
+    // Unified 440x178 base across standard menus so < and > nav buttons never shift under the cursor,
+    // while Lyrics Mode expands ONLY horizontally (width 440 -> 520) keeping height fixed at 178px
+    if (activePage === 'music' && lyricsMode && !settingsOpen) {
+      return {
+        targetW: 520,
+        targetH: 178,
+        targetR: 34,
+        targetS: 16,
+        tintStyle: activeTrack ? ('wash' as const) : ('none' as const),
+        tintRgb: currentTrack.tintRgb,
+      };
+    }
+
+    if (activePage === 'weather' && !settingsOpen) {
+      return {
+        targetW: 440,
+        targetH: 192,
+        targetR: 34,
+        targetS: 16,
+        tintStyle: 'none' as const,
+        tintRgb: [0.95, 0.78, 0.22] as [number, number, number],
+      };
+    }
+
+    return {
+      targetW: 440,
+      targetH: 178,
+      targetR: 34,
+      targetS: 16,
+      tintStyle: activeTrack ? ('wash' as const) : ('none' as const),
+      tintRgb: currentTrack.tintRgb,
+    };
+  }, [
+    activeAlert,
+    isExpanded,
+    miniCapsuleMode,
+    topEdgeHover,
+    assistantOpen,
+    assistantMode,
+    settingsOpen,
+    activePage,
+    lyricsMode,
+    activeTrack,
+    currentTrack.tintRgb,
+    showAllChatHistory,
+    assistantLoading,
+    latestAssistantMessage,
+    pendingImage,
+  ]);
+
+  // ── Live Battery Ring Indicator (Reflects Real Battery % and Charging State — Matches HTML .battery-icon) ──
+  const renderBatteryRing = (size = 15, stroke = 2.2) => {
+    const r = (size - stroke) / 2;
+    const c = 2 * Math.PI * r;
+    const pct = Math.max(0.05, Math.min(1, batteryLevel / 100));
+    const ringColor =
+      batteryLevel < 15 && !isCharging
+        ? '#ff453a'
+        : batteryLevel <= 25 && !isCharging
+        ? '#ff9f0a'
+        : '#1ed760';
+    const trackColor =
+      batteryLevel < 15 && !isCharging
+        ? 'rgba(255, 69, 58, 0.25)'
+        : batteryLevel <= 25 && !isCharging
+        ? 'rgba(255, 159, 10, 0.25)'
+        : 'rgba(30, 215, 96, 0.26)';
+    const boltSize = size >= 20 ? 10 : Math.max(7, size - 7);
+
+    return (
+      <div
+        title={`Battery: ${batteryLevel}% · ${isCharging ? 'Charging' : 'On Battery'}`}
+        className="relative inline-flex items-center justify-center shrink-0"
+      >
+        <svg width={size} height={size} className="-rotate-90">
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            fill="none"
+            stroke={trackColor}
+            strokeWidth={stroke}
+          />
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            fill="none"
+            stroke={ringColor}
+            strokeWidth={stroke}
+            strokeDasharray={c}
+            strokeDashoffset={c * (1 - pct)}
+            strokeLinecap="round"
+            className="transition-all duration-300"
+          />
+        </svg>
+        {isCharging && (
+          <span className="absolute inset-0 flex items-center justify-center">
+            <svg width={boltSize} height={boltSize} viewBox="0 0 24 24" fill="#ffffff">
+              <path d="M13 2L4 14h7l-2 8 9-12h-7l2-8z" />
+            </svg>
+          </span>
+        )}
+      </div>
+    );
+  };
+
+  // ── Reusable Page Renderer (Enables Simultaneous Outgoing + Incoming Carousel Slide Animation) ──
+  const renderPageContent = (pageId: IslandPage) => {
+    switch (pageId) {
+      case 'music': {
+        const isExternalSource = Boolean(activeTrack && activeTrack.sourceType === 'external');
+        const activeShuffleState = isExternalSource ? externalShuffleEnabled : moodShuffleEnabled;
+        const displayHeadline = activeTrack
+          ? lyricsMode
+            ? activeTrack.title
+            : activeTrack.artist &&
+              !activeTrack.title.toLowerCase().includes(activeTrack.artist.toLowerCase())
+            ? `${activeTrack.title} - ${activeTrack.artist}`
+            : activeTrack.title
+          : mediaLoading
+          ? 'Memuat lagu...'
+          : 'Tidak ada media';
+        const displaySub = mediaLoading
+          ? 'Menyiapkan Official Studio Audio & Synced Lyrics...'
+          : activeTrack
+          ? lyricsMode
+            ? activeTrack.artist
+              ? `${activeTrack.artist} - ${activeTrack.title}`
+              : activeTrack.title
+            : isExternalSource && activeTrack.externalApp
+            ? `${activeTrack.artist || activeTrack.title} · ${activeTrack.externalApp}`
+            : activeTrack.artist || activeTrack.title
+          : '';
+        const displayLyricsLines = activeTrack ? parsedLyrics : [];
+        const controlsActive = Boolean(activeTrack);
+
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`relative w-full h-full flex flex-col justify-between select-none transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              lyricsMode ? 'px-[26px] py-[16px]' : 'px-[42px] pt-[12px] pb-[10px]'
+            }`}
+          >
+            {/* Header Waktu & Baterai (.top-bar — Smoothly fades & collapses when entering Lyrics Mode) */}
+            <div
+              className={`flex items-center justify-center gap-[7px] text-[13px] pl-[30px] whitespace-nowrap transition-all duration-400 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                lyricsMode
+                  ? 'max-h-0 opacity-0 -translate-y-2 scale-95 blur-[3px] mb-0 pointer-events-none overflow-hidden'
+                  : 'max-h-[24px] opacity-100 translate-y-0 scale-100 blur-0 mb-[2px]'
+              }`}
+            >
+              {renderBatteryRing(20, 2.5)}
+              <span className="text-[#d1d1d6] font-medium">
+                {headerDateStr} {nowDate.getFullYear()}
+              </span>
+              <span className="text-white font-bold tabular-nums">{timeStr}</span>
+            </div>
+
+            {/* Optional Top-Right Waveform / Queue / FLAC when playing (Fades out smoothly in Lyrics Mode) */}
+            {(activeTrack || flacEnabled || musicQueue.length > 0) && (
+              <div
+                className={`absolute top-[13px] right-[26px] flex items-center gap-1.5 z-10 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  lyricsMode
+                    ? 'opacity-0 scale-90 blur-[2px] pointer-events-none'
+                    : 'opacity-100 scale-100 blur-0'
+                }`}
+              >
+                {musicQueue.length > 0 && (
+                  <button
+                    onClick={handleNextTrack}
+                    title={`Antrian Lagu (${musicQueue.length}):\n${musicQueue
+                      .map((t, i) => `${i + 1}. ${t.title}${t.artist ? ` - ${t.artist}` : ''}`)
+                      .join('\n')}\n(Klik untuk langsung putar lagu berikutnya)`}
+                    className="px-1.5 py-0.5 rounded bg-white/15 hover:bg-white/25 border border-white/20 text-white text-[8.5px] font-bold tracking-tight cursor-pointer transition tabular-nums"
+                  >
+                    +{musicQueue.length} Antrian
+                  </button>
+                )}
+                {(flacEnabled || activeTrack?.isFlac) && (
+                  <span
+                    onClick={() => setSettingsOpen(true)}
+                    title="FLAC Lossless Audio Active (Click to configure in Settings)"
+                    className="px-1.5 py-0.5 rounded bg-amber-400/20 border border-amber-400/40 text-[#ffd60a] text-[8px] font-bold tracking-wider cursor-pointer hover:bg-amber-400/30 transition"
+                  >
+                    FLAC
+                  </span>
+                )}
+                {activeTrack && (
+                  <button
+                    onClick={handleTogglePlay}
+                    title={isPlaying ? 'Pause music' : 'Play music'}
+                    className="text-white/95 hover:text-white transition"
+                  >
+                    <BeatEqualizerBars
+                      size={14}
+                      playing={isPlaying && !muted && volume > 0}
+                      activeTrackTitle={activeTrack?.title}
+                      activeTrackArtist={activeTrack?.artist}
+                      hasAudioUrl={Boolean(activeTrack?.audioUrl)}
+                      audioEl={audioElRef.current}
+                      positionMsRef={positionMsRef}
+                      parsedLyricsCount={parsedLyrics.length}
+                      activeLineIndex={activeLineIndex}
+                    />
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Unified Main Row: Left Music Controls Column + Elastic Right Lyrics Panel */}
+            <div className="flex items-center w-full flex-1 min-h-0">
+              {/* Left Column: Morphs smoothly from 100% width in normal mode to 222px in Lyrics Mode */}
+              <div
+                className={`flex flex-col justify-between transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  lyricsMode ? 'w-[222px] shrink-0 h-full py-1' : 'w-full'
+                }`}
+              >
+                {/* Album Art & Teks (.media-info) */}
+                <div
+                  className={`flex items-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    lyricsMode ? 'gap-[14px] mt-0 mb-[10px]' : 'gap-[18px] -mt-[10px] mb-[12px]'
+                  }`}
+                >
+                  {activeTrack?.coverUrl ? (
+                    <img
+                      src={activeTrack.coverUrl}
+                      alt={activeTrack.title}
+                      className={`object-cover shrink-0 shadow-md transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                        lyricsMode
+                          ? 'w-[56px] h-[56px] rounded-[13px]'
+                          : 'w-[66px] h-[66px] rounded-[14px]'
+                      }`}
+                    />
+                  ) : (
+                    <div
+                      className={`bg-[#1c1c1e] flex items-center justify-center shrink-0 transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                        lyricsMode
+                          ? 'w-[56px] h-[56px] rounded-[13px]'
+                          : 'w-[66px] h-[66px] rounded-[14px]'
+                      }`}
+                    >
+                      <svg
+                        width={lyricsMode ? 26 : 32}
+                        height={lyricsMode ? 26 : 32}
+                        viewBox="0 0 24 24"
+                        fill="#555558"
+                        className="transition-all duration-500"
+                      >
+                        <path d="M20 3L9 5v10.55c-.59-.34-1.27-.55-2-.55-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V9.82l8-1.6v5.33c-.59-.34-1.27-.55-2-.55-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V3z" />
+                      </svg>
+                    </div>
+                  )}
+
+                  {activeTrack ? (
+                    <div
+                      className={`min-w-0 flex-1 transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                        lyricsMode ? 'mt-0' : 'mt-[8px]'
+                      }`}
+                    >
+                      <div
+                        className={`font-bold text-white tracking-[-0.2px] truncate leading-snug transition-all duration-500 ${
+                          lyricsMode ? 'text-[15px]' : 'text-[16px]'
+                        }`}
+                      >
+                        {displayHeadline}
+                      </div>
+                      <div
+                        className={`text-[#8e8e93] font-medium truncate leading-tight mt-0.5 transition-all duration-500 ${
+                          lyricsMode ? 'text-[12px] text-white/60' : 'text-[12px]'
+                        }`}
+                      >
+                        {displaySub}
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      title="Tekan Alt + Q untuk meminta AI memutar musik"
+                      className={`font-bold text-white tracking-[-0.2px] truncate transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                        lyricsMode ? 'text-[15px] mt-0' : 'text-[16px] mt-[8px]'
+                      }`}
+                    >
+                      {displayHeadline}
+                    </div>
+                  )}
+                </div>
+
+                {/* Progress Bar (.progress-row — Smoothly morphs width with Left Column) */}
+                <div
+                  className={`flex items-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    lyricsMode ? 'gap-[10px] mb-[8px]' : 'gap-[12px] mb-[10px]'
+                  }`}
+                >
+                  <span
+                    className={`font-medium tracking-[-0.3px] tabular-nums shrink-0 transition-all duration-300 ${
+                      lyricsMode ? 'text-[13px]' : 'text-[14px]'
+                    } ${controlsActive ? 'text-white' : 'text-[#555558]'}`}
+                  >
+                    {formatTrackTime(activeTrack ? positionMs : 0)}
+                  </span>
+                  <div
+                    onClick={(e) => {
+                      if (!activeTrack || !activeTrack.durationMs) return;
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                      const nextMs = Math.floor(ratio * activeTrack.durationMs);
+                      handleSeek(nextMs);
+                    }}
+                    className={`flex-1 h-[5px] rounded-[3px] relative cursor-pointer flex items-center overflow-hidden transition-colors duration-300 ${
+                      controlsActive ? 'bg-white/25' : 'bg-[#242426]'
+                    }`}
+                  >
+                    {activeTrack && activeTrack.durationMs > 0 && (
+                      <div
+                        className="h-full bg-white rounded-[3px] transition-[width] duration-75 ease-linear"
+                        style={{
+                          width: `${Math.min(100, (positionMs / activeTrack.durationMs) * 100)}%`,
+                        }}
+                      />
+                    )}
+                  </div>
+                  <span
+                    className={`font-medium tracking-[-0.3px] tabular-nums shrink-0 transition-all duration-300 ${
+                      lyricsMode ? 'text-[13px]' : 'text-[14px]'
+                    } ${controlsActive ? 'text-white' : 'text-[#555558]'}`}
+                  >
+                    {activeTrack
+                      ? formatTrackTime(Math.max(0, activeTrack.durationMs - positionMs), true)
+                      : '-00:00'}
+                  </span>
+                </div>
+
+                {/* Tombol Kontrol (.controls-row — Glides smoothly with Left Column) */}
+                <div
+                  className={`relative flex items-center justify-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    lyricsMode ? 'h-[28px] mb-0' : 'h-[26px] mb-[8px]'
+                  }`}
+                >
+                  <button
+                    onClick={() => {
+                      setIsPinnedOpen(true);
+                      setLyricsMode((prev) => !prev);
+                    }}
+                    className={`absolute flex items-center justify-center cursor-pointer transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:opacity-90 active:scale-90 ${
+                      lyricsMode ? 'left-[4px] text-white' : 'left-[24px]'
+                    }`}
+                    title={lyricsMode ? 'Close Lyrics View' : 'Lyrics'}
+                    aria-label="Lyrics"
+                  >
+                    {lyricsMode ? (
+                      <LyricsQuoteBubbleSvg size={19} active />
+                    ) : (
+                      <svg
+                        width={20}
+                        height={20}
+                        viewBox="0 0 24 24"
+                        fill={activeTrack ? '#ffffff' : '#555558'}
+                        className="transition-colors duration-300"
+                      >
+                        <path d="M20 2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h3v4l4-4h9c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14h-9.83L8 18.17V16H4V4h16v12z" />
+                        <path d="M9.5 8.5h2v2.5L10.3 13H8.8l1.1-2H9.5V8.5zm4 0h2v2.5L14.3 13h-1.5l1.1-2h-.4V8.5z" />
+                      </svg>
+                    )}
+                  </button>
+
+                  <div
+                    className={`flex items-center transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                      lyricsMode ? 'gap-[22px] px-[24px]' : 'gap-[28px] pl-0'
+                    }`}
+                  >
+                    <button
+                      onClick={handlePrevTrack}
+                      className="flex items-center justify-center cursor-pointer transition hover:opacity-85 active:scale-90"
+                      title="Previous / Rewind"
+                      aria-label="Rewind"
+                    >
+                      <svg
+                        width={lyricsMode ? 21 : 22}
+                        height={lyricsMode ? 21 : 22}
+                        viewBox="0 0 24 24"
+                        fill={controlsActive ? '#ffffff' : '#555558'}
+                        className="transition-all duration-300"
+                      >
+                        <path d="M11.5 12l8.5 6V6l-8.5 6zm-9 0l8.5 6V6l-8.5 6z" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={handleTogglePlay}
+                      className="flex items-center justify-center cursor-pointer transition hover:opacity-85 active:scale-95"
+                      title={isPlaying ? 'Pause' : 'Play'}
+                      aria-label="Play"
+                    >
+                      {isPlaying ? (
+                        <svg
+                          width={20}
+                          height={20}
+                          viewBox="0 0 24 24"
+                          fill={controlsActive ? '#ffffff' : '#555558'}
+                          className="transition-all duration-300"
+                        >
+                          <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+                        </svg>
+                      ) : (
+                        <svg
+                          width={20}
+                          height={20}
+                          viewBox="0 0 24 24"
+                          fill={controlsActive ? '#ffffff' : '#555558'}
+                          className="transition-all duration-300"
+                        >
+                          <path d="M6 4l15 8-15 8V4z" />
+                        </svg>
+                      )}
+                    </button>
+                    <button
+                      onClick={handleNextTrack}
+                      className="flex items-center justify-center cursor-pointer transition hover:opacity-85 active:scale-90"
+                      title={
+                        isExternalSource
+                          ? `Next Track (${activeTrack?.externalApp || 'External Player'})`
+                          : musicQueue.length > 0
+                          ? `Next in Queue: ${musicQueue[0].title} - ${musicQueue[0].artist}`
+                          : moodShuffleEnabled
+                          ? 'Next (Mood Shuffle Auto-Pick)'
+                          : 'Next / Skip Track'
+                      }
+                      aria-label="Fast Forward"
+                    >
+                      <svg
+                        width={lyricsMode ? 21 : 22}
+                        height={lyricsMode ? 21 : 22}
+                        viewBox="0 0 24 24"
+                        fill={controlsActive || musicQueue.length > 0 ? '#ffffff' : '#555558'}
+                        className="transition-all duration-300"
+                      >
+                        <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+                      </svg>
+                    </button>
+                  </div>
+
+                  {/* Source-Aware Shuffle Toggle Button (Controls External App Shuffle OR Internal AI Mood Shuffle) */}
+                  <button
+                    onClick={handleToggleShuffle}
+                    className={`absolute flex items-center justify-center cursor-pointer transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:opacity-95 active:scale-90 ${
+                      lyricsMode ? 'right-[4px]' : 'right-[24px]'
+                    }`}
+                    title={
+                      isExternalSource
+                        ? `${activeTrack?.externalApp || 'External'} Shuffle: ${
+                            activeShuffleState ? 'ON' : 'OFF'
+                          } (Klik untuk toggle shuffle di ${
+                            activeTrack?.externalApp || 'aplikasi eksternal'
+                          })`
+                        : activeShuffleState
+                        ? 'AI Mood Shuffle: ON (Otomatis putar lagu sesuai mood saat lagu habis · Klik untuk matikan)'
+                        : 'AI Mood Shuffle: OFF (Klik untuk aktifkan auto-shuffle sesuai mood lagu)'
+                    }
+                    aria-label="Toggle Shuffle"
+                  >
+                    <svg
+                      width={lyricsMode ? 17 : 18}
+                      height={lyricsMode ? 17 : 18}
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke={activeShuffleState ? '#ffffff' : '#555558'}
+                      strokeWidth={2.2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="transition-colors duration-300"
+                    >
+                      <polyline points="16 3 21 3 21 8" />
+                      <line x1="4" y1="20" x2="21" y2="3" />
+                      <polyline points="21 16 21 21 16 21" />
+                      <line x1="15" y1="15" x2="21" y2="21" />
+                      <line x1="4" y1="4" x2="9" y2="9" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+
+              {/* Right Column: Divider + Synced Lyrics Panel (Smoothly slides, scales & unblurs on toggle) */}
+              <div
+                className={`flex items-center h-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  lyricsMode
+                    ? 'flex-1 opacity-100 translate-x-0 scale-100 blur-0 ml-[18px] pointer-events-auto'
+                    : 'w-0 opacity-0 translate-x-7 scale-95 blur-[6px] ml-0 pointer-events-none overflow-hidden'
+                }`}
+              >
+                <div className="w-[1px] h-[86%] bg-white/15 shrink-0 mr-[18px]" />
+
+                <div
+                  ref={lyricsContainerRef}
+                  style={{
+                    WebkitMaskImage:
+                      'linear-gradient(to bottom, transparent 0%, black 16%, black 84%, transparent 100%)',
+                    maskImage:
+                      'linear-gradient(to bottom, transparent 0%, black 16%, black 84%, transparent 100%)',
+                  }}
+                  className="flex-1 h-[146px] overflow-y-auto no-scrollbar scroll-smooth space-y-3 pr-1 py-8 flex flex-col justify-start min-w-[215px]"
+                >
+                  {mediaLoading ? (
+                    <div className="text-white/55 text-[13px] font-medium my-auto text-center animate-pulse">
+                      Memuat lirik...
+                    </div>
+                  ) : !activeTrack ? (
+                    <div className="my-auto flex flex-col items-center justify-center text-center px-2 select-none">
+                      <span className="text-white/45 text-[13px] font-semibold tracking-tight">
+                        Belum ada musik diputar
+                      </span>
+                      <span className="text-white/25 text-[11px] font-medium mt-1">
+                        Tekan Alt + Q untuk memutar lagu
+                      </span>
+                    </div>
+                  ) : displayLyricsLines.length === 0 ? (
+                    <div className="text-white/40 text-[12.5px] font-medium my-auto text-center px-2">
+                      Lirik belum tersedia
+                    </div>
+                  ) : (
+                    displayLyricsLines.map((line, idx) => {
+                      const effectiveActiveIdx =
+                        activeLineIndex >= 0 ? activeLineIndex : 0;
+                      const isCurrent = idx === effectiveActiveIdx;
+                      const distance = Math.abs(idx - effectiveActiveIdx);
+
+                      return (
+                        <div
+                          key={idx}
+                          ref={isCurrent ? activeLyricLineRef : null}
+                          onClick={() => handleSeek(line.timeMs)}
+                          className={`cursor-pointer transition-all duration-300 ease-out origin-left select-none leading-snug ${
+                            isCurrent
+                              ? 'text-[15px] font-bold text-white opacity-100 scale-[1.02] translate-x-0.5 py-0.5'
+                              : distance === 1
+                              ? 'text-white/45 text-[13.5px] font-semibold hover:text-white/75'
+                              : 'text-white/25 text-[12.5px] font-medium hover:text-white/50'
+                          }`}
+                          title="Klik untuk melompat ke baris lirik ini"
+                        >
+                          {isCurrent && line.words && line.words.length > 0 ? (
+                            <span className="inline-flex flex-wrap gap-x-1">
+                              {line.words.map((w, wIdx) => {
+                                const isWordSung = positionMs >= w.startMs;
+                                return (
+                                  <span
+                                    key={wIdx}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleSeek(w.startMs);
+                                    }}
+                                    className={`transition-all duration-150 cursor-pointer ${
+                                      isWordSung
+                                        ? 'text-white translate-y-[-0.5px]'
+                                        : 'text-white/40'
+                                    }`}
+                                  >
+                                    {w.word}
+                                  </span>
+                                );
+                              })}
+                            </span>
+                          ) : (
+                            <span>{line.text}</span>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Indikator Slide (.pagination — Smoothly fades & collapses in Lyrics Mode) */}
+            <div
+              className={`flex items-center justify-center gap-[5px] w-full transition-all duration-400 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                lyricsMode
+                  ? 'max-h-0 opacity-0 translate-y-2 pointer-events-none overflow-hidden'
+                  : 'max-h-[10px] opacity-100 translate-y-0'
+              }`}
+            >
+              {ISLAND_PAGES.map((p, idx) => {
+                const isActive = idx === pageIndex;
+                return (
+                  <button
+                    key={p.id}
+                    onClick={(e) => selectTabPage(idx, e)}
+                    className={`h-[4px] transition-all duration-300 ${
+                      isActive
+                        ? 'w-[17px] bg-white rounded-[3px]'
+                        : 'w-[4px] bg-[#555558] rounded-full hover:bg-white/60'
+                    }`}
+                    title={p.label}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        );
+      }
+
+      case 'notifications':
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full h-full flex flex-col justify-between px-9 py-1 overflow-hidden"
+          >
+            {/* Compact Top Action & Reminder Creator Row (Fits cleanly without clipping) */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const text = newNotifInput.trim();
+                if (!text) return;
+                const parts = text.split(' - ');
+                const title = parts[0]?.trim() || text;
+                const sub = parts.slice(1).join(' - ').trim() || `Pengingat pukul ${timeStr}`;
+                pushRealNotification(title, sub, 'message');
+                setNewNotifInput('');
+              }}
+              className="flex items-center gap-1.5 shrink-0"
+            >
+              <input
+                type="text"
+                value={newNotifInput}
+                onChange={(e) => setNewNotifInput(e.target.value)}
+                placeholder="Tambah pengingat cepat (misal: Scrim - 20:00)..."
+                className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 focus:border-white/25 rounded-full px-3 py-1 text-[10.5px] text-white placeholder-white/35 focus:outline-none"
+              />
+              <button
+                type="submit"
+                className="px-2.5 py-1 rounded-full bg-white text-black hover:bg-white/90 text-[10px] font-bold shrink-0 transition"
+              >
+                + Notify
+              </button>
+              <button
+                type="button"
+                onClick={() => setDndEnabled((d) => !d)}
+                title={dndEnabled ? 'Disable Do Not Disturb' : 'Enable Do Not Disturb'}
+                className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition ${
+                  dndEnabled
+                    ? 'bg-[#5e5ce6] text-white'
+                    : 'bg-white/[0.08] hover:bg-white/15 text-white/75'
+                }`}
+              >
+                {dndEnabled ? <MoonFilledSvg size={11} /> : <BellOutlineSvg size={11} />}
+              </button>
+              {notifications.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setNotifications([])}
+                  className="px-2 py-1 rounded-full bg-white/10 hover:bg-white/20 text-white/80 text-[10px] font-medium shrink-0 transition"
+                >
+                  Clear
+                </button>
+              )}
+            </form>
+
+            {notifications.length === 0 ? (
+              <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-white/40 text-[11px]">
+                <BellOutlineSvg size={13} />
+                <span className="truncate">
+                  {dndEnabled ? 'Do Not Disturb aktif · ' : ''}Belum ada notifikasi baru
+                </span>
+              </div>
+            ) : (
+              <div className="flex-1 min-h-0 flex flex-col justify-start space-y-1 overflow-y-auto no-scrollbar pt-1.5">
+                {notifications.map((n) => (
+                  <div
+                    key={n.id}
+                    className="group flex items-center justify-between gap-2 px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition shrink-0"
+                  >
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <div className="w-4 h-4 rounded bg-white/10 text-white/85 flex items-center justify-center shrink-0">
+                        {n.iconType === 'calendar' && <CalendarGridSvg size={10} />}
+                        {n.iconType === 'download' && <ShelfTraySvg size={10} />}
+                        {n.iconType === 'message' && <MessageBubbleSvg size={10} />}
+                      </div>
+                      <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
+                        <span className="text-[11px] font-bold text-white shrink-0">
+                          {n.title}
+                        </span>
+                        <span className="text-[10.5px] text-white/60 truncate flex-1">
+                          {n.subtitle}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="shrink-0 flex items-center gap-1.5">
+                      <span className="text-[10px] text-white/40 tabular-nums">
+                        {n.timeAgo}
+                      </span>
+                      <button
+                        onClick={() =>
+                          setNotifications((prev) => prev.filter((item) => item.id !== n.id))
+                        }
+                        className="p-0.5 text-white/45 hover:text-white transition"
+                        title="Dismiss notification"
+                      >
+                        <CloseCrossSvg size={9} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+
+      case 'pomodoro': {
+        const isFocus = pomoMode === 'focus';
+
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full h-full flex flex-col justify-center items-center gap-3 px-6 py-2"
+          >
+            {/* Center Section: Centered Left Glowing Red Badge, Big Timer & Reset, Subtitle */}
+            <div className="flex items-center justify-center gap-6 px-1 w-full">
+              {/* Left Glowing Red Circular Stopwatch Badge */}
+              <div
+                onClick={() => setPomoRunning((r) => !r)}
+                title={pomoRunning ? 'Pause' : 'Start'}
+                className="relative w-14 h-14 rounded-full border-[3px] border-[#ff453a] shadow-[0_0_22px_rgba(255,69,58,0.7)] bg-[#1d0e12] flex items-center justify-center shrink-0 cursor-pointer active:scale-95 transition"
+              >
+                <TimerStopwatchSvg size={28} className="text-white drop-shadow-sm" />
+              </div>
+
+              {/* Big Digital Countdown + Reset Reload Button + Subtitle */}
+              <div className="flex flex-col items-start justify-center">
+                <div className="flex items-center gap-2.5">
+                  <span className="text-[36px] font-bold text-white tabular-nums tracking-tight leading-none">
+                    {formatPomoTime(pomoRemainingSeconds)}
+                  </span>
+                  <button
+                    onClick={() => {
+                      setPomoRunning(false);
+                      setPomoRemainingSeconds(pomoTotalSeconds);
+                    }}
+                    title="Reset Timer"
+                    className="text-white/65 hover:text-white transition active:rotate-180 duration-300"
+                  >
+                    <RotateResetSvg size={17} />
+                  </button>
+                </div>
+                <div className="flex items-center gap-2 mt-1">
+                  <span className="text-[12px] text-white/50 font-normal">
+                    {isFocus ? 'Focus time' : 'Break time'}
+                  </span>
+                  {pomoSessionsCompleted > 0 && (
+                    <span className="text-[10.5px] px-2 py-0.5 rounded-full bg-white/10 text-white/70">
+                      Sesi: {pomoSessionsCompleted}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Bottom Row: [ Short Break ], [ ▶ ] Red Pill, [ Focus Time ] */}
+            <div className="flex items-center justify-center gap-3 pt-1">
+              <button
+                onClick={() => {
+                  setPomoRunning(false);
+                  setPomoMode('break');
+                  setPomoTotalSeconds(5 * 60);
+                  setPomoRemainingSeconds(5 * 60);
+                }}
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-[11.5px] font-medium border transition ${
+                  pomoMode === 'break'
+                    ? 'bg-white/20 border-white/40 text-white shadow-sm'
+                    : 'bg-white/[0.08] hover:bg-white/14 border-white/[0.06] text-white/80 hover:text-white'
+                }`}
+              >
+                <CoffeeCupSvg size={13} className="text-white/85" />
+                <span>Short Break</span>
+              </button>
+
+              <button
+                onClick={() => setPomoRunning((r) => !r)}
+                className="w-14 h-8 rounded-full bg-[#ff4d4f] hover:bg-[#ff383b] text-white flex items-center justify-center shadow-lg shadow-rose-500/35 transition active:scale-95 shrink-0"
+                title={pomoRunning ? 'Pause' : 'Start'}
+              >
+                {pomoRunning ? <PauseFilledSvg size={16} /> : <PlayFilledSvg size={16} />}
+              </button>
+
+              <button
+                onClick={() => {
+                  setPomoRunning(false);
+                  setPomoMode('focus');
+                  setPomoTotalSeconds(25 * 60);
+                  setPomoRemainingSeconds(25 * 60);
+                }}
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-[11.5px] font-medium border transition ${
+                  pomoMode === 'focus'
+                    ? 'bg-white/20 border-white/40 text-white shadow-sm'
+                    : 'bg-white/[0.08] hover:bg-white/14 border-white/[0.06] text-white/80 hover:text-white'
+                }`}
+              >
+                <TargetFocusSvg size={13} className="text-white/85" />
+                <span>Focus Time</span>
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      case 'todolist':
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full h-full flex items-center justify-between px-10 py-1 gap-5"
+          >
+            <div className="flex flex-col justify-between h-full py-1">
+              <div>
+                <div className="text-[28px] font-bold tracking-tight text-white leading-none tabular-nums">
+                  {completedCount}/{tasks.length}
+                </div>
+                <div className="text-[11px] text-white/45 font-medium mt-1">
+                  Tasks Completed
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => {
+                    if (!addingTask) {
+                      const next30 = new Date(Date.now() + 30 * 60 * 1000);
+                      setNewTaskTime(
+                        `${String(next30.getHours()).padStart(2, '0')}:${String(
+                          next30.getMinutes()
+                        ).padStart(2, '0')}`
+                      );
+                    }
+                    setAddingTask((a) => !a);
+                  }}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/12 hover:bg-white/20 text-white text-[11px] font-medium transition"
+                >
+                  <PlusSvg size={11} />
+                  Add Task
+                </button>
+                {tasks.some((t) => t.done) && (
+                  <button
+                    onClick={() => setTasks((prev) => prev.filter((t) => !t.done))}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/10 hover:bg-white/18 text-white/80 text-[11px] font-medium transition"
+                  >
+                    Clear Done
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="w-[260px] h-[104px] rounded-2xl bg-[#121216] border border-white/[0.07] p-2.5 overflow-y-auto no-scrollbar flex flex-col justify-between">
+              <div className="space-y-1.5">
+                {tasks.length === 0 && !addingTask ? (
+                  <div className="text-[11px] text-white/40 py-2 text-center">
+                    Belum ada task · Klik + Add Task untuk atur pengingat
+                  </div>
+                ) : (
+                  tasks.map((task) => (
+                    <div
+                      key={task.id}
+                      onClick={() =>
+                        setTasks((prev) =>
+                          prev.map((t) => (t.id === task.id ? { ...t, done: !t.done } : t))
+                        )
+                      }
+                      className="flex items-center justify-between gap-2 cursor-pointer group"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                        <div
+                          className={`mt-0.5 w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 transition ${
+                            task.done
+                              ? 'bg-white border-white text-black'
+                              : 'border-white/40 group-hover:border-white/75'
+                          }`}
+                        >
+                          {task.done && <CheckTickSvg size={9} />}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div
+                            className={`text-[12px] font-semibold leading-tight truncate ${
+                              task.done ? 'line-through text-white/35' : 'text-white'
+                            }`}
+                          >
+                            {task.title}
+                          </div>
+                          {editingTaskTimeId === task.id ? (
+                            <div
+                              onClick={(ev) => ev.stopPropagation()}
+                              className="mt-0.5 flex items-center gap-1"
+                            >
+                              <input
+                                type="time"
+                                autoFocus
+                                value={task.time || '09:00'}
+                                onChange={(ev) => {
+                                  const nextTime = ev.target.value;
+                                  setTasks((prev) =>
+                                    prev.map((t) =>
+                                      t.id === task.id ? { ...t, time: nextTime } : t
+                                    )
+                                  );
+                                }}
+                                onBlur={() => setEditingTaskTimeId(null)}
+                                onKeyDown={(ev) => {
+                                  if (ev.key === 'Enter' || ev.key === 'Escape') {
+                                    setEditingTaskTimeId(null);
+                                  }
+                                }}
+                                style={{ colorScheme: 'dark' }}
+                                className="bg-white/12 border border-white/20 rounded px-1 py-0.2 text-[10px] text-white tabular-nums focus:outline-none"
+                              />
+                            </div>
+                          ) : (
+                            <div
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setEditingTaskTimeId(task.id);
+                              }}
+                              title="Klik untuk ubah jam pengingat task ini"
+                              className="text-[10px] text-white/45 hover:text-white/80 font-medium mt-0.5 tabular-nums inline-flex items-center gap-1 transition"
+                            >
+                              <span>{task.time || 'Atur jam'}</span>
+                              {!task.done && task.time && (
+                                <span className="text-[8.5px] text-white/30">· Pengingat aktif</span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          setTasks((prev) => prev.filter((t) => t.id !== task.id));
+                        }}
+                        className="opacity-0 group-hover:opacity-100 p-0.5 text-white/40 hover:text-white transition"
+                        title="Delete task"
+                      >
+                        <CloseCrossSvg size={10} />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {addingTask && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const raw = newTaskInput.trim().slice(0, 80);
+                    if (!raw) return;
+                    // Support inline time typing (e.g. "Meeting klien 19:30") OR the explicit time picker value
+                    const inlineTimeMatch = raw.match(/^(.*?)\s+(?:jam|pukul|at)?\s*(\d{1,2}[:.]\d{2})$/i);
+                    let finalTitle = raw;
+                    let finalTime = newTaskTime.trim();
+                    if (inlineTimeMatch && inlineTimeMatch[1].trim()) {
+                      finalTitle = inlineTimeMatch[1].trim();
+                      const parts = inlineTimeMatch[2].replace('.', ':').split(':');
+                      finalTime = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+                    }
+                    setTasks((prev) => [
+                      ...prev.slice(-29),
+                      {
+                        id: Date.now(),
+                        title: finalTitle,
+                        time: finalTime,
+                        done: false,
+                      },
+                    ]);
+                    if (finalTime) {
+                      pushRealNotification(
+                        `Task Dijadwalkan: ${finalTitle}`,
+                        `Dynamic Island akan mengingatkan pukul ${finalTime}`,
+                        'calendar'
+                      );
+                    }
+                    setNewTaskInput('');
+                    setAddingTask(false);
+                  }}
+                  className="mt-1 flex items-center gap-1"
+                >
+                  <input
+                    type="text"
+                    autoFocus
+                    value={newTaskInput}
+                    onChange={(e) => setNewTaskInput(e.target.value)}
+                    placeholder="Nama task..."
+                    className="flex-1 min-w-0 bg-white/10 rounded px-2 py-0.5 text-[11px] text-white placeholder-white/35 focus:outline-none"
+                  />
+                  <input
+                    type="time"
+                    value={newTaskTime}
+                    onChange={(e) => setNewTaskTime(e.target.value)}
+                    title="Atur jam pengingat di Dynamic Island"
+                    style={{ colorScheme: 'dark' }}
+                    className="w-[68px] shrink-0 bg-white/10 border border-white/15 rounded px-1 py-0.5 text-[10px] text-white tabular-nums focus:outline-none focus:border-white/40"
+                  />
+                  <button
+                    type="submit"
+                    className="px-2 py-0.5 rounded bg-white text-black text-[10px] font-semibold shrink-0"
+                  >
+                    Add
+                  </button>
+                </form>
+              )}
+            </div>
+          </div>
+        );
+
+      case 'shelf':
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsDragOver(true);
+            }}
+            onDragLeave={(e) => {
+              e.stopPropagation();
+              const rect = e.currentTarget.getBoundingClientRect();
+              if (
+                e.clientX <= rect.left ||
+                e.clientX >= rect.right ||
+                e.clientY <= rect.top ||
+                e.clientY >= rect.bottom
+              ) {
+                setIsDragOver(false);
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsDragOver(false);
+
+              const sampleJson = e.dataTransfer?.getData('application/x-isle-file');
+              if (sampleJson) {
+                try {
+                  const parsed = JSON.parse(sampleJson);
+                  if (parsed && typeof parsed.name === 'string') {
+                    addFilesToShelf([
+                      {
+                        name: parsed.name,
+                        size: parsed.size || '1.0 MB',
+                        ext: parsed.ext || detectFileExt(parsed.name),
+                      },
+                    ]);
+                    return;
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+
+              const dropped = Array.from(e.dataTransfer?.files || []);
+              if (dropped.length > 0) {
+                addFilesToShelf(
+                  dropped.map((f) => ({
+                    name: f.name,
+                    size: formatBytes(f.size),
+                    ext: detectFileExt(f.name),
+                  }))
+                );
+              }
+            }}
+            className="relative w-full h-full flex items-center justify-center px-10 py-1.5"
+          >
+            {/* Optional Toast if Shelf is full */}
+            {shelfToast && (
+              <div className="absolute top-0.5 right-12 z-30 px-2.5 py-0.5 rounded-full bg-white/15 text-[10px] font-semibold text-white">
+                {shelfToast}
+              </div>
+            )}
+
+            {/* Base Shelf Area: Empty Prompt OR Staged Document File Cards (Matches 00:04 & 00:10-00:13) */}
+            {shelfFiles.length === 0 && !isDragOver ? (
+              <div
+                onClick={() => {
+                  addFilesToShelf([SAMPLE_DRAGGABLE_FILES[0]]);
+                }}
+                className="w-full h-[108px] rounded-2xl border border-dashed border-white/25 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex flex-col items-center justify-center cursor-pointer"
+              >
+                <div className="text-white/85 mb-1.5">
+                  <ShelfTraySvg size={22} />
+                </div>
+                <div className="text-[12.5px] font-semibold text-white">Drop files here</div>
+                <div className="text-[10.5px] text-white/40 mt-0.5">
+                  Drag out anytime · click to open
+                </div>
+              </div>
+            ) : (
+              <div className="w-full h-[108px] flex items-center justify-start gap-4 px-2 overflow-x-auto no-scrollbar">
+                {shelfFiles.map((file) => (
+                  <div
+                    key={file.id}
+                    draggable
+                    onDragStart={(ev) => {
+                      ev.dataTransfer.setData('text/plain', file.name);
+                      ev.dataTransfer.effectAllowed = 'copyMove';
+                    }}
+                    style={{
+                      animation: 'shelfFilePopIn 280ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
+                    }}
+                    className="relative group flex flex-col items-center w-[72px] shrink-0 cursor-grab active:cursor-grabbing py-1 rounded-xl hover:bg-white/[0.06] transition"
+                    title={`${file.name} (${file.size}) — Drag out or click × to remove`}
+                  >
+                    <div className="relative flex items-center justify-center drop-shadow-md group-hover:scale-105 transition-transform">
+                      <FileDocumentBadgeSvg ext={file.ext} size={42} />
+                    </div>
+                    <span className="text-[11px] font-semibold text-white/90 truncate w-full text-center mt-1.5 leading-tight">
+                      {truncateMiddleFileName(file.name, 11)}
+                    </span>
+                    <span className="text-[9.5px] font-medium text-white/45 tabular-nums leading-tight mt-0.5">
+                      {file.size}
+                    </span>
+                    <button
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setShelfFiles((prev) => prev.filter((f) => f.id !== file.id));
+                      }}
+                      className="opacity-0 group-hover:opacity-100 absolute top-0.5 right-1 w-4 h-4 rounded-full bg-black/90 border border-white/25 flex items-center justify-center text-white/80 hover:text-white transition"
+                      title="Remove from Shelf"
+                    >
+                      <CloseCrossSvg size={9} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Active Drag-Over Overlay ("Release to add") — Dims existing files behind dashed box (Matches 00:08 & 00:12) */}
+            {isDragOver && (
+              <div className="absolute inset-x-10 inset-y-1.5 z-20 rounded-2xl border-[1.5px] border-dashed border-white/65 bg-black/75 backdrop-blur-[2px] flex flex-col items-center justify-center pointer-events-none animate-[ isleFadeIn_140ms_ease-out ]">
+                <div
+                  className="text-white mb-1.5"
+                  style={{ animation: 'shelfTrayBounce 0.9s ease-in-out infinite' }}
+                >
+                  <ShelfTraySvg size={23} />
+                </div>
+                <div className="text-[13px] font-semibold text-white tracking-tight">
+                  Release to add
+                </div>
+              </div>
+            )}
+          </div>
+        );
+
+      case 'calendar':
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full h-full flex items-stretch justify-between px-9 py-0.5 gap-4 overflow-hidden"
+          >
+            {/* Compact Left Calendar Grid (Fits 6 weeks cleanly inside 170px uniform island height with zero clipping) */}
+            <div className="w-[162px] shrink-0 flex flex-col justify-between py-0.5">
+              <div className="flex items-center justify-between leading-none">
+                <div
+                  onClick={() => {
+                    setCalYear(nowDate.getFullYear());
+                    setCalMonth(nowDate.getMonth());
+                    setSelectedDay(nowDate.getDate());
+                  }}
+                  title="Jump to Today"
+                  className="text-[10px] font-bold tracking-wider cursor-pointer"
+                >
+                  <span className="text-[#ff453a]">{MONTH_NAMES[calMonth]}</span>{' '}
+                  <span className="text-white/50 font-semibold">{calYear}</span>
+                </div>
+                <div className="flex items-center gap-1 text-white/60">
+                  <button
+                    onClick={() => {
+                      if (calMonth === 0) {
+                        setCalMonth(11);
+                        setCalYear((y) => y - 1);
+                      } else {
+                        setCalMonth((m) => m - 1);
+                      }
+                    }}
+                    className="hover:text-white transition p-0.5"
+                  >
+                    <ChevronLeftSvg size={10} />
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (calMonth === 11) {
+                        setCalMonth(0);
+                        setCalYear((y) => y + 1);
+                      } else {
+                        setCalMonth((m) => m + 1);
+                      }
+                    }}
+                    className="hover:text-white transition p-0.5"
+                  >
+                    <ChevronRightSvg size={10} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-7 text-center text-[8.5px] font-semibold text-white/40 leading-none my-0.5">
+                <span>S</span>
+                <span>M</span>
+                <span>T</span>
+                <span>W</span>
+                <span>T</span>
+                <span>F</span>
+                <span>S</span>
+              </div>
+
+              <div className="grid grid-cols-7 gap-y-[1px] text-center tabular-nums">
+                {calendarCells.map((day, idx) => {
+                  if (!day) return <div key={idx} className="h-[14.5px]" />;
+                  const isToday =
+                    calYear === nowDate.getFullYear() &&
+                    calMonth === nowDate.getMonth() &&
+                    day === nowDate.getDate();
+                  const isSelected = day === selectedDay;
+                  const hasEvents =
+                    (eventsByDate[`${calYear}-${calMonth}-${day}`]?.length || 0) > 0;
+                  const isWeekend = idx % 7 === 0 || idx % 7 === 6;
+
+                  return (
+                    <button
+                      key={idx}
+                      onClick={() => setSelectedDay(day)}
+                      className={`relative h-[14.5px] w-[14.5px] mx-auto rounded-full flex flex-col items-center justify-center text-[9px] font-semibold transition ${
+                        isToday
+                          ? 'bg-[#ff453a] text-white font-bold'
+                          : isSelected
+                          ? 'bg-white/20 text-white'
+                          : isWeekend
+                          ? 'text-white/40 hover:text-white'
+                          : 'text-white/85 hover:bg-white/10'
+                      }`}
+                    >
+                      <span className="leading-none">{day}</span>
+                      {hasEvents && (
+                        <span
+                          className={`w-1 h-1 rounded-full absolute bottom-0 ${
+                            isToday ? 'bg-white' : 'bg-[#ff9f0a]'
+                          }`}
+                        />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Right Column: Events, Smart Alarms & World Clocks */}
+            <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5 overflow-hidden">
+              <div className="flex items-center justify-between gap-1.5 shrink-0 whitespace-nowrap leading-none">
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => setCalendarSubTab('events')}
+                    className={`text-[11px] font-bold tracking-tight transition whitespace-nowrap ${
+                      calendarSubTab === 'events'
+                        ? 'text-white'
+                        : 'text-white/40 hover:text-white/70'
+                    }`}
+                  >
+                    Events ({selectedDayEvents.length})
+                  </button>
+                  <span className="text-white/20 select-none text-[10px]">|</span>
+                  <button
+                    onClick={() => setCalendarSubTab('alarms')}
+                    className={`flex items-center gap-1 text-[11px] font-bold tracking-tight transition whitespace-nowrap ${
+                      calendarSubTab === 'alarms'
+                        ? 'text-[#ff9f0a]'
+                        : 'text-white/40 hover:text-white/70'
+                    }`}
+                  >
+                    <AlarmBellSvg size={10} />
+                    <span>Alarms ({smartAlarms.length})</span>
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => setShowWorldClocks((w) => !w)}
+                  title={showWorldClocks ? 'Sembunyikan Jam Dunia' : 'Tampilkan Jam Dunia'}
+                  className={`p-0.5 rounded transition shrink-0 ${
+                    showWorldClocks
+                      ? 'bg-white/15 text-white'
+                      : 'text-white/45 hover:text-white/80'
+                  }`}
+                >
+                  <GlobeTimezoneSvg size={12} />
+                </button>
+              </div>
+
+              {calendarSubTab === 'events' ? (
+                <>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handleAddCalendarEvent(newEventInput);
+                    }}
+                    className="flex items-center gap-1.5 bg-[#1c1c21] border border-white/[0.06] rounded-full px-2.5 py-0.5 my-1 shrink-0"
+                  >
+                    <span className="text-white/45">
+                      <PlusSvg size={10} />
+                    </span>
+                    <input
+                      type="text"
+                      value={newEventInput}
+                      onChange={(e) => setNewEventInput(e.target.value)}
+                      placeholder="Add event · e.g. Dinner 20:00"
+                      className="flex-1 min-w-0 bg-transparent text-[10.5px] text-white placeholder-white/35 focus:outline-none"
+                    />
+                  </form>
+
+                  <div className="flex-1 min-h-0 space-y-1 overflow-y-auto no-scrollbar">
+                    {selectedDayEvents.length === 0 ? (
+                      <div className="text-[10.5px] text-white/35 py-0.5 truncate">
+                        No events scheduled for this day
+                      </div>
+                    ) : (
+                      selectedDayEvents.map((ev) => (
+                        <div
+                          key={ev.id}
+                          className="group flex items-center justify-between bg-[#2b1e0e] hover:bg-[#352512] rounded-lg px-2 py-0.5 transition"
+                        >
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span className="w-[2.5px] h-3 rounded-full bg-[#ff9f0a] shrink-0" />
+                            <span className="text-[10.5px] font-bold text-white truncate">
+                              {ev.title}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] text-white/65 tabular-nums">{ev.time}</span>
+                            <button
+                              onClick={() =>
+                                setEventsByDate((prev) => ({
+                                  ...prev,
+                                  [currentDateKey]: (prev[currentDateKey] || []).filter(
+                                    (item) => item.id !== ev.id
+                                  ),
+                                }))
+                              }
+                              className="hidden group-hover:inline-flex text-white/45 hover:text-white"
+                            >
+                              <CloseCrossSvg size={9} />
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handleAddSmartAlarm(newAlarmTime, newAlarmTitle);
+                    }}
+                    className="flex items-center gap-1 bg-[#1c1c21] border border-white/[0.08] rounded-full px-2 py-0.5 my-1 shrink-0"
+                  >
+                    <input
+                      type="time"
+                      value={newAlarmTime}
+                      onChange={(e) => setNewAlarmTime(e.target.value)}
+                      className="bg-white/10 text-white text-[10px] font-mono font-semibold rounded px-1 py-0.2 focus:outline-none shrink-0"
+                      title="Waktu alarm (HH:mm)"
+                    />
+                    <input
+                      type="text"
+                      value={newAlarmTitle}
+                      onChange={(e) => setNewAlarmTitle(e.target.value)}
+                      placeholder="Nama alarm..."
+                      className="flex-1 min-w-0 bg-transparent text-[10.5px] text-white placeholder-white/35 focus:outline-none px-1"
+                    />
+                    <button
+                      type="submit"
+                      className="px-2 py-0.5 rounded-full bg-[#ff9f0a] hover:bg-[#ff9000] text-black text-[9.5px] font-bold transition shrink-0"
+                    >
+                      + Set
+                    </button>
+                  </form>
+
+                  <div className="flex-1 min-h-0 space-y-1 overflow-y-auto no-scrollbar">
+                    {smartAlarms.length === 0 ? (
+                      <div className="text-[10.5px] text-white/35 py-0.5 flex items-center gap-1">
+                        <AlarmBellSvg size={11} />
+                        <span className="truncate">Belum ada alarm aktif</span>
+                      </div>
+                    ) : (
+                      smartAlarms.map((a) => (
+                        <div
+                          key={a.id}
+                          className={`group flex items-center justify-between rounded-lg px-2 py-0.5 transition ${
+                            a.enabled
+                              ? 'bg-[#2b1e0e] hover:bg-[#352512]'
+                              : 'bg-white/[0.03] hover:bg-white/[0.06] opacity-60'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                            <span
+                              className={`w-[2.5px] h-3 rounded-full shrink-0 ${
+                                a.enabled ? 'bg-[#ff9f0a]' : 'bg-white/30'
+                              }`}
+                            />
+                            <span className="text-[10.5px] font-bold text-white tabular-nums shrink-0">
+                              {a.time}
+                            </span>
+                            <span className="text-[10px] text-white/70 truncate flex-1">
+                              {a.title}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              onClick={() => handleToggleAlarm(a.id)}
+                              className={`w-5 h-3 rounded-full p-0.5 transition ${
+                                a.enabled ? 'bg-[#ff9f0a]' : 'bg-white/20'
+                              }`}
+                            >
+                              <div
+                                className={`w-2 h-2 rounded-full bg-white transition-transform ${
+                                  a.enabled ? 'translate-x-2' : 'translate-x-0'
+                                }`}
+                              />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteAlarm(a.id)}
+                              className="text-white/40 hover:text-white transition"
+                            >
+                              <CloseCrossSvg size={9} />
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </>
+              )}
+
+              {showWorldClocks && (
+                <div className="pt-0.5 mt-0.5 border-t border-white/10 flex items-center justify-between text-[9.5px] tabular-nums shrink-0">
+                  {worldClocks.map((wc) => (
+                    <div key={wc.city} className="flex items-center gap-1">
+                      <span className="text-white/45">{wc.city}</span>
+                      <span className="text-white font-bold">{wc.time}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+      case 'weather': {
+        // Parse sunrise & sunset minutes to compute exact live position of the Sun along the golden horizon curve
+        const parseClockMin = (str: string, defMin: number) => {
+          const m = str.match(/(\d{1,2}):(\d{2})/);
+          if (!m) return defMin;
+          return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+        };
+        const sunriseMin = parseClockMin(weatherData.sunrise, 5 * 60 + 49);
+        const sunsetMin = parseClockMin(weatherData.sunset, 17 * 60 + 37);
+        const nowMin = nowDate.getHours() * 60 + nowDate.getMinutes();
+        const rawProgress =
+          sunsetMin > sunriseMin
+            ? (nowMin - sunriseMin) / (sunsetMin - sunriseMin)
+            : 0.48;
+        const sunT = Math.min(0.92, Math.max(0.08, rawProgress));
+
+        // Quadratic Bezier curve from (46, 74) via control point (200, 2) to (354, 74)
+        const p0x = 46;
+        const p0y = 74;
+        const p1x = 200;
+        const p1y = 2;
+        const p2x = 354;
+        const p2y = 74;
+        const oneMinusT = 1 - sunT;
+        const sunX = oneMinusT * oneMinusT * p0x + 2 * oneMinusT * sunT * p1x + sunT * sunT * p2x;
+        const sunY = oneMinusT * oneMinusT * p0y + 2 * oneMinusT * sunT * p1y + sunT * sunT * p2y;
+
+        const fullDays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const weatherDateLabel = `${fullDays[nowDate.getDay()]}, ${nowDate.getDate()} ${SHORT_MONTHS[
+          nowDate.getMonth()
+        ].toLowerCase()}`;
+
+        const renderHourlyWeatherIcon = (code: number, idx: number) => {
+          const isDarkCloud = code >= 51 || idx < 3;
+          return (
+            <svg width={26} height={20} viewBox="0 0 28 22" className="shrink-0">
+              {/* Subtle rear cloud/moon accent */}
+              <circle
+                cx={19.5}
+                cy={8.5}
+                r={4}
+                fill={isDarkCloud ? '#8fa0b5' : '#525866'}
+                opacity={0.85}
+              />
+              {/* Main sculpted cloud silhouette matching reference */}
+              <path
+                d="M8.5 18.5h10.2c2.6 0 4.6-2 4.6-4.5 0-2.3-1.7-4.2-3.9-4.4-.7-2.6-3-4.5-5.8-4.5-3.3 0-6 2.7-6 6 0 .3 0 .6.1.9-1.6.5-2.8 2-2.8 3.8 0 1.5 1.6 2.7 3.6 2.7z"
+                fill={isDarkCloud ? '#4a4e54' : '#b8c7db'}
+              />
+            </svg>
+          );
+        };
+
+        const quickCities = ['Jakarta', 'Bandung', 'Surabaya', 'Yogyakarta', 'Bali', 'Tokyo'];
+        const isCrossFading = editingWeatherCity || weatherTransitioning || weatherLoading;
+
+        return (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative w-full h-full flex flex-col justify-between overflow-hidden rounded-b-[32px] select-none pt-3 pb-1"
+          >
+            {/* Top-Left Date & Location Pin (Click city to change manually or auto-detect) + Top-Right Quick Actions */}
+            <div className="flex items-start justify-between px-7 z-20 shrink-0">
+              <div className="flex flex-col">
+                <span className="text-[11px] font-medium text-white/65 tracking-tight leading-tight">
+                  {weatherDateLabel}
+                </span>
+                {editingWeatherCity ? (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      setEditingWeatherCity(false);
+                      fetchWeatherData(weatherCityInput);
+                    }}
+                    className="flex items-center gap-1.5 mt-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
+                  >
+                    <input
+                      type="text"
+                      autoFocus
+                      value={weatherCityInput}
+                      onChange={(e) => setWeatherCityInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          e.stopPropagation();
+                          setEditingWeatherCity(false);
+                        }
+                      }}
+                      placeholder="Ketik kota (Enter)..."
+                      className="w-[132px] bg-white/10 border border-white/25 rounded-[2px] px-1.5 py-0.5 text-[10.5px] text-white placeholder-white/40 focus:outline-none focus:border-[#f7d648]/80 transition-colors"
+                    />
+                    <button
+                      type="submit"
+                      className="px-1.5 py-0.5 bg-white/15 hover:bg-white/25 text-[9.5px] font-semibold text-white rounded-[2px] transition cursor-pointer"
+                    >
+                      OK
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingWeatherCity(false)}
+                      className="px-1 py-0.5 text-[9.5px] text-white/50 hover:text-white transition cursor-pointer"
+                    >
+                      ✕
+                    </button>
+                  </form>
+                ) : (
+                  <div className="flex items-center gap-1.5 mt-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]">
+                    <button
+                      onClick={() => {
+                        setWeatherCityInput(
+                          weatherData.city === 'Mendeteksi...' ? '' : weatherData.city
+                        );
+                        setEditingWeatherCity(true);
+                      }}
+                      title="Klik untuk ganti kota manual (kosongkan untuk deteksi otomatis)"
+                      className="inline-flex items-center gap-1 text-left group cursor-pointer"
+                    >
+                      <svg
+                        width={10}
+                        height={10}
+                        viewBox="0 0 24 24"
+                        fill="#d4d4d8"
+                        className="shrink-0 group-hover:fill-white transition"
+                      >
+                        <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 010-5 2.5 2.5 0 010 5z" />
+                      </svg>
+                      <span
+                        className={`text-[11.5px] font-semibold text-white/90 group-hover:text-white tracking-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                          weatherTransitioning || weatherLoading ? 'opacity-45 translate-y-[1px]' : 'opacity-100 translate-y-0'
+                        }`}
+                      >
+                        {weatherLoading ? 'Memuat...' : weatherData.city}
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setEditingWeatherCity(false);
+                        fetchWeatherData('');
+                      }}
+                      title="Deteksi lokasi otomatis"
+                      className="text-[9.5px] text-white/35 hover:text-white/80 font-medium transition cursor-pointer"
+                    >
+                      Auto
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Subtle Top-Right Current Temp & Assistant Trigger */}
+              <div className="flex items-center gap-2 text-white/75">
+                <span
+                  className={`text-[12px] font-semibold text-[#f5d547] tabular-nums transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isCrossFading ? 'opacity-50 scale-95' : 'opacity-100 scale-100'
+                  }`}
+                >
+                  {weatherData.currentTemp}°C
+                </span>
+                <button
+                  onClick={() => {
+                    setShowAllChatHistory(false);
+                    setAssistantOpen(true);
+                    setAssistantMode(defaultAltQMode);
+                  }}
+                  title="Buka Isle Assistant (Alt+Q)"
+                  className="text-white/60 hover:text-white transition cursor-pointer"
+                >
+                  <SparkleFourPointSvg size={13} />
+                </button>
+              </div>
+            </div>
+
+            {/* Center Current Conditions (Golden Solar Horizon Curve + Sunrise/Sunset + Clock) with Fluid Cross-Fade on City Selector Interaction */}
+            <div className="relative w-full h-[78px] flex items-center justify-center shrink-0 -mt-2">
+              {/* Layer 1: Live Solar Horizon Curve & Current Conditions */}
+              <div
+                className={`relative w-full h-full flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  editingWeatherCity
+                    ? 'opacity-0 scale-[0.96] -translate-y-1.5 pointer-events-none'
+                    : weatherTransitioning || weatherLoading
+                    ? 'opacity-40 scale-[0.985] translate-y-0.5'
+                    : 'opacity-100 scale-100 translate-y-0'
+                }`}
+              >
+                <svg
+                  width={400}
+                  height={84}
+                  viewBox="0 0 400 84"
+                  className="overflow-visible pointer-events-none"
+                >
+                  <defs>
+                    <linearGradient id="isleSolarArcGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#eab308" stopOpacity="0.12" />
+                      <stop offset="22%" stopColor="#facc15" stopOpacity="0.88" />
+                      <stop offset="50%" stopColor="#fde047" stopOpacity="1" />
+                      <stop offset="78%" stopColor="#eab308" stopOpacity="0.85" />
+                      <stop offset="100%" stopColor="#ca8a04" stopOpacity="0.12" />
+                    </linearGradient>
+                    <radialGradient id="isleSunGlow" cx="50%" cy="50%" r="50%">
+                      <stop offset="0%" stopColor="#fde047" stopOpacity="0.45" />
+                      <stop offset="55%" stopColor="#eab308" stopOpacity="0.14" />
+                      <stop offset="100%" stopColor="#eab308" stopOpacity="0" />
+                    </radialGradient>
+                  </defs>
+
+                  {/* Ambient Warm Solar Glow Behind Sun */}
+                  <circle cx={sunX} cy={sunY} r={34} fill="url(#isleSunGlow)" />
+
+                  {/* Golden Horizon Arc */}
+                  <path
+                    d={`M ${p0x} ${p0y} Q ${p1x} ${p1y} ${p2x} ${p2y}`}
+                    fill="none"
+                    stroke="url(#isleSolarArcGrad)"
+                    strokeWidth={4.2}
+                    strokeLinecap="round"
+                  />
+
+                  {/* Sun Core + 8 Surrounding Ray Dots (Matches reference image) */}
+                  <g
+                    transform={`translate(${sunX}, ${sunY})`}
+                    className="transition-transform duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]"
+                  >
+                    <circle cx={0} cy={0} r={12.5} fill="#f7d648" />
+                    {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => {
+                      const rad = (deg * Math.PI) / 180;
+                      const rx = Math.cos(rad) * 18.5;
+                      const ry = Math.sin(rad) * 18.5;
+                      return <circle key={deg} cx={rx} cy={ry} r={1.8} fill="#f7d648" />;
+                    })}
+                  </g>
+                </svg>
+
+                {/* Left Sunrise Label */}
+                <div className="absolute left-9 bottom-1.5 flex flex-col items-center leading-tight">
+                  <span className="text-[10.5px] font-medium text-white/85">Sunrise</span>
+                  <span className="text-[11px] font-semibold text-white tabular-nums mt-0.5">
+                    {weatherData.sunrise}
+                  </span>
+                </div>
+
+                {/* Center Large Thin Digital Time */}
+                <div className="absolute inset-x-0 bottom-0.5 flex justify-center pointer-events-none">
+                  <span className="text-[28px] font-light text-white tracking-wider tabular-nums leading-none">
+                    {timeStr}
+                  </span>
+                </div>
+
+                {/* Right Sunset Label */}
+                <div className="absolute right-9 bottom-1.5 flex flex-col items-center leading-tight">
+                  <span className="text-[10.5px] font-medium text-white/85">Sunset</span>
+                  <span className="text-[11px] font-semibold text-white tabular-nums mt-0.5">
+                    {weatherData.sunset}
+                  </span>
+                </div>
+              </div>
+
+              {/* Layer 2: Interactive City Selector Quick-Pick Overlay (Cross-Fades smoothly when editingWeatherCity is open) */}
+              <div
+                className={`absolute inset-0 px-7 flex flex-col justify-center gap-1.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  editingWeatherCity
+                    ? 'opacity-100 scale-100 translate-y-0 pointer-events-auto'
+                    : 'opacity-0 scale-[0.97] translate-y-1.5 pointer-events-none'
+                }`}
+              >
+                <div className="flex items-center justify-between text-[10px] text-white/55">
+                  <span>Pilih kota cepat atau ketik di atas:</span>
+                  <span className="text-white/80 font-medium tabular-nums">
+                    Saat ini: {weatherData.city} · {weatherData.currentTemp}°C
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setEditingWeatherCity(false);
+                      fetchWeatherData('');
+                    }}
+                    className="px-2 py-1 bg-white/10 hover:bg-white/20 border border-white/15 rounded-[2px] text-[10px] font-semibold text-[#f7d648] transition cursor-pointer"
+                  >
+                    Auto Lokasi
+                  </button>
+                  {quickCities.map((cityItem) => (
+                    <button
+                      key={cityItem}
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setWeatherCityInput(cityItem);
+                        setEditingWeatherCity(false);
+                        fetchWeatherData(cityItem);
+                      }}
+                      className={`px-2 py-1 border rounded-[2px] text-[10px] font-medium transition cursor-pointer ${
+                        weatherData.city.toLowerCase() === cityItem.toLowerCase()
+                          ? 'bg-white/20 border-white/40 text-white'
+                          : 'bg-white/[0.06] hover:bg-white/15 border-white/10 text-white/75 hover:text-white'
+                      }`}
+                    >
+                      {cityItem}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Bottom Dark Wave Silhouette (Clipped & Feathered Inside Island Curve) + 7 Hourly Forecast Columns with Fluid Cross-Fade */}
+            <div className="relative w-full pt-1 pb-0.5 px-6 z-10 shrink-0 overflow-hidden rounded-b-[30px]">
+              {/* Subtle Wave Backdrop with Soft Bottom-Edge & Corner Fade */}
+              <svg
+                viewBox="0 0 440 58"
+                preserveAspectRatio="none"
+                className="absolute inset-x-3 bottom-0 w-[calc(100%-24px)] h-[52px] pointer-events-none"
+              >
+                <defs>
+                  <linearGradient id="isleWeatherWaveFill" x1="0%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stopColor="rgb(28, 31, 38)" stopOpacity="0.68" />
+                    <stop offset="68%" stopColor="rgb(18, 20, 26)" stopOpacity="0.38" />
+                    <stop offset="100%" stopColor="rgb(0, 0, 0)" stopOpacity="0" />
+                  </linearGradient>
+                </defs>
+                <path
+                  d="M0,20 Q95,-2 215,20 T440,14 L440,58 L0,58 Z"
+                  fill="url(#isleWeatherWaveFill)"
+                />
+              </svg>
+
+              <div
+                className={`relative z-10 grid grid-cols-7 gap-1 items-center justify-items-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  editingWeatherCity
+                    ? 'opacity-35 scale-[0.98] translate-y-0.5'
+                    : weatherTransitioning || weatherLoading
+                    ? 'opacity-25 scale-[0.985] translate-y-1'
+                    : 'opacity-100 scale-100 translate-y-0'
+                }`}
+              >
+                {weatherData.hourly.slice(0, 7).map((item, idx) => (
+                  <div key={`${item.time}-${idx}`} className="flex flex-col items-center gap-0.5">
+                    <span className="text-[9.5px] font-medium text-white/60 tabular-nums">
+                      {item.time}
+                    </span>
+                    <div className="my-0.5">{renderHourlyWeatherIcon(item.code, idx)}</div>
+                    <span className="text-[10.5px] font-bold text-white tabular-nums">
+                      {item.temp}°
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      }
+    }
+  };
+
+  return (
+    <div
+      className="relative w-screen h-screen bg-transparent overflow-hidden select-none font-sans pointer-events-none"
+    >
+      {/* ── Top-Center Dynamic Island Anchor (Flush at top: 0, horizontally centered) ── */}
+      <div className="relative z-40 w-full flex justify-center items-start pt-0 pointer-events-none">
+        <IslandSurface
+          width={targetW}
+          height={targetH}
+          radius={targetR}
+          shoulder={targetS}
+          topInset={0}
+          tintStyle={tintStyle}
+          tintRgb={tintRgb}
+          auraColors={botPalette.glow}
+          voiceLevelRef={voiceEnergyRef}
+          nudgeTrigger={nudgeCount}
+          onMouseEnter={() => {
+            setDesktopClickThrough(false);
+            if (activeAlert) {
+              setAlertHovered(true);
+            } else {
+              setIsHovered(true);
+            }
+          }}
+          onMouseLeave={() => {
+            setDesktopClickThrough(true);
+            if (activeAlert) {
+              setAlertHovered(false);
+            } else {
+              if (lyricsMode) {
+                // Keep Island open while in lyrics view per user requirement
+                return;
+              }
+              setIsHovered(false);
+              setIsDragOver(false);
+              if (dragAutoOpened) {
+                setDragAutoOpened(false);
+              }
+            }
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (activeAlert) {
+              if (activeAlert.type === 'meeting') {
+                setActiveAlert(null);
+                navigateToPage(5);
+                setIsPinnedOpen(true);
+              } else if (activeAlert.type === 'notification') {
+                setActiveAlert(null);
+                navigateToPage(1);
+                setIsPinnedOpen(true);
+              }
+              return;
+            }
+            if (!isPinnedOpen) setIsPinnedOpen(true);
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            if (activeAlert) {
+              setActiveAlert(null);
+            } else if (!lyricsMode) {
+              setIsPinnedOpen((p) => !p);
+              setIsHovered(false);
+              setDragAutoOpened(false);
+            }
+          }}
+        >
+          {/* =========================================================
+              1. SYSTEM ALERTS (Slim Hardware HUD & Rich Peek Alerts)
+             ========================================================= */}
+          {activeAlert && (
+            <div className="w-full h-full flex items-center justify-between px-4 animate-[ isleFadeIn_160ms_ease-out ]">
+              {(activeAlert.type === 'volume' ||
+                activeAlert.type === 'mute' ||
+                activeAlert.type === 'brightness') && (
+                <div
+                  onWheel={(e) => {
+                    e.stopPropagation();
+                    if (activeAlert.type === 'brightness') {
+                      setBrightness((b) => {
+                        const next =
+                          e.deltaY < 0 ? Math.min(10, b + 1) : Math.max(0, b - 1);
+                        triggerAlert('brightness', { value: next });
+                        return next;
+                      });
+                    } else {
+                      setVolume((v) => {
+                        const next =
+                          e.deltaY < 0 ? Math.min(100, v + 2) : Math.max(0, v - 2);
+                        setMuted(next === 0);
+                        triggerAlert('volume', { value: next, muted: next === 0 });
+                        return next;
+                      });
+                    }
+                  }}
+                  className="w-full flex items-center gap-3 px-1"
+                >
+                  <div className="text-white shrink-0 flex items-center justify-center">
+                    {activeAlert.type === 'brightness' ? (
+                      <SunBrightnessSvg size={17} />
+                    ) : (
+                      <SpeakerWaveSvg
+                        size={17}
+                        level={activeAlert.value ?? volume}
+                        muted={activeAlert.muted ?? muted}
+                      />
+                    )}
+                  </div>
+                  <div className="flex-1 h-[5.5px] bg-[#3a3a3e] rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-white rounded-full transition-all duration-100 ease-out"
+                      style={{
+                        width: `${
+                          activeAlert.type === 'brightness'
+                            ? Math.min(100, Math.max(0, ((activeAlert.value ?? brightness) / 10) * 100))
+                            : activeAlert.muted
+                            ? 0
+                            : Math.min(100, Math.max(0, activeAlert.value ?? volume))
+                        }%`,
+                      }}
+                    />
+                  </div>
+                  <span className="text-[11.5px] font-bold text-white/90 tabular-nums w-6 text-right shrink-0">
+                    {activeAlert.type === 'brightness'
+                      ? activeAlert.value ?? brightness
+                      : activeAlert.muted
+                      ? 0
+                      : activeAlert.value ?? volume}
+                  </span>
+                </div>
+              )}
+
+              {activeAlert.type === 'capslock' && (
+                <div className="w-full flex items-center justify-between px-1">
+                  <div className="flex items-center gap-2.5 text-white">
+                    <CapsLockArrowSvg size={16} />
+                    <span className="text-[12.5px] font-semibold tracking-tight text-white">
+                      Caps Lock {activeAlert.capsOn ? 'On' : 'Off'}
+                    </span>
+                  </div>
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      activeAlert.capsOn ? 'bg-[#30d158]' : 'bg-white/25'
+                    }`}
+                  />
+                </div>
+              )}
+
+              {(activeAlert.type === 'charging' || activeAlert.type === 'lowbattery') && (
+                <div className="w-full flex items-center justify-between gap-3 px-1">
+                  <div className="flex items-center gap-2.5 shrink-0">
+                    <div className="relative w-8 h-8 flex items-center justify-center">
+                      <svg width={32} height={32} className="-rotate-90">
+                        <circle
+                          cx={16}
+                          cy={16}
+                          r={13}
+                          fill="none"
+                          stroke={
+                            (activeAlert.value ?? batteryLevel) <= 20 && !isCharging
+                              ? 'rgba(255,69,58,0.22)'
+                              : 'rgba(48,209,88,0.22)'
+                          }
+                          strokeWidth={2.6}
+                        />
+                        <circle
+                          cx={16}
+                          cy={16}
+                          r={13}
+                          fill="none"
+                          stroke={
+                            (activeAlert.value ?? batteryLevel) <= 20 && !isCharging
+                              ? '#ff453a'
+                              : '#30d158'
+                          }
+                          strokeWidth={2.6}
+                          strokeDasharray={2 * Math.PI * 13}
+                          strokeDashoffset={
+                            2 * Math.PI * 13 * (1 - (activeAlert.value ?? batteryLevel) / 100)
+                          }
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                      <span
+                        className={`absolute ${
+                          (activeAlert.value ?? batteryLevel) <= 20 && !isCharging
+                            ? 'text-[#ff453a]'
+                            : 'text-[#30d158]'
+                        }`}
+                      >
+                        <BoltChargingSvg size={13} />
+                      </span>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-[12px] font-semibold text-white leading-tight">
+                        {isCharging
+                          ? 'Charging'
+                          : (activeAlert.value ?? batteryLevel) <= 20
+                          ? 'Low Battery'
+                          : 'On Battery'}
+                      </span>
+                      <span className="text-[10px] text-white/50 leading-tight">
+                        {isCharging
+                          ? 'Plugged into AC power'
+                          : (activeAlert.value ?? batteryLevel) <= 20
+                          ? 'Plug in charger soon'
+                          : 'Laptop battery active'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Real Laptop Battery Progress Bar + Percentage */}
+                  <div className="flex-1 flex items-center gap-2.5 min-w-[90px]">
+                    <div className="flex-1 h-[6px] bg-white/15 rounded-full overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{
+                          width: `${Math.min(100, Math.max(0, activeAlert.value ?? batteryLevel))}%`,
+                          backgroundColor:
+                            (activeAlert.value ?? batteryLevel) <= 15 && !isCharging
+                              ? '#ff453a'
+                              : (activeAlert.value ?? batteryLevel) <= 30 && !isCharging
+                              ? '#ff9f0a'
+                              : '#30d158',
+                        }}
+                      />
+                    </div>
+                    <span className="text-[13.5px] font-bold text-white tabular-nums shrink-0">
+                      {activeAlert.value ?? batteryLevel}%
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {activeAlert.type === 'meeting' && (
+                <div className="w-full flex items-center justify-between px-0.5">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-full bg-[#0a84ff]/20 text-[#389bff] flex items-center justify-center shrink-0">
+                      <VideoCameraSvg size={15} />
+                    </div>
+                    <div className="flex flex-col min-w-0">
+                      <span className="text-[12.5px] font-semibold text-white truncate leading-tight">
+                        Weekly sync in 5 min
+                      </span>
+                      <span className="text-[11px] text-white/50 truncate leading-tight tabular-nums">
+                        01:53 – 02:23 · Google Meet
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActiveAlert(null);
+                      navigateToPage(5);
+                      setIsPinnedOpen(true);
+                    }}
+                    className="px-3.5 py-1 rounded-full bg-[#1a73e8] hover:bg-[#2580f5] text-white text-[12px] font-semibold transition shrink-0"
+                  >
+                    Join
+                  </button>
+                </div>
+              )}
+
+              {activeAlert.type === 'notification' && (
+                <div className="w-full flex items-center justify-between px-0.5">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-full bg-white/10 text-white flex items-center justify-center shrink-0">
+                      <MailEnvelopeSvg size={14} />
+                    </div>
+                    <div className="flex flex-col min-w-0 pr-2">
+                      <span className="text-[12.5px] font-semibold text-white leading-tight">
+                        Ana
+                      </span>
+                      <span className="text-[11px] text-white/55 truncate leading-tight">
+                        Lunch at 12? I booked the place by the park...
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActiveAlert(null);
+                      navigateToPage(1);
+                      setIsPinnedOpen(true);
+                    }}
+                    className="px-3 py-1 rounded-full bg-white/12 hover:bg-white/20 text-white text-[11.5px] font-medium transition shrink-0"
+                  >
+                    Reply
+                  </button>
+                </div>
+              )}
+
+              {activeAlert.type === 'permission' && (
+                <div className="w-full h-full flex items-center gap-3.5 py-2.5 px-1">
+                  <div className="relative shrink-0">
+                    <BotCanvas
+                      size={40}
+                      shape={botShape}
+                      color={botColor}
+                      form={
+                        activeAlert.permissionState === 'allowed'
+                          ? 'success'
+                          : activeAlert.permissionState === 'denied'
+                          ? 'error'
+                          : 'asking'
+                      }
+                      voiceLevel={0}
+                    />
+                    <span
+                      className={`absolute -top-0.5 -left-0.5 w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                        activeAlert.permissionState === 'allowed'
+                          ? 'bg-[#30d158] text-black'
+                          : activeAlert.permissionState === 'denied'
+                          ? 'bg-[#ff453a] text-white'
+                          : 'bg-[#ff9f0a] text-black'
+                      }`}
+                    >
+                      {activeAlert.permissionState === 'allowed' ? (
+                        <CheckTickSvg size={10} />
+                      ) : activeAlert.permissionState === 'denied' ? (
+                        <CloseCrossSvg size={10} />
+                      ) : (
+                        '!'
+                      )}
+                    </span>
+                  </div>
+
+                  <div className="flex-1 min-w-0 flex flex-col justify-between h-full">
+                    <div>
+                      <div className="text-[12.5px] font-semibold text-white leading-tight">
+                        shop needs permission
+                      </div>
+                      <div className="text-[10.5px] text-white/45 leading-tight">
+                        Isle Assistant · Windows
+                      </div>
+                    </div>
+
+                    <div className="inline-flex items-center px-2 py-0.5 rounded bg-white/[0.08] font-mono text-[11px] text-white/90 w-fit">
+                      git push origin main
+                    </div>
+
+                    <div className="flex items-center gap-1.5 pt-0.5">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveAlert((a) => (a ? { ...a, permissionState: 'denied' } : null));
+                          setTimeout(() => setActiveAlert(null), 700);
+                        }}
+                        className="px-3 py-0.5 rounded-full bg-white/10 hover:bg-white/16 text-white/85 text-[11px] font-medium transition"
+                      >
+                        Deny
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveAlert((a) => (a ? { ...a, permissionState: 'allowed' } : null));
+                          setTimeout(() => setActiveAlert(null), 700);
+                        }}
+                        className="px-3 py-0.5 rounded-full bg-white/12 hover:bg-white/20 text-white text-[11px] font-medium transition"
+                      >
+                        Allow
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveAlert((a) => (a ? { ...a, permissionState: 'allowed' } : null));
+                          setTimeout(() => setActiveAlert(null), 700);
+                        }}
+                        className="px-3.5 py-0.5 rounded-full bg-white text-black hover:bg-white/90 text-[11px] font-semibold transition"
+                      >
+                        Always
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Smart Alarm Trigger Alert (Full-width notch alert with Snooze & Dismiss) ── */}
+              {activeAlert.type === 'alarm' && (
+                <div className="w-full flex items-center justify-between px-1">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-full bg-[#ff9f0a]/20 text-[#ff9f0a] flex items-center justify-center shrink-0 animate-bounce">
+                      <AlarmBellSvg size={16} />
+                    </div>
+                    <div className="flex flex-col min-w-0 pr-2">
+                      <span className="text-[12.5px] font-bold text-white truncate leading-tight">
+                        {activeAlert.alarmTitle || 'Smart Alarm'}
+                      </span>
+                      <span className="text-[10.5px] text-[#ffb340] font-medium leading-tight tabular-nums flex items-center gap-1.5 mt-0.5">
+                        <span>{activeAlert.alarmTime || timeStr}</span>
+                        <span className="text-white/40">•</span>
+                        <span>Waktunya telah tiba</span>
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSnoozeAlarm(activeAlert.alarmId);
+                      }}
+                      className="px-3 py-1 rounded-full bg-white/12 hover:bg-white/20 text-white text-[11px] font-medium transition"
+                      title="Tunda 5 Menit"
+                    >
+                      Snooze (+5m)
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (activeAlert.alarmId?.startsWith('task-')) {
+                          const taskIdNum = parseInt(activeAlert.alarmId.replace('task-', ''), 10);
+                          setTasks((prev) =>
+                            prev.map((t) => (t.id === taskIdNum ? { ...t, done: true } : t))
+                          );
+                        }
+                        setActiveAlert(null);
+                      }}
+                      className="px-3 py-1 rounded-full bg-white text-black hover:bg-white/90 text-[11px] font-semibold transition"
+                      title={
+                        activeAlert.alarmId?.startsWith('task-')
+                          ? 'Tandai Task Selesai'
+                          : 'Matikan Alarm'
+                      }
+                    >
+                      {activeAlert.alarmId?.startsWith('task-') ? 'Done' : 'Dismiss'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Seamless Fluid Action Confirmation Alert (Task Added, Timer Set, Alarm Set, Weather, Music, System) ── */}
+              {activeAlert.type === 'action_confirm' && (
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const targetIdx = activeAlert.targetPageIdx;
+                    setActiveAlert(null);
+                    if (typeof targetIdx === 'number') {
+                      navigateToPage(targetIdx);
+                      setIsPinnedOpen(true);
+                    }
+                  }}
+                  className="w-full flex items-center justify-between px-1.5 cursor-pointer select-none animate-[isleFadeIn_180ms_ease-out]"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-[10px] bg-white/[0.08] border border-white/15 text-white flex items-center justify-center shrink-0">
+                      {activeAlert.confirmCategory === 'task' ? (
+                        <TaskCheckBoxSvg size={15} />
+                      ) : activeAlert.confirmCategory === 'timer' ? (
+                        <TimerStopwatchSvg size={15} />
+                      ) : activeAlert.confirmCategory === 'alarm' ? (
+                        <AlarmBellSvg size={15} />
+                      ) : activeAlert.confirmCategory === 'weather' ? (
+                        <SunBrightnessSvg size={15} />
+                      ) : activeAlert.confirmCategory === 'music' ? (
+                        <MusicNoteSvg size={15} />
+                      ) : (
+                        <CheckTickSvg size={14} />
+                      )}
+                    </div>
+                    <div className="flex flex-col min-w-0 pr-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[12px] font-bold text-white truncate leading-tight">
+                          {activeAlert.confirmTitle || 'Berhasil Dilaksanakan'}
+                        </span>
+                        <span className="text-white/70 shrink-0">
+                          <CheckTickSvg size={10} />
+                        </span>
+                      </div>
+                      <span className="text-[10.5px] text-white/60 font-medium truncate leading-tight mt-0.5">
+                        {activeAlert.confirmSubtitle || 'Dynamic Island diperbarui'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {activeAlert.confirmBadge && (
+                    <div className="px-2.5 py-1 rounded-[8px] bg-white/[0.09] border border-white/15 text-[11.5px] font-bold text-white tabular-nums tracking-tight shrink-0">
+                      {activeAlert.confirmBadge}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* =========================================================
+              2. COMPACT NOTCH STATE ([Battery Ring] 10:54 — Cross-morphs smoothly with Expanded Island)
+             ========================================================= */}
+          {!activeAlert && (
+            <div
+              className={`absolute inset-x-0 top-0 h-[32px] flex items-center justify-between px-3.5 text-white transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                !isExpanded && !(miniCapsuleMode && !topEdgeHover)
+                  ? 'opacity-100 scale-100 blur-0 pointer-events-auto z-20'
+                  : 'opacity-0 scale-90 blur-[4px] pointer-events-none z-0'
+              }`}
+            >
+              <div className="flex items-center gap-1.5">
+                {renderBatteryRing(15, 2.2)}
+                {dndEnabled && (
+                  <span className="text-[#8e8eff]">
+                    <MoonFilledSvg size={11} />
+                  </span>
+                )}
+              </div>
+              <span className="text-[13px] font-bold tracking-tight text-white tabular-nums">
+                {timeStr}
+              </span>
+            </div>
+          )}
+
+          {/* =========================================================
+              3. REAL-TIME VOICE (gemini-3.8-live) & SEARCH-GROUNDED AI (gemini-3.8-flash)
+             ========================================================= */}
+          {!activeAlert && isExpanded && assistantOpen && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full h-full flex flex-col justify-between text-white animate-[ isleFadeIn_200ms_ease-out ]"
+            >
+              {/* STAGE 1: REAL-TIME ISLE ASSISTANT VOICE PILL (Minimalist, Zero AI Slop) */}
+              {assistantMode === 'voice-pill' ? (
+                <div
+                  onWheel={(e) => {
+                    if (e.deltaY < -5) setAssistantMode('conversation');
+                  }}
+                  className="w-full h-full flex items-center justify-between px-4 py-2 gap-3"
+                >
+                  <div
+                    onClick={() => startBrowserVoiceRecognition()}
+                    title={
+                      voiceListening
+                        ? 'Isle Assistant aktif · Klik untuk hentikan'
+                        : 'Klik untuk bicara dengan Isle Assistant'
+                    }
+                    className="relative shrink-0 cursor-pointer"
+                  >
+                    <BotCanvas
+                      size={36}
+                      shape={botShape}
+                      color={botColor}
+                      form={voiceListening ? 'listening' : assistantLoading ? 'thinking' : botForm}
+                      voiceLevelRef={voiceEnergyRef}
+                    />
+                  </div>
+
+                  <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[12px] font-semibold text-white tracking-tight">
+                        Isle Assistant
+                      </span>
+                      <span className="text-[10px] text-white/45 font-medium">
+                        {voiceListening
+                          ? 'Mendengarkan...'
+                          : assistantLoading
+                          ? 'Memproses...'
+                          : 'Voice Mode'}
+                      </span>
+                    </div>
+
+                    {assistantLoading ? (
+                      <div className="mt-0.5">
+                        <GeminiThinkingIndicator label="Memproses..." />
+                      </div>
+                    ) : (
+                      <div
+                        onClick={() => setAssistantMode('conversation')}
+                        className="text-[11.5px] text-white/85 line-clamp-2 leading-relaxed cursor-pointer hover:text-white transition"
+                        title="Klik untuk membuka riwayat teks lengkap"
+                      >
+                        {agentTranscript && voiceListening
+                          ? `"${agentTranscript}"`
+                          : agentHeadline ||
+                            (voiceListening
+                              ? 'Silakan berbicara...'
+                              : 'Klik mic untuk mulai berbicara')}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col items-end justify-between h-full py-0.5 shrink-0 pl-1">
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => {
+                          const nextLang = voiceLang === 'id-ID' ? 'en-US' : 'id-ID';
+                          setVoiceLang(nextLang);
+                          if (voiceListening) {
+                            setTimeout(() => startBrowserVoiceRecognition(true), 40);
+                          }
+                        }}
+                        className="px-1.5 py-0.5 rounded-full bg-white/[0.08] hover:bg-white/16 text-[9.5px] font-semibold text-white/70 hover:text-white transition"
+                        title="Ganti Bahasa (ID / EN)"
+                      >
+                        {voiceLang === 'id-ID' ? 'ID' : 'EN'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          stopVoiceRecognition();
+                          setDefaultAltQMode('conversation');
+                          setAssistantMode('conversation');
+                        }}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-white/16 text-[9.5px] font-semibold text-white/70 hover:text-white transition"
+                        title="Beralih ke mode Teks (Type)"
+                      >
+                        Type
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => startBrowserVoiceRecognition()}
+                        title={voiceListening ? 'Hentikan Mendengarkan' : 'Mulai Bicara'}
+                        className={`w-6 h-6 rounded-full flex items-center justify-center transition ${
+                          voiceListening
+                            ? 'bg-[#ff453a] text-white shadow-sm shadow-rose-500/40'
+                            : 'bg-white/12 hover:bg-white/20 text-white/85'
+                        }`}
+                      >
+                        <MicSymbolicSvg size={11} />
+                      </button>
+                      <button
+                        onClick={closeAssistantAndCollapse}
+                        title="Tutup (Alt+Q atau Esc)"
+                        className="w-6 h-6 rounded-full bg-white/[0.08] hover:bg-white/16 flex items-center justify-center text-white/60 hover:text-white transition"
+                      >
+                        <CloseCrossSvg size={10} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* STAGE 2: SLEEK SINGLE-ANSWER AI VIEW + MULTIMODAL VISION (Upload, Drag-Drop, Paste & Auto-Screenshot) */
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const droppedFiles = Array.from(e.dataTransfer?.files || []) as File[];
+                    const imgFile = droppedFiles.find((f) => f.type.startsWith('image/'));
+                    if (imgFile) {
+                      attachImageFile(imgFile);
+                    }
+                  }}
+                  className="w-full h-full flex flex-col justify-between px-3.5 pt-2 pb-2"
+                >
+                  {/* Slim Minimalist Header */}
+                  <div className="flex items-center justify-between shrink-0 pb-1 border-b border-white/[0.06]">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-[11px] font-semibold text-white tracking-tight">
+                        Isle Assistant
+                      </span>
+                      {messages.filter((m) => m.role === 'assistant').length > 1 && (
+                        <button
+                          onClick={() => setShowAllChatHistory((prev) => !prev)}
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-medium transition ${
+                            showAllChatHistory
+                              ? 'bg-white/15 text-white'
+                              : 'text-white/40 hover:text-white/75'
+                          }`}
+                          title="Toggle history"
+                        >
+                          {showAllChatHistory ? 'Latest only' : 'History'}
+                        </button>
+                      )}
+                      {voiceListening && (
+                        <span className="text-[9.5px] text-[#30d158] font-medium animate-pulse truncate">
+                          · Listening
+                        </span>
+                      )}
+                      {spamNotice && (
+                        <span className="text-[9.5px] text-[#ff9f0a] font-medium truncate">
+                          · {spamNotice}
+                        </span>
+                      )}
+                      {newChatToast && (
+                        <span className="text-[9.5px] text-white/40">· Cleared</span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1 shrink-0">
+                      <div className="flex items-center bg-white/[0.07] rounded-full p-0.5 text-[9px] mr-0.5">
+                        <button
+                          onClick={() => {
+                            setDefaultAltQMode('voice-pill');
+                            setAssistantMode('voice-pill');
+                            startBrowserVoiceRecognition(true);
+                          }}
+                          className="px-1.5 py-0.5 rounded-full text-white/60 hover:text-white"
+                          title="Switch to Voice Mode"
+                        >
+                          Voice
+                        </button>
+                        <button
+                          onClick={() => {
+                            stopVoiceRecognition();
+                            setDefaultAltQMode('conversation');
+                            setAssistantMode('conversation');
+                            assistantInputRef.current?.focus();
+                          }}
+                          className="px-1.5 py-0.5 rounded-full bg-white text-black font-semibold"
+                          title="Direct Typing Mode"
+                        >
+                          Type
+                        </button>
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          setMessages([]);
+                          setLatestSearchSources([]);
+                          setPendingImage(null);
+                          setShowAllChatHistory(false);
+                          setAnimatingMsgId(null);
+                          setNewChatToast(true);
+                          setTimeout(() => setNewChatToast(false), 2000);
+                          assistantInputRef.current?.focus();
+                        }}
+                        title="Clear response"
+                        className="w-5 h-5 rounded-full bg-white/[0.08] hover:bg-white/16 flex items-center justify-center text-white/70 hover:text-white transition"
+                      >
+                        <PlusSvg size={10} />
+                      </button>
+                      <button
+                        onClick={closeAssistantAndCollapse}
+                        title="Close (Alt+Q or Esc)"
+                        className="w-5 h-5 rounded-full bg-white/[0.08] hover:bg-white/16 flex items-center justify-center text-white/70 hover:text-white transition"
+                      >
+                        <CloseCrossSvg size={9} />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Main Response Area */}
+                  <div
+                    ref={chatScrollRef}
+                    className="flex-1 overflow-y-auto no-scrollbar pr-0.5 my-1 flex flex-col justify-center"
+                  >
+                    {assistantLoading ? (
+                      <div className="flex items-center gap-2.5 py-1 pl-0.5 animate-[ isleFadeIn_180ms_ease-out ]">
+                        <div className="shrink-0">
+                          <BotCanvas
+                            size={18}
+                            shape={botShape}
+                            color={botColor}
+                            form="thinking"
+                            voiceLevelRef={voiceEnergyRef}
+                          />
+                        </div>
+                        <GeminiThinkingIndicator
+                          label={agentHeadline || 'Isle Assistant thinking...'}
+                        />
+                      </div>
+                    ) : showAllChatHistory ? (
+                      <div className="space-y-2 py-0.5">
+                        {messages
+                          .filter((m) => m.role === 'assistant')
+                          .map((m) => (
+                            <div key={m.id} className="flex items-start gap-2">
+                              <div className="shrink-0 mt-0.5">
+                                <BotCanvas
+                                  size={15}
+                                  shape={botShape}
+                                  color={botColor}
+                                  form="reply"
+                                  voiceLevel={0}
+                                />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                {m.imageUrl && (
+                                  <img
+                                    src={m.imageUrl}
+                                    alt="Analyzed attachment"
+                                    className="h-9 w-auto rounded border border-white/15 object-cover mb-1"
+                                  />
+                                )}
+                                <div className="text-[11.5px] text-white/90 leading-relaxed select-text break-words">
+                                  {m.text}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                      </div>
+                    ) : latestAssistantMessage ? (
+                      <div
+                        key={latestAssistantMessage.id}
+                        className="flex flex-col gap-1 animate-[ isleFadeIn_240ms_ease-out ]"
+                      >
+                        <div className="flex items-start gap-2">
+                          <div className="shrink-0 mt-0.5">
+                            <BotCanvas
+                              size={16}
+                              shape={botShape}
+                              color={botColor}
+                              form="reply"
+                              voiceLevel={0}
+                            />
+                          </div>
+                          {latestAssistantMessage.imageUrl && (
+                            <img
+                              src={latestAssistantMessage.imageUrl}
+                              alt="Visual context"
+                              className="w-9 h-9 rounded-md border border-white/20 object-cover shrink-0 mt-0.5"
+                              title="Gambar / Screenshot yang dianalisis AI"
+                            />
+                          )}
+                          <div className="text-[11.5px] text-white/92 leading-relaxed select-text break-words flex-1 min-w-0">
+                            {animatingMsgId === latestAssistantMessage.id
+                              ? latestAssistantMessage.text.slice(0, revealedChars)
+                              : latestAssistantMessage.text}
+                            {animatingMsgId === latestAssistantMessage.id && (
+                              <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-white/70 animate-pulse rounded-xs" />
+                            )}
+                          </div>
+                        </div>
+
+
+
+                        {/* Compact PC System Control / Terminal Card (Bluetooth, Wi-Fi, Terminal stdout) */}
+                        {latestAssistantMessage.commandCard &&
+                          animatingMsgId !== latestAssistantMessage.id && (
+                            <div className="pl-6 pt-0.5 animate-[ isleFadeIn_180ms_ease-out ]">
+                              <div
+                                onClick={() => {
+                                  const card = latestAssistantMessage.commandCard;
+                                  if (!card) return;
+                                  if (card.uri) {
+                                    window.location.href = card.uri;
+                                  } else if (card.command) {
+                                    navigator.clipboard?.writeText(card.command);
+                                  }
+                                }}
+                                title={
+                                  latestAssistantMessage.commandCard.uri
+                                    ? `Click to open Windows Settings (${latestAssistantMessage.commandCard.uri})`
+                                    : 'Click to copy command'
+                                }
+                                className="flex flex-col gap-0.5 px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] font-mono text-[10px] cursor-pointer transition"
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="truncate text-white/75">
+                                    <span className="text-white/35 mr-1">$</span>
+                                    {latestAssistantMessage.commandCard.command}
+                                  </div>
+                                  <span className="flex items-center gap-1 text-[#30d158] font-sans font-semibold text-[9.5px] shrink-0">
+                                    <CheckTickSvg size={9} />
+                                    {latestAssistantMessage.commandCard.purpose}
+                                  </span>
+                                </div>
+                                {latestAssistantMessage.commandCard.output && (
+                                  <div className="text-[9.5px] text-white/50 truncate">
+                                    {latestAssistantMessage.commandCard.output}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                        {/* Compact Found Files Strip (when user asks AI to find files) */}
+                        {latestAssistantMessage.foundFiles &&
+                          latestAssistantMessage.foundFiles.length > 0 &&
+                          animatingMsgId !== latestAssistantMessage.id && (
+                            <div className="flex items-center gap-1.5 pl-6 pt-0.5 overflow-x-auto no-scrollbar animate-[ isleFadeIn_180ms_ease-out ]">
+                              {latestAssistantMessage.foundFiles.map((f, idx) => (
+                                <button
+                                  key={idx}
+                                  onClick={() => {
+                                    addFilesToShelf([
+                                      {
+                                        name: f.name,
+                                        size: f.size,
+                                        ext: detectFileExt(f.name),
+                                      },
+                                    ]);
+                                    closeAssistantAndCollapse();
+                                    setIsPinnedOpen(true);
+                                    navigateToPage(4, 'right');
+                                  }}
+                                  title={`${f.path} (${f.size}) · Click to send to Shelf`}
+                                  className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white/[0.06] hover:bg-white/14 border border-white/10 text-[9.5px] text-white/85 whitespace-nowrap transition shrink-0"
+                                >
+                                  <FileDocumentBadgeSvg ext={detectFileExt(f.name)} size={12} />
+                                  <span className="truncate max-w-[110px]">{f.name}</span>
+                                  <span className="text-white/40">{f.size}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                        {/* Ultra-Minimalist Subtle Source Citations (Zero AI slop, short domain badge) */}
+                        {latestAssistantMessage.searchSources &&
+                          latestAssistantMessage.searchSources.length > 0 &&
+                          animatingMsgId !== latestAssistantMessage.id && (
+                            <div className="flex items-center gap-1.5 pl-6 pt-0.5 text-[9px] text-white/35 animate-[ isleFadeIn_180ms_ease-out ]">
+                              <span className="text-white/20">•</span>
+                              <span>Sumber:</span>
+                              {latestAssistantMessage.searchSources.slice(0, 2).map((src, idx) => {
+                                let label = src.title;
+                                try {
+                                  label = new URL(src.uri).hostname.replace('www.', '');
+                                } catch {
+                                  label = src.title.slice(0, 16);
+                                }
+                                return (
+                                  <a
+                                    key={idx}
+                                    href={src.uri}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-white/45 hover:text-white/80 underline underline-offset-2 decoration-white/20 hover:decoration-white/60 transition"
+                                    title={src.title}
+                                  >
+                                    {label}
+                                  </a>
+                                );
+                              })}
+                            </div>
+                          )}
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 py-1 pl-1 animate-[isleFadeIn_180ms_ease-out]">
+                        <div className="shrink-0">
+                          <BotCanvas
+                            size={16}
+                            shape={botShape}
+                            color={botColor}
+                            form="reply"
+                            voiceLevel={0}
+                          />
+                        </div>
+                        <div className="text-[11.5px] text-white/85 font-normal select-none">
+                          Halo! Ada yang bisa aku bantu di Windows hari ini?
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Pending Image Attachment Preview Chip (Upload / Paste / Drag-Drop / Auto-Screenshot) */}
+                  {pendingImage && (
+                    <div className="flex items-center justify-between gap-2 px-2 py-1 mb-1 rounded-lg bg-white/[0.07] border border-white/15 shrink-0 animate-[ isleFadeIn_150ms_ease-out ]">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <img
+                          src={pendingImage.dataUrl}
+                          alt={pendingImage.name}
+                          className="w-6 h-6 rounded object-cover border border-white/20 shrink-0"
+                        />
+                        <span className="text-[10px] text-white/85 truncate font-medium">
+                          {pendingImage.name}
+                        </span>
+                        <span className="text-[9px] text-white/50 font-medium shrink-0">
+                          · Vision
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setPendingImage(null)}
+                        className="w-4 h-4 rounded-full bg-white/10 hover:bg-white/25 flex items-center justify-center text-white/70 hover:text-white transition shrink-0"
+                        title="Hapus lampiran gambar"
+                      >
+                        <CloseCrossSvg size={8} />
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Slim Bottom Auto-Focused Input Field Bar with Multimodal Image Upload + Paste Support */}
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      stopVoiceRecognition();
+                      handleAskGemini(assistantInput);
+                    }}
+                    className="flex items-center gap-1.5 pt-0.5 shrink-0"
+                  >
+                    <div
+                      onClick={() => startBrowserVoiceRecognition()}
+                      title={
+                        voiceListening
+                          ? 'Listening · Click to stop'
+                          : 'Click to speak'
+                      }
+                      className="shrink-0 cursor-pointer"
+                    >
+                      <BotCanvas
+                        size={24}
+                        shape={botShape}
+                        color={botColor}
+                        form={voiceListening ? 'listening' : assistantLoading ? 'thinking' : botForm}
+                        voiceLevelRef={voiceEnergyRef}
+                      />
+                    </div>
+
+                    {/* Hidden File Input for Multimodal Vision Image Upload */}
+                    <input
+                      ref={imageInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) attachImageFile(f);
+                        e.target.value = '';
+                      }}
+                      className="hidden"
+                    />
+
+                    <div className="flex-1 flex items-center bg-[#18181d] border border-white/12 focus-within:border-white/30 rounded-full pl-2 pr-1 py-0.5 transition gap-1">
+                      {/* Image Upload / Vision Attachment Button */}
+                      <button
+                        type="button"
+                        onClick={() => imageInputRef.current?.click()}
+                        title="Upload gambar (atau Paste Ctrl+V / Drag & Drop / ketik 'ambil screenshot')"
+                        className={`w-5 h-5 rounded-full flex items-center justify-center transition shrink-0 ${
+                          pendingImage
+                            ? 'bg-white text-black'
+                            : 'text-white/50 hover:text-white hover:bg-white/10'
+                        }`}
+                      >
+                        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                          <circle cx="8.5" cy="8.5" r="1.5" />
+                          <polyline points="21 15 16 10 5 21" />
+                        </svg>
+                      </button>
+
+                      <input
+                        ref={assistantInputRef}
+                        type="text"
+                        autoFocus
+                        maxLength={1000}
+                        value={assistantInput}
+                        onChange={(e) => {
+                          setAssistantInput(e.target.value);
+                          setBotForm(e.target.value ? 'typing' : 'listening');
+                        }}
+                        onPaste={(e) => {
+                          const items = Array.from(e.clipboardData?.items || []) as DataTransferItem[];
+                          const imgItem = items.find((item) => item.type.startsWith('image/'));
+                          if (imgItem) {
+                            const file = imgItem.getAsFile();
+                            if (file) {
+                              e.preventDefault();
+                              attachImageFile(file);
+                            }
+                          }
+                        }}
+                        placeholder={
+                          voiceListening
+                            ? 'Listening...'
+                            : pendingImage
+                            ? 'Tanyakan sesuatu tentang gambar ini...'
+                            : 'Type here, paste image, or "ambil screenshot"'
+                        }
+                        className="flex-1 bg-transparent text-[11.5px] text-white placeholder-white/35 focus:outline-none min-w-0"
+                      />
+                      {assistantLoading ? (
+                        <button
+                          type="button"
+                          onClick={cancelInFlightGemini}
+                          title="Stop response"
+                          className="w-5 h-5 rounded-full bg-white/15 hover:bg-white/25 text-white flex items-center justify-center transition shrink-0"
+                        >
+                          <StopSquareSvg size={8} />
+                        </button>
+                      ) : assistantInput.trim() || pendingImage ? (
+                        <button
+                          type="submit"
+                          className="w-5 h-5 rounded-full bg-white text-black hover:bg-white/90 flex items-center justify-center transition shrink-0"
+                        >
+                          <SendArrowSvg size={11} />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => startBrowserVoiceRecognition()}
+                          title={voiceListening ? 'Stop voice' : 'Start voice'}
+                          className={`w-5 h-5 rounded-full flex items-center justify-center transition shrink-0 ${
+                            voiceListening
+                              ? 'bg-[#ff453a] text-white animate-pulse'
+                              : 'bg-white/12 hover:bg-white/20 text-white/85'
+                          }`}
+                        >
+                          <MicSymbolicSvg size={11} />
+                        </button>
+                      )}
+                    </div>
+                  </form>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* =========================================================
+              4. EXPANDED ISLAND (6 Pages + Simultaneous Dual-Layer Slide + Seamless Cross-Morph)
+             ========================================================= */}
+          {!activeAlert && !assistantOpen && (
+            <div
+              onWheel={(e) => {
+                if (isExpanded && Math.abs(e.deltaX) > 18 && !prevPageIndex) {
+                  if (e.deltaX > 0) navigateToPage(pageIndex + 1, 'right');
+                  else navigateToPage(pageIndex - 1, 'left');
+                }
+              }}
+              className={`relative w-full h-full flex flex-col justify-between text-white origin-top transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                isExpanded
+                  ? 'opacity-100 scale-100 translate-y-0 blur-0 pointer-events-auto'
+                  : 'opacity-0 scale-[0.84] -translate-y-3 blur-[6px] pointer-events-none'
+              }`}
+            >
+              {/* ── Top Header Row on Non-Music/Weather Pages (Clean Minimalist Title + Battery & Clock in Corner) ── */}
+              {activePage !== 'music' && activePage !== 'weather' && (
+                <div className="w-full flex items-center justify-between px-6 pt-2.5 pb-1 z-20 shrink-0 animate-[ isleFadeIn_200ms_ease-out ]">
+                  {/* Clean Page Title + Shelf "Clear" Action */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[12.5px] font-bold text-white tracking-tight">
+                      {ISLAND_PAGES.find((p) => p.id === activePage)?.label || activePage}
+                    </span>
+                    {activePage === 'shelf' && shelfFiles.length > 0 && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShelfFiles([]);
+                        }}
+                        className="px-2.5 py-0.5 rounded-full bg-white/12 hover:bg-white/22 text-[10px] font-semibold text-white/90 transition animate-[ isleFadeIn_160ms_ease-out ]"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Right: Equalizer + Isle Assistant + Battery Ring + Date + Time + Settings */}
+                  <div className="flex items-center gap-2.5 text-white/85">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setIsPlaying((p) => !p);
+                      }}
+                      title={isPlaying ? 'Pause music' : 'Play music'}
+                      className="text-white/80 hover:text-white transition"
+                    >
+                      <BeatEqualizerBars
+                        size={14}
+                        playing={isPlaying && !muted && volume > 0}
+                        activeTrackTitle={activeTrack?.title}
+                        activeTrackArtist={activeTrack?.artist}
+                        hasAudioUrl={Boolean(activeTrack?.audioUrl)}
+                        audioEl={audioElRef.current}
+                        positionMsRef={positionMsRef}
+                        parsedLyricsCount={parsedLyrics.length}
+                        activeLineIndex={activeLineIndex}
+                      />
+                    </button>
+
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowAllChatHistory(false);
+                        setAssistantOpen(true);
+                        setAssistantMode(defaultAltQMode);
+                        if (defaultAltQMode === 'voice-pill') {
+                          setTimeout(() => startBrowserVoiceRecognition(true), 30);
+                        } else {
+                          setTimeout(() => assistantInputRef.current?.focus(), 40);
+                        }
+                      }}
+                      title="Open Isle Assistant (Alt+Q)"
+                      className="text-white/75 hover:text-white transition"
+                    >
+                      <SparkleFourPointSvg size={14} />
+                    </button>
+
+                    <div className="flex items-center gap-1.5 text-[11.5px] tracking-tight whitespace-nowrap">
+                      {renderBatteryRing(14, 2)}
+                      <span className="text-white/75 font-medium">{headerDateStr}</span>
+                      <span className="text-white font-bold tabular-nums">{timeStr}</span>
+                    </div>
+
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSettingsOpen((s) => !s);
+                      }}
+                      title="Settings"
+                      className={`transition ${
+                        settingsOpen ? 'text-white' : 'text-white/65 hover:text-white'
+                      }`}
+                    >
+                      <GearSettingsSvg size={14} />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Side Left / Right Carousel Chevron Buttons (.nav-btn — Smoothly fades & scales in Lyrics/Settings mode) ── */}
+              <button
+                onClick={goPrevPage}
+                className={`absolute left-[10px] top-[48%] -translate-y-1/2 z-30 w-[21px] h-[21px] rounded-full bg-[#3a3a3c] hover:bg-[#48484a] flex items-center justify-center cursor-pointer transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-90 ${
+                  (activePage === 'music' && lyricsMode) || settingsOpen
+                    ? 'opacity-0 scale-75 -translate-x-2 blur-[2px] pointer-events-none'
+                    : 'opacity-100 scale-100 translate-x-0 blur-0 pointer-events-auto'
+                }`}
+                title="Previous Slide"
+                aria-label="Previous Slide"
+              >
+                <svg
+                  width={12}
+                  height={12}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#dcdce0"
+                  strokeWidth={2.4}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="15 18 9 12 15 6" />
+                </svg>
+              </button>
+              <button
+                onClick={goNextPage}
+                className={`absolute right-[10px] top-[48%] -translate-y-1/2 z-30 w-[21px] h-[21px] rounded-full bg-[#3a3a3c] hover:bg-[#48484a] flex items-center justify-center cursor-pointer transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-90 ${
+                  (activePage === 'music' && lyricsMode) || settingsOpen
+                    ? 'opacity-0 scale-75 translate-x-2 blur-[2px] pointer-events-none'
+                    : 'opacity-100 scale-100 translate-x-0 blur-0 pointer-events-auto'
+                }`}
+                title="Next Slide"
+                aria-label="Next Slide"
+              >
+                <svg
+                  width={12}
+                  height={12}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#dcdce0"
+                  strokeWidth={2.4}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </button>
+
+              {/* ── Quick Settings Overlay (Alt+Q Mode Selector + FLAC Lossless + Smart Mood Shuffle + Done) ── */}
+              {settingsOpen ? (
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  className="flex-1 flex flex-col justify-center gap-2.5 px-8 py-2 animate-[isleFadeIn_180ms_ease-out]"
+                >
+                  <div className="flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-3 py-2">
+                    <div className="flex flex-col">
+                      <span className="text-[11px] font-semibold text-white tracking-tight">
+                        Shortcut Alt + Q
+                      </span>
+                      <span className="text-[9.5px] text-white/45">
+                        Mode default saat membuka Isle Assistant
+                      </span>
+                    </div>
+                    <div className="flex items-center bg-black/60 border border-white/10 rounded-[4px] p-0.5 text-[10px]">
+                      <button
+                        onClick={() => setDefaultAltQMode('conversation')}
+                        className={`px-3 py-1 rounded-[3px] font-medium transition cursor-pointer ${
+                          defaultAltQMode === 'conversation'
+                            ? 'bg-white text-black'
+                            : 'text-white/60 hover:text-white'
+                        }`}
+                      >
+                        Type
+                      </button>
+                      <button
+                        onClick={() => setDefaultAltQMode('voice-pill')}
+                        className={`px-3 py-1 rounded-[3px] font-medium transition cursor-pointer ${
+                          defaultAltQMode === 'voice-pill'
+                            ? 'bg-white text-black'
+                            : 'text-white/60 hover:text-white'
+                        }`}
+                      >
+                        Voice
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Audio & Playback Options (FLAC Lossless + Smart Mood Shuffle + Done) */}
+                  <div className="flex items-center justify-between gap-2">
+                    <div
+                      onClick={() => {
+                        const nextFlac = !flacEnabled;
+                        setFlacEnabled(nextFlac);
+                        setActiveTrack((prev) => (prev ? { ...prev, isFlac: nextFlac } : prev));
+                      }}
+                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-3 py-2 cursor-pointer transition select-none"
+                    >
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-semibold text-white text-[10.5px]">FLAC Lossless</span>
+                          <span className="text-[7.5px] font-mono tracking-wider text-white/50 border border-white/10 px-1 py-0.2 rounded-[2px]">
+                            HI-RES
+                          </span>
+                        </div>
+                        <span className="text-[9px] text-white/40">Studio Audio</span>
+                      </div>
+                      <div
+                        className={`w-7 h-3.5 rounded-[3px] p-0.5 transition shrink-0 border ${
+                          flacEnabled ? 'bg-white border-white' : 'bg-black/50 border-white/20'
+                        }`}
+                      >
+                        <div
+                          className={`w-2.5 h-2.5 rounded-[2px] transition-transform ${
+                            flacEnabled ? 'translate-x-3.5 bg-black' : 'translate-x-0 bg-white/40'
+                          }`}
+                        />
+                      </div>
+                    </div>
+
+                    <div
+                      onClick={() => setMoodShuffleEnabled((prev) => !prev)}
+                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-3 py-2 cursor-pointer transition select-none"
+                    >
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-semibold text-white text-[10.5px]">Mood Shuffle</span>
+                          <span className="text-[7.5px] font-mono tracking-wider text-white/50 border border-white/10 px-1 py-0.2 rounded-[2px]">
+                            AUTO
+                          </span>
+                        </div>
+                        <span className="text-[9px] text-white/40">Mix Sesuai Mood</span>
+                      </div>
+                      <div
+                        className={`w-7 h-3.5 rounded-[3px] p-0.5 transition shrink-0 border ${
+                          moodShuffleEnabled ? 'bg-white border-white' : 'bg-black/50 border-white/20'
+                        }`}
+                      >
+                        <div
+                          className={`w-2.5 h-2.5 rounded-[2px] transition-transform ${
+                            moodShuffleEnabled ? 'translate-x-3.5 bg-black' : 'translate-x-0 bg-white/40'
+                          }`}
+                        />
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => setSettingsOpen(false)}
+                      className="px-4 py-2 rounded-md bg-white text-black hover:bg-neutral-200 text-[10.5px] font-semibold shrink-0 transition cursor-pointer"
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                /* ── Dual-Layer Simultaneous Carousel Viewport (Outgoing + Incoming Pages Slide Together with Motion Blur) ── */
+                <div className="relative flex-1 overflow-hidden">
+                  {/* Outgoing Page Layer (Animates out over 360ms when switching pages) */}
+                  {prevPageIndex !== null && prevPageIndex !== pageIndex && (
+                    <div
+                      key={`out-${prevPageIndex}-${slideTick}`}
+                      style={{
+                        animation:
+                          slideDir === 'right'
+                            ? 'islePageOutLeft 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards'
+                            : 'islePageOutRight 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
+                      }}
+                      className="absolute inset-0 flex flex-col justify-center pointer-events-none"
+                    >
+                      {renderPageContent(ISLAND_PAGES[prevPageIndex].id)}
+                    </div>
+                  )}
+
+                  {/* Incoming / Active Page Layer (Unified key without lyricsMode so Music <-> Lyrics morphs in place!) */}
+                  <div
+                    key={`in-${pageIndex}-${slideTick}`}
+                    style={
+                      prevPageIndex !== null
+                        ? {
+                            animation:
+                              slideDir === 'right'
+                                ? 'islePageInRight 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards'
+                                : 'islePageInLeft 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
+                          }
+                        : undefined
+                    }
+                    className="relative w-full h-full flex flex-col justify-center"
+                  >
+                    {renderPageContent(activePage)}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Bottom Page Indicator Dots (Rendered inline inside Music Player on Music tab) ── */}
+              {activePage !== 'music' && !settingsOpen && (
+                <div
+                  className="w-full flex items-center justify-center gap-[5px] pb-[10px] z-20 shrink-0"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {ISLAND_PAGES.map((p, idx) => {
+                    const isActive = idx === pageIndex;
+                    return (
+                      <button
+                        key={p.id}
+                        onClick={(e) => selectTabPage(idx, e)}
+                        className={`h-[4px] transition-all duration-300 ${
+                          isActive
+                            ? 'w-[17px] bg-white rounded-[3px]'
+                            : 'w-[4px] bg-[#555558] rounded-full hover:bg-white/60'
+                        }`}
+                        title={p.label}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </IslandSurface>
+      </div>
+
+      {/* Hidden Real HTML5 Audio Player (Supports Both Local MP3/WAV Files & Direct FLAC/HTTP Audio Streams) */}
+      <audio
+        ref={audioElRef}
+        onTimeUpdate={(e) => {
+          if (!activeTrack?.audioUrl) return;
+          const el = e.currentTarget;
+          setPositionMs(Math.floor(el.currentTime * 1000));
+        }}
+        onLoadedMetadata={(e) => {
+          if (!activeTrack?.audioUrl) return;
+          const el = e.currentTarget;
+          if (Number.isFinite(el.duration) && el.duration > 0) {
+            const durMs = Math.floor(el.duration * 1000);
+            setActiveTrack((prev) => (prev ? { ...prev, durationMs: durMs } : prev));
+          }
+        }}
+        onEnded={() => {
+          if (!activeTrack?.audioUrl || activeTrack?.sourceType === 'external') return;
+          if (Date.now() - lastPlayedSongTimeRef.current < 5000) return;
+          handleTrackEndedRef.current();
+        }}
+        className="hidden"
+      />
+      {/* Offscreen YouTube Iframe Audio Player (Only rendered for Internal AI Player tracks, never for External OS Media) */}
+      {activeTrack?.youtubeVideoId && activeTrack?.sourceType !== 'external' && (
+        <iframe
+          ref={ytIframeRef}
+          key={activeTrack.youtubeVideoId}
+          src={`https://www.youtube.com/embed/${activeTrack.youtubeVideoId}?enablejsapi=1&autoplay=1&playsinline=1&origin=${encodeURIComponent(typeof window !== 'undefined' ? window.location.origin : '')}`}
+          className="fixed -top-[9999px] -left-[9999px] w-[2px] h-[2px] opacity-0 pointer-events-none"
+          allow="autoplay; encrypted-media"
+          title="YouTube Full Audio Stream"
+          onLoad={(e) => {
+            try {
+              const cw = e.currentTarget.contentWindow;
+              if (cw) {
+                cw.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), '*');
+                cw.postMessage(
+                  JSON.stringify({
+                    event: 'command',
+                    func: 'addEventListener',
+                    args: ['onStateChange'],
+                  }),
+                  '*'
+                );
+                cw.postMessage(
+                  JSON.stringify({ event: 'command', func: 'playVideo', args: '' }),
+                  '*'
+                );
+                cw.postMessage(
+                  JSON.stringify({ event: 'command', func: muted ? 'mute' : 'unMute', args: '' }),
+                  '*'
+                );
+                cw.postMessage(
+                  JSON.stringify({
+                    event: 'command',
+                    func: 'setVolume',
+                    args: [muted ? 0 : volume],
+                  }),
+                  '*'
+                );
+              }
+            } catch {
+              // ignore
+            }
+          }}
+        />
+      )}
+      <input
+        ref={audioFileInputRef}
+        type="file"
+        accept="audio/*"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) handleLocalAudioFile(f);
+          e.target.value = '';
+        }}
+        className="hidden"
+      />
+    </div>
+  );
+}

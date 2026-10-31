@@ -1,0 +1,72 @@
+name: Build & Release WinIsleSetup
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Versi Release Tag (contoh: v1.1.0)'
+        required: false
+        default: 'v1.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build Web App & Server
+        run: |
+          npm run build
+          npm run build:server
+
+      - name: Build WinIsleSetup.exe via Electron Builder
+        run: npx electron-builder --win nsis --x64 --publish never
+
+      - name: Package WinIsleSetup.zip
+        run: node scripts/package-release-zip.mjs
+
+      - name: Upload Artifacts to Workflow Run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinIsleSetup-Package
+          path: |
+            release/*.zip
+            release/*.exe
+          if-no-files-found: warn
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag_name || 'v1.1.0' }}
+          name: WinIsle ${{ github.ref_name || inputs.tag_name || 'v1.1.0' }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          body: |
+            ## WinIsle Dynamic Island for Windows v1.1.0
+            Unduh **`WinIsleSetup.exe`** atau **`WinIsleSetup.zip`** di bawah ini untuk menginstal Dynamic Island terbaru di Windows (teroptimasi RAM ~40MB & bebas bilah putih).
+          files: |
+            release/*.zip
+            release/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

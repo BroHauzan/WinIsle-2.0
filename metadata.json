@@ -1,0 +1,10 @@
+{
+  "name": "Isle — GNOME Notch Island",
+  "description": "WinIsle — Standalone frameless Dynamic Island desktop application for Windows with synced lyrics, calls, Pomodoro focus timer, reminders, clipboard & file shelf, calendar, system alerts, and voice assistant.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
