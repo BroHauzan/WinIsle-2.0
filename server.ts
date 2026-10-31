@@ -1074,25 +1074,28 @@ async function searchRiMusicYouTubeTrack(
 ): Promise<{ videoId: string; title: string; sec: number; coverUrl?: string } | null> {
   try {
     const res = await withTimeout(
-      fetch('https://music.youtube.com/youtubei/v1/search', {
+      fetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'X-YouTube-Client-Name': '67',
-          'X-YouTube-Client-Version': '1.20231106.01.00',
+          'X-YouTube-Client-Version': '1.20240717.01.00',
           Origin: 'https://music.youtube.com',
+          Referer: 'https://music.youtube.com/',
         },
         body: JSON.stringify({
           context: {
-            client: { clientName: 'WEB_REMIX', clientVersion: '1.20231106.01.00', hl: 'en', gl: 'US' },
+            client: { clientName: 'WEB_REMIX', clientVersion: '1.20240717.01.00', hl: 'en', gl: 'ID' },
           },
           query,
+          // sigma67/ytmusicapi official filter="songs" param: returns pure full-length studio songs
+          params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
         }),
       }),
       4500,
-      'rimusic-ytmusic-search'
+      'ytmusicapi-songs-search'
     );
 
     if (!res.ok) return null;
@@ -1185,6 +1188,7 @@ async function searchRiMusicYouTubeTrack(
         const subText = subRuns.map((x: any) => String(x?.text || '')).join(' ');
         const durRun = subRuns.find((x: any) => /^\d+:\d+(:\d+)?$/.test(String(x?.text || '').trim()));
         const secVal = durRun ? parseLengthTextToSeconds(durRun.text) : 0;
+        const cover = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url;
         const videoId =
           r.playlistItemData?.videoId ||
           r?.navigationEndpoint?.watchEndpoint?.videoId ||
@@ -1194,7 +1198,7 @@ async function searchRiMusicYouTubeTrack(
         if (videoId && (secVal >= 90 || secVal === 0)) {
           const base = isSongsShelf ? 130 : isVideosShelf ? 60 : 100;
           const score = scoreCandidate(title, subText, secVal, base);
-          candidates.push({ videoId, title, sec: secVal, score });
+          candidates.push({ videoId, title, sec: secVal, score, coverUrl: cover });
         }
       }
     }
@@ -1290,12 +1294,12 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
   let title = cleanQ;
   let artist = '';
   let coverUrl = '';
-  let audioUrl = ''; // Only populated if optional lossless FLAC direct stream is enabled & resolved
+  let audioUrl = ''; // Strictly reserved for full-length lossless FLAC or local blob; NEVER 30s iTunes preview!
   let isFlac = false;
   let durationMs = 210000; // default to 3.5m full song duration
   let youtubeVideoId = '';
 
-  // 1. Fetch iTunes metadata (limit=10 so we can filter out Live / Concert / Extended / Karaoke editions and pick the true Studio Track)
+  // 1. Fetch iTunes metadata (ONLY for accurate studio title, artist, 600x600 album art, and full studio durationMs)
   try {
     const itRes = await withTimeout(
       fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&media=music&entity=song&limit=10`),
@@ -1327,6 +1331,7 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
           if (typeof best.trackTimeMillis === 'number' && best.trackTimeMillis > 45000) {
             durationMs = best.trackTimeMillis;
           }
+          // NEVER assign best.previewUrl to audioUrl because previewUrl is only a 30-second snippet!
         }
       }
     }
@@ -1347,9 +1352,9 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
     }
   }
 
-  // 2. Search Official Studio Audio via RiMusic InnerTube (fast4x/RiMusic) with strict studio & duration validation
+  // 2. Search Official Studio Song via sigma67/ytmusicapi (WEB_REMIX filter="songs")
   let matchedYtDurationSec = 0;
-  const riTrack = await searchRiMusicYouTubeTrack(`${title} ${artist} Official Audio`.trim(), targetSec);
+  const riTrack = await searchRiMusicYouTubeTrack(`${title} ${artist}`.trim(), targetSec);
   if (riTrack && riTrack.videoId) {
     youtubeVideoId = riTrack.videoId;
     matchedYtDurationSec = riTrack.sec;
@@ -2693,9 +2698,9 @@ Valid action_name values:
 Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'}, nowPlaying=${sanitizeText(currentState.trackTitle, 80) || 'Idle'}, queueLength=${Number(currentState.queueCount) || 0}, moodShuffle=${currentState.moodShuffleEnabled ? 'ON' : 'OFF'}, volume=${Number(currentState.volume) || 36}%, brightness=${Number(currentState.brightness) ?? 7}/10, battery=${Number(currentState.batteryLevel) || 82}%, bluetooth=${currentState.bluetoothEnabled !== false ? 'ON' : 'OFF'}, pomodoro=${sanitizeText(currentState.pomoRemaining, 10) || '25:00'} (${currentState.pomoRunning ? 'running' : 'paused'}), shelfFiles=${Number(currentState.shelfCount) || 0}.`;
 
   let response: any = null;
-  const requestedModel = (req.body?.model as string)?.trim() || 'gemini-3.1-flash-lite';
+  const requestedModel = (req.body?.model as string)?.trim() || 'agnes-3.0-flash';
   const isThinkingModel = requestedModel === 'muse-spark-1.3-contributor';
-  let usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite';
+  let usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : (requestedModel === 'agnes-2.5-flash' ? 'agnes-2.5-flash' : 'agnes-3.0-flash');
   let lastError: any = null;
 
   const bynaraKey =
@@ -2706,6 +2711,13 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
     /\/+$/,
     ''
   );
+
+  const AGNES_BASE_URL = (process.env.AGNES_BASE_URL || 'https://apihub.agnes-ai.com/v1').replace(
+    /\/+$/,
+    ''
+  );
+  const AGNES_API_KEY =
+    (process.env.AGNES_API_KEY || 'sk-MqH1SO7S1v9a34UPe4iWtE3r088xPK2h8KLCp738tsbmGucj').trim();
 
   // Wait for live web search snippets so model also receives fresh web context
   const liveWeb = await liveWebPromise;
@@ -2795,64 +2807,73 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
       lastError = err;
     }
   } else {
-    // ROUTE 2: Fast Mode (`gemini-3.1-flash-lite`) via official Google GenAI SDK (@google/genai)
-    const aiClients = getGeminiClients(clientKey);
-    const geminiModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const;
+    // ROUTE 2: Fast Mode (`agnes-3.0-flash` / `agnes-2.5-flash`) via Agnes AI API Hub
+    const agnesModels =
+      requestedModel === 'agnes-2.5-flash'
+        ? ['agnes-2.5-flash', 'agnes-3.0-flash']
+        : ['agnes-3.0-flash', 'agnes-2.5-flash'];
 
-    outerFastStepA: for (const client of aiClients) {
-      for (const modelName of geminiModels) {
-        try {
-          const baseText = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}`;
-          response = await withTimeout(
-            client.models.generateContent({
-              model: modelName,
-              contents: buildContentsPayload(baseText),
-              config: imageBase64
-                ? {
-                    systemInstruction: systemPrompt,
-                    thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-                  }
-                : {
-                    systemInstruction: systemPrompt,
-                    tools: [{ googleSearch: {} }],
-                    thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-                  },
-            }),
-            imageBase64 ? 12000 : 9000,
-            `${modelName}-primary`
-          );
-          usedModel = modelName;
-          break outerFastStepA;
-        } catch (err: any) {
-          lastError = err;
-        }
-      }
+    const agnesMessages: Array<{ role: string; content: any }> = [
+      { role: 'system', content: systemPrompt },
+    ];
+    for (const m of rawHistory.slice(-6)) {
+      const text = sanitizeText(m?.text, 300);
+      if (!text || text.includes('Maaf, gagal memproses respon AI')) continue;
+      agnesMessages.push({
+        role: m?.role === 'assistant' ? 'assistant' : 'user',
+        content: text,
+      });
+    }
+    if (imageBase64) {
+      agnesMessages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: `${prompt}${webContextBlock}` },
+          { type: 'image_url', image_url: { url: `data:${imageMimeType};base64,${imageBase64}` } },
+        ],
+      });
+    } else {
+      agnesMessages.push({
+        role: 'user',
+        content: `${prompt}${webContextBlock}`,
+      });
     }
 
-    // Fallback without googleSearch tool if grounded call hit tool constraint
-    if (!response) {
-      outerFastStepB: for (const client of aiClients) {
-        for (const modelName of geminiModels) {
-          try {
-            const fallbackText = `${historyLines ? `Recent Conversation:\n${historyLines}\n\n` : ''}User: ${prompt}${webContextBlock}`;
-            response = await withTimeout(
-              client.models.generateContent({
-                model: modelName,
-                contents: buildContentsPayload(fallbackText),
-                config: {
-                  systemInstruction: systemPrompt,
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-                },
-              }),
-              10000,
-              `${modelName}-grounded`
-            );
-            usedModel = modelName;
-            break outerFastStepB;
-          } catch (err: any) {
-            lastError = err;
+    for (const agnesModel of agnesModels) {
+      if (response) break;
+      try {
+        const agnesRes = await withTimeout(
+          fetch(`${AGNES_BASE_URL}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${AGNES_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: agnesModel,
+              messages: agnesMessages,
+              temperature: 0.6,
+              max_tokens: 700,
+            }),
+          }),
+          9000,
+          `agnes-${agnesModel}`
+        );
+
+        if (agnesRes.ok) {
+          const agnesData: any = await agnesRes.json();
+          const content = String(agnesData?.choices?.[0]?.message?.content || '').trim();
+          if (content) {
+            response = { text: content, candidates: [] };
+            usedModel = agnesModel;
+            break;
           }
+        } else {
+          const errBody = await agnesRes.text().catch(() => '');
+          lastError = new Error(`Agnes HTTP ${agnesRes.status}: ${errBody.slice(0, 160)}`);
         }
+      } catch (err: any) {
+        lastError = err;
       }
     }
   }
@@ -2868,7 +2889,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
         }]`,
         candidates: [],
       };
-      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite';
+      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'agnes-3.0-flash';
     } else if (liveWeb.snippets.length > 0) {
       const cleanSummary = liveWeb.snippets
         .slice(0, 2)
@@ -2878,20 +2899,16 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
         text: cleanSummary,
         candidates: [],
       };
-      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite';
+      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'agnes-3.0-flash';
     } else {
       console.error('Model request failed:', usedModel, lastError?.message || lastError);
-      const isAuthErr = String(lastError?.message || '').includes('401') || String(lastError?.message || '').includes('API key');
-      const errDetail = isAuthErr
-        ? 'Periksa API Key Google AI Studio Anda di Settings > Secrets atau masukkan Gemini API Key di menu Settings Isle.'
-        : lastError?.message || 'Koneksi sedang sibuk';
       return res.status(200).json({
         error: `Gagal merespons dari ${usedModel}.`,
         reply: isThinkingModel
           ? `Maaf, Muse Spark sedang tidak dapat merespons (${lastError?.message || 'Koneksi sibuk'}). Silakan coba lagi.`
-          : `Maaf, koneksi ke Gemini 3.1 Flash Lite terkendala (${errDetail}). Silakan coba lagi atau gunakan perintah langsung.`,
+          : `Maaf, koneksi ke Agnes 3.0 Flash terkendala (${lastError?.message || 'Koneksi sibuk'}). Silakan coba lagi atau gunakan perintah langsung.`,
         action: 'none',
-        needApiKey: isAuthErr,
+        needApiKey: false,
       });
     }
   }

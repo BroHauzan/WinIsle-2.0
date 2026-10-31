@@ -9,14 +9,15 @@ export const DEFAULT_BYNARA_BASE_URL =
   (import.meta.env.VITE_AI_BASE_URL as string)?.trim() || 'https://router.bynara.id/v1';
 
 export const DEFAULT_GEMINI_MODEL =
-  (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'gemini-3.1-flash-lite';
+  (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'agnes-3.0-flash';
 
 export const DEFAULT_BYNARA_KEY =
   (import.meta.env.VITE_BYNARA_API_KEY as string)?.trim() ||
   'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
 
 export const SUPPORTED_GEMINI_MODELS = [
-  'gemini-3.1-flash-lite',
+  'agnes-3.0-flash',
+  'agnes-2.5-flash',
   'muse-spark-1.3-contributor',
 ];
 
@@ -123,9 +124,9 @@ export async function askGeminiAssistant(
 
   const candidateModels = [
     params.model?.trim() || DEFAULT_GEMINI_MODEL,
-    'stepfun-3.7-flash',
+    'agnes-3.0-flash',
+    'agnes-2.5-flash',
     'muse-spark-1.3-contributor',
-    'laguna-s-2.1',
   ];
   const models = Array.from(new Set(candidateModels.filter(Boolean)));
   let lastError = '';

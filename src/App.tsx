@@ -566,16 +566,16 @@ export default function App() {
   const [hasServerKey, setHasServerKey] = useState(true);
   const [serverMaskedKey, setServerMaskedKey] = useState<string>('sk-nry••••ByRY');
 
-  // AI Model Selection: 'gemini-3.1-flash-lite' (Fast / Kilat via Google AI Studio) vs 'muse-spark-1.3-contributor' (Thinking / Mendalam via Bynara)
+  // AI Model Selection: 'agnes-3.0-flash' (Fast / Kilat via Agnes AI) vs 'muse-spark-1.3-contributor' (Thinking / Mendalam via Bynara)
   const [assistantModel, setAssistantModel] = useState<string>(() => {
     try {
       const saved = window.localStorage.getItem('isle_ai_model');
-      if (saved === 'gemini-3.1-flash-lite' || saved === 'muse-spark-1.3-contributor') return saved;
-      if (saved === 'stepfun-3.7-flash') return 'gemini-3.1-flash-lite';
+      if (saved === 'agnes-3.0-flash' || saved === 'agnes-2.5-flash' || saved === 'muse-spark-1.3-contributor') return saved;
+      if (saved === 'gemini-3.1-flash-lite' || saved === 'stepfun-3.7-flash') return 'agnes-3.0-flash';
     } catch {
       // ignore
     }
-    return 'gemini-3.1-flash-lite';
+    return 'agnes-3.0-flash';
   });
 
   useEffect(() => {
@@ -1404,9 +1404,9 @@ export default function App() {
     return () => window.removeEventListener('message', handleYtMessage);
   }, []);
 
-  // Ensure YouTube IFrame JS API handshake succeeds so real-time currentTime & state events always stream
+  // Ensure YouTube IFrame JS API handshake & autoplay succeed so full song audio always streams with sound
   useEffect(() => {
-    if (!activeTrack?.youtubeVideoId) return;
+    if (!activeTrack?.youtubeVideoId || activeTrack?.audioUrl) return;
     ytListeningAckRef.current = false;
     ytPlayerStateRef.current = -1;
 
@@ -1423,6 +1423,24 @@ export default function App() {
           }),
           '*'
         );
+        if (ytPlayerStateRef.current !== 1 && ytPlayerStateRef.current !== 2) {
+          cw.postMessage(
+            JSON.stringify({ event: 'command', func: 'playVideo', args: '' }),
+            '*'
+          );
+          cw.postMessage(
+            JSON.stringify({ event: 'command', func: muted ? 'mute' : 'unMute', args: '' }),
+            '*'
+          );
+          cw.postMessage(
+            JSON.stringify({
+              event: 'command',
+              func: 'setVolume',
+              args: [muted ? 0 : volume],
+            }),
+            '*'
+          );
+        }
       } catch {
         // ignore
       }
@@ -1430,13 +1448,13 @@ export default function App() {
 
     sendHandshake();
     const id = window.setInterval(() => {
-      if (!ytListeningAckRef.current) {
+      if (!ytListeningAckRef.current || (ytPlayerStateRef.current !== 1 && ytPlayerStateRef.current !== 2)) {
         sendHandshake();
       }
-    }, 400);
+    }, 450);
 
     return () => window.clearInterval(id);
-  }, [activeTrack?.youtubeVideoId]);
+  }, [activeTrack?.youtubeVideoId, activeTrack?.audioUrl, muted, volume]);
 
   // Sync YouTube IFrame volume & mute state
   useEffect(() => {
@@ -1459,6 +1477,13 @@ export default function App() {
       // ignore
     }
   }, [volume, muted, activeTrack?.youtubeVideoId]);
+
+  // Sync HTML5 audio element volume & mute state
+  useEffect(() => {
+    if (audioElRef.current) {
+      audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0, volume / 100));
+    }
+  }, [volume, muted]);
 
   // Send media transport, shuffle, or seek command to External App (Spotify, YouTube Music, or Windows GSMTC OS Media Session)
   const sendExternalMediaCommand = useCallback(
@@ -1527,11 +1552,21 @@ export default function App() {
       externalApp?: string;
     }) => {
       const isExternal = trackInfo.sourceType === 'external';
-      const isLocalBlob = Boolean(trackInfo.audioUrl && trackInfo.audioUrl.startsWith('blob:'));
-      const isDirectFlacStream = Boolean(
-        !isExternal && trackInfo.isFlac && trackInfo.audioUrl && trackInfo.audioUrl.startsWith('http')
-      );
-      const useHtmlAudio = !isExternal && (isLocalBlob || isDirectFlacStream);
+      const rawAudioUrl = (trackInfo.audioUrl || '').trim();
+      // Never use 30-second iTunes preview snippets; only use HTML5 audio for local files or full-length lossless FLAC streams
+      const isShortPreview =
+        rawAudioUrl.includes('itunes.apple.com') ||
+        rawAudioUrl.includes('AudioPreview') ||
+        rawAudioUrl.includes('.p.m4a');
+      const effectiveAudioUrl = isShortPreview ? '' : rawAudioUrl;
+      const useHtmlAudio =
+        !isExternal &&
+        Boolean(
+          effectiveAudioUrl &&
+            (effectiveAudioUrl.startsWith('http:') ||
+              effectiveAudioUrl.startsWith('https:') ||
+              effectiveAudioUrl.startsWith('blob:'))
+        );
       const safeDurationMs =
         typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 40000
           ? trackInfo.durationMs
@@ -1541,10 +1576,10 @@ export default function App() {
         title: trackInfo.title || 'Media',
         artist: trackInfo.artist || '',
         coverUrl: trackInfo.coverUrl || '',
-        audioUrl: useHtmlAudio ? trackInfo.audioUrl : '',
+        audioUrl: useHtmlAudio ? effectiveAudioUrl : '',
         isFlac: Boolean(trackInfo.isFlac || flacEnabled),
         durationMs: safeDurationMs,
-        youtubeVideoId: isExternal || isLocalBlob ? undefined : trackInfo.youtubeVideoId,
+        youtubeVideoId: isExternal || effectiveAudioUrl.startsWith('blob:') ? undefined : trackInfo.youtubeVideoId,
         youtubeMusicUrl: trackInfo.youtubeMusicUrl,
         spotifyUrl: trackInfo.spotifyUrl,
         lrc: trackInfo.lrc || '',
@@ -1576,7 +1611,7 @@ export default function App() {
             .play()
             .then(() => setIsPlaying(true))
             .catch(() => {
-              // If direct FLAC stream fails CORS/codec, fall back seamlessly to YouTube Full Audio
+              // If direct stream fails CORS/codec, fall back seamlessly to YouTube Full Audio
               setActiveTrack((prev) => (prev ? { ...prev, audioUrl: '' } : prev));
               setIsPlaying(true);
             });
@@ -7438,22 +7473,24 @@ export default function App() {
                       <button
                         onClick={() =>
                           setAssistantModel((m) =>
-                            m === 'gemini-3.1-flash-lite' ? 'muse-spark-1.3-contributor' : 'gemini-3.1-flash-lite'
+                            m === 'agnes-3.0-flash' || m === 'agnes-2.5-flash'
+                              ? 'muse-spark-1.3-contributor'
+                              : 'agnes-3.0-flash'
                           )
                         }
                         className={`px-1.5 py-0.5 rounded-full text-[9px] font-semibold transition flex items-center gap-1 ${
-                          assistantModel === 'gemini-3.1-flash-lite'
+                          assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
                             ? 'bg-amber-400/20 text-amber-300 border border-amber-400/35'
                             : 'bg-purple-500/20 text-purple-300 border border-purple-400/35'
                         }`}
-                        title="Klik untuk ganti model AI: Fast (Gemini 3.1 Flash Lite) / Thinking (Muse Spark 1.3)"
+                        title="Klik untuk ganti model AI: Fast (Agnes 3.0 Flash) / Thinking (Muse Spark 1.3)"
                       >
-                        {assistantModel === 'gemini-3.1-flash-lite' ? (
+                        {assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash' ? (
                           <FastLightningSvg size={10} />
                         ) : (
                           <ThinkingBrainSvg size={10} />
                         )}
-                        <span>{assistantModel === 'gemini-3.1-flash-lite' ? 'Fast' : 'Thinking'}</span>
+                        <span>{assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash' ? 'Fast' : 'Thinking'}</span>
                       </button>
                       <button
                         onClick={() => {
@@ -7556,16 +7593,16 @@ export default function App() {
                     </div>
 
                     <div className="flex items-center gap-1 shrink-0">
-                      {/* Model Selector Pill: Fast (gemini-3.1-flash-lite) vs Thinking (muse-spark-1.3-contributor) */}
+                      {/* Model Selector Pill: Fast (agnes-3.0-flash) vs Thinking (muse-spark-1.3-contributor) */}
                       <div className="flex items-center bg-white/[0.08] hover:bg-white/[0.12] border border-white/10 rounded-full p-0.5 text-[9px] transition mr-0.5">
                         <button
-                          onClick={() => setAssistantModel('gemini-3.1-flash-lite')}
+                          onClick={() => setAssistantModel('agnes-3.0-flash')}
                           className={`flex items-center gap-1 px-2 py-0.5 rounded-full transition ${
-                            assistantModel === 'gemini-3.1-flash-lite'
+                            assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
                               ? 'bg-amber-400 text-black font-bold shadow-xs'
                               : 'text-white/60 hover:text-white font-medium'
                           }`}
-                          title="Mode Cepat: Gemini 3.1 Flash Lite (Respon Kilat via Google AI Studio)"
+                          title="Mode Cepat: Agnes 3.0 Flash (Respon Kilat via Agnes AI)"
                         >
                           <FastLightningSvg size={10} />
                           <span>Fast</span>
@@ -7655,8 +7692,8 @@ export default function App() {
                         <GeminiThinkingIndicator
                           label={
                             agentHeadline ||
-                            (assistantModel === 'gemini-3.1-flash-lite'
-                              ? 'Gemini 3.1 Flash Lite thinking...'
+                            (assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
+                              ? 'Agnes 3.0 Flash memproses...'
                               : 'Muse Spark Thinking...')
                           }
                         />
@@ -8466,7 +8503,8 @@ export default function App() {
         onLoadedMetadata={(e) => {
           if (!activeTrack?.audioUrl) return;
           const el = e.currentTarget;
-          if (Number.isFinite(el.duration) && el.duration > 0) {
+          // Only update duration if it is a full-length song (> 60s), never overwrite with a 30s snippet
+          if (Number.isFinite(el.duration) && el.duration > 60) {
             const durMs = Math.floor(el.duration * 1000);
             setActiveTrack((prev) => (prev ? { ...prev, durationMs: durMs } : prev));
           }
@@ -8478,14 +8516,23 @@ export default function App() {
         }}
         className="hidden"
       />
-      {/* Offscreen YouTube Iframe Audio Player (Only rendered for Internal AI Player tracks, never for External OS Media) */}
-      {activeTrack?.youtubeVideoId && activeTrack?.sourceType !== 'external' && (
+      {/* Full-Song YouTube Music Iframe Audio Player (Powered by sigma67/ytmusicapi filter="songs" videoId) */}
+      {!activeTrack?.audioUrl && activeTrack?.youtubeVideoId && activeTrack?.sourceType !== 'external' && (
         <iframe
           ref={ytIframeRef}
           key={activeTrack.youtubeVideoId}
-          src={`https://www.youtube.com/embed/${activeTrack.youtubeVideoId}?enablejsapi=1&autoplay=1&playsinline=1&origin=${encodeURIComponent(typeof window !== 'undefined' ? window.location.origin : '')}`}
-          className="fixed -top-[9999px] -left-[9999px] w-[2px] h-[2px] opacity-0 pointer-events-none"
-          allow="autoplay; encrypted-media"
+          src={`https://www.youtube.com/embed/${activeTrack.youtubeVideoId}?enablejsapi=1&autoplay=1&playsinline=1&controls=0&rel=0&origin=${encodeURIComponent(typeof window !== 'undefined' ? window.location.origin : '')}`}
+          style={{
+            position: 'fixed',
+            bottom: '4px',
+            right: '4px',
+            width: '240px',
+            height: '135px',
+            opacity: 0.002,
+            pointerEvents: 'none',
+            zIndex: -10,
+          }}
+          allow="autoplay *; encrypted-media *; fullscreen"
           title="YouTube Full Audio Stream"
           onLoad={(e) => {
             try {
