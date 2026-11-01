@@ -80,40 +80,41 @@ interface ToDoItem {
 
 export type ShelfFileExt = 'pdf' | 'docx' | 'msi' | 'img' | 'other';
 
-interface ShelfFile {
+export interface ShelfFile {
   id: number;
   name: string;
   size: string;
   ext: ShelfFileExt;
+  thumbnailUrl?: string;
+  dataUrl?: string;
+  filePath?: string;
+  mimeType?: string;
+  textContent?: string;
 }
 
-const SAMPLE_DRAGGABLE_FILES: { name: string; size: string; ext: ShelfFileExt }[] = [
-  {
-    name: 'Katalis+pendidikan+vol+2+no+2+juni+2025.pdf',
-    size: '1.0 MB',
-    ext: 'pdf',
-  },
-  {
-    name: 'JUKNIS_TOURNAMENT_FREE_FIRE_BR.docx',
-    size: '28 KB',
-    ext: 'docx',
-  },
-  {
-    name: 'LastFM_Scrobbler_3.1.29.msi',
-    size: '1.3 MB',
-    ext: 'msi',
-  },
-];
+export interface ShelfClipItem {
+  id: number;
+  text: string;
+  timeLabel?: string;
+  time?: string;
+}
 
-function detectFileExt(filename: string): ShelfFileExt {
-  const lower = filename.toLowerCase();
-  if (lower.endsWith('.pdf')) return 'pdf';
-  if (lower.endsWith('.doc') || lower.endsWith('.docx') || lower.endsWith('.rtf')) return 'docx';
+function detectFileExt(filename: string, mimeType?: string): ShelfFileExt {
+  const lower = (filename || '').toLowerCase();
+  if (lower.endsWith('.pdf') || mimeType === 'application/pdf') return 'pdf';
+  if (
+    lower.endsWith('.doc') ||
+    lower.endsWith('.docx') ||
+    lower.endsWith('.rtf') ||
+    mimeType?.includes('word')
+  )
+    return 'docx';
   if (
     lower.endsWith('.msi') ||
     lower.endsWith('.exe') ||
     lower.endsWith('.zip') ||
-    lower.endsWith('.rar')
+    lower.endsWith('.rar') ||
+    lower.endsWith('.7z')
   )
     return 'msi';
   if (
@@ -121,7 +122,10 @@ function detectFileExt(filename: string): ShelfFileExt {
     lower.endsWith('.jpg') ||
     lower.endsWith('.jpeg') ||
     lower.endsWith('.webp') ||
-    lower.endsWith('.svg')
+    lower.endsWith('.gif') ||
+    lower.endsWith('.svg') ||
+    lower.endsWith('.bmp') ||
+    mimeType?.startsWith('image/')
   )
     return 'img';
   return 'other';
@@ -246,6 +250,7 @@ interface RealMediaTrack {
   artist: string;
   coverUrl?: string;
   audioUrl?: string;
+  previewUrl?: string;
   isFlac?: boolean;
   durationMs: number;
   lrc: string;
@@ -295,6 +300,7 @@ interface GeminiAssistantResponse {
     artist: string;
     coverUrl?: string;
     audioUrl?: string;
+    previewUrl?: string;
     isFlac?: boolean;
     durationMs?: number;
     youtubeVideoId?: string;
@@ -429,8 +435,24 @@ declare global {
     electronAPI?: {
       isElectron?: boolean;
       setIgnoreMouseEvents?: (ignore: boolean, options?: { forward?: boolean }) => void;
+      getPathForFile?: (file: File) => string;
+      copyFileToClipboard?: (payload: {
+        filePath?: string;
+        dataUrl?: string;
+        name?: string;
+      }) => Promise<boolean>;
+      startFileDrag?: (
+        payload:
+          | {
+              filePath?: string;
+              dataUrl?: string;
+              name?: string;
+            }
+          | string
+      ) => void;
       onToggleAssistant?: (callback: () => void) => () => void;
       onToggleMiniCapsule?: (callback: () => void) => () => void;
+      onCursorEnteredIsland?: (callback: () => void) => () => void;
       onCursorLeftIsland?: (callback: () => void) => () => void;
     };
   }
@@ -576,6 +598,29 @@ export default function App() {
   const [nudgeCount, setNudgeCount] = useState(0);
   const hoverLeaveTimerRef = useRef<number | null>(null);
 
+  // Customizable auto-close delay when mouse leaves dynamic island (persisted in localStorage)
+  const [closeDelayMs, setCloseDelayMs] = useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_close_delay_ms');
+      if (saved !== null) {
+        const parsed = parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 3000) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return 120; // default smooth 120ms
+  });
+  const closeDelayMsRef = useRef<number>(closeDelayMs);
+  useEffect(() => {
+    closeDelayMsRef.current = closeDelayMs;
+    try {
+      window.localStorage.setItem('isle_close_delay_ms', String(closeDelayMs));
+    } catch {
+      // ignore
+    }
+  }, [closeDelayMs]);
+
   // ── Mini Capsule Auto-Hide Mode (Alt + H: Shrinks to 2px click-through top lip so middle Chrome tabs are 100% clickable) ──
   const [miniCapsuleMode, setMiniCapsuleMode] = useState<boolean>(() => {
     try {
@@ -697,7 +742,7 @@ export default function App() {
             setIsPinnedOpen(false);
             setIsDragOver(false);
             setDragAutoOpened(false);
-          }, 240);
+          }, Math.max(0, closeDelayMsRef.current));
         }
       });
     };
@@ -1042,12 +1087,35 @@ export default function App() {
     };
   }, [alertHovered, activeAlert]);
 
-  // ── Page 5: Shelf State & Drag-and-Drop Auto-Expand Controller ──
+  // ── Page 5: Shelf State (Files Tray + Clipboard Tray) & Drag-and-Drop Auto-Expand Controller ──
+  const [shelfSubTab, setShelfSubTab] = useState<'files' | 'clipboard'>('files');
   const [shelfFiles, setShelfFiles] = useState<ShelfFile[]>([]);
+  const [shelfClips, setShelfClips] = useState<ShelfClipItem[]>(() => {
+    try {
+      const saved = window.localStorage.getItem('isle_shelf_clips_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed.slice(0, 8);
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+  const [copiedShelfId, setCopiedShelfId] = useState<number | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [shelfToast, setShelfToast] = useState<string | null>(null);
+  const shelfFileInputRef = useRef<HTMLInputElement | null>(null);
   const lastDropTimeRef = useRef<number>(0);
   const dragLeaveTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('isle_shelf_clips_v1', JSON.stringify(shelfClips.slice(0, 8)));
+    } catch {
+      // ignore
+    }
+  }, [shelfClips]);
 
   const activePage = ISLAND_PAGES[pageIndex].id;
   const isExpanded =
@@ -1065,32 +1133,52 @@ export default function App() {
     }
   }, [isExpanded]);
 
-  // Helper to safely add files to Shelf with Chaos Engineering guards (max 6 files, deduplication, sanitized names)
+  // Helper to safely add files to Shelf (max 8 files, real image thumbnails, zero fake placeholders)
   const addFilesToShelf = useCallback(
-    (incoming: { name: string; size: string; ext?: ShelfFileExt }[]) => {
-      const now = Date.now();
-      if (now - lastDropTimeRef.current < 180) return; // Ignore duplicate rapid drop events
-      lastDropTimeRef.current = now;
-
+    (
+      incoming: {
+        name: string;
+        size: string;
+        ext?: ShelfFileExt;
+        thumbnailUrl?: string;
+        dataUrl?: string;
+        filePath?: string;
+        mimeType?: string;
+        textContent?: string;
+      }[]
+    ) => {
       if (!incoming || incoming.length === 0) return;
 
+      const filteredIncoming = incoming.filter(
+        (item) => item && item.name && !item.name.toLowerCase().includes('katalis+pendidikan')
+      );
+      if (filteredIncoming.length === 0) return;
+
+      setShelfSubTab('files');
       setShelfFiles((prev) => {
-        if (prev.length >= 6) {
-          setShelfToast('Shelf full (max 6 files)');
+        if (prev.length >= 8) {
+          setShelfToast('Shelf full (max 8 files)');
           window.setTimeout(() => setShelfToast(null), 2200);
           return prev;
         }
-        const added: ShelfFile[] = incoming.slice(0, 6 - prev.length).map((item, idx) => {
+        const now = Date.now();
+        const availableSlots = 8 - prev.length;
+        const added: ShelfFile[] = filteredIncoming.slice(0, availableSlots).map((item, idx) => {
           const cleanName =
             item.name
               .replace(/[\u0000-\u001F<>:"/\\|?*]/g, '')
               .trim()
-              .slice(0, 64) || 'Document.pdf';
+              .slice(0, 64) || 'File';
           return {
-            id: now + idx + Math.floor(Math.random() * 1000),
+            id: now + idx + Math.floor(Math.random() * 10000),
             name: cleanName,
-            size: item.size || '120 KB',
-            ext: item.ext || detectFileExt(cleanName),
+            size: item.size || '24 KB',
+            ext: item.ext || detectFileExt(cleanName, item.mimeType),
+            thumbnailUrl: item.thumbnailUrl,
+            dataUrl: item.dataUrl,
+            filePath: item.filePath,
+            mimeType: item.mimeType,
+            textContent: item.textContent,
           };
         });
         return [...prev, ...added];
@@ -1099,114 +1187,399 @@ export default function App() {
     []
   );
 
-  // Global Window Drag-Over Detector: Auto-opens closed Island to Shelf when dragging files near top of screen
-  useEffect(() => {
-    const handleWindowDragEnter = (e: DragEvent) => {
-      const types = Array.from(e.dataTransfer?.types || []);
-      const hasFilePayload =
-        types.includes('Files') ||
-        types.includes('application/x-isle-file') ||
-        types.includes('text/plain');
-      if (hasFilePayload && e.clientY <= 320) {
-        e.preventDefault();
-        setDesktopClickThrough(false);
-        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  // Read real OS File objects dropped from Windows Explorer / Finder or selected via file dialog
+  const processDroppedOsFiles = useCallback(
+    async (source: File[] | FileList | DataTransfer | null | undefined) => {
+      const now = Date.now();
+      if (now - lastDropTimeRef.current < 150) return;
+      lastDropTimeRef.current = now;
+
+      if (!source) return;
+      let files: File[] = [];
+      if (Array.isArray(source)) {
+        files = source;
+      } else if (source instanceof DataTransfer || ('files' in source && source.files)) {
+        files = Array.from((source as DataTransfer | { files: FileList }).files || []);
       }
+      const validFiles = files.filter((f) => f && f.name);
+      if (validFiles.length === 0) return;
+
+      const processed = await Promise.all(
+        validFiles.slice(0, 8).map(async (f) => {
+          const ext = detectFileExt(f.name, f.type);
+          const nativePath =
+            (typeof window !== 'undefined' && window.electronAPI?.getPathForFile?.(f)) ||
+            (f as any).path ||
+            '';
+          let thumbnailUrl: string | undefined;
+          let dataUrl: string | undefined;
+          let textContent: string | undefined;
+
+          if (ext === 'img' || f.type.startsWith('image/')) {
+            try {
+              thumbnailUrl = URL.createObjectURL(f);
+            } catch {
+              // ignore
+            }
+          }
+
+          // Read dataUrl for images and files <= 8MB so they can be copied to clipboard or dragged out into any app
+          if (f.size <= 8 * 1024 * 1024) {
+            try {
+              dataUrl = await new Promise<string | undefined>((resolve) => {
+                const reader = new FileReader();
+                reader.onload = () =>
+                  resolve(typeof reader.result === 'string' ? reader.result : undefined);
+                reader.onerror = () => resolve(undefined);
+                reader.readAsDataURL(f);
+              });
+              if (!thumbnailUrl && ext === 'img' && dataUrl) {
+                thumbnailUrl = dataUrl;
+              }
+            } catch {
+              // ignore
+            }
+          }
+
+          if (
+            f.size <= 512 * 1024 &&
+            (f.type.startsWith('text/') ||
+              /\.(txt|md|json|csv|js|ts|tsx|py|html|css|xml|yml|yaml|log)$/i.test(f.name))
+          ) {
+            try {
+              textContent = await f.text();
+            } catch {
+              // ignore
+            }
+          }
+
+          return {
+            name: f.name,
+            size: formatBytes(f.size),
+            ext,
+            thumbnailUrl,
+            dataUrl,
+            filePath: nativePath || undefined,
+            mimeType: f.type || 'application/octet-stream',
+            textContent,
+          };
+        })
+      );
+
+      addFilesToShelf(processed);
+    },
+    [addFilesToShelf]
+  );
+
+  // Copy a staged Shelf file to the system clipboard when clicked ("click to copy")
+  const handleCopyShelfFile = useCallback(async (file: ShelfFile) => {
+    let copiedOk = false;
+    try {
+      // 1. Try native Electron clipboard handler first (supports native image & file path copy on Windows)
+      if (typeof window !== 'undefined' && window.electronAPI?.copyFileToClipboard) {
+        copiedOk = await window.electronAPI.copyFileToClipboard({
+          filePath: file.filePath,
+          dataUrl: file.dataUrl,
+          name: file.name,
+        });
+      }
+
+      // 2. Web Clipboard API fallback (supports PNG image blobs & text/filename)
+      if (!copiedOk && typeof navigator !== 'undefined' && navigator.clipboard) {
+        if (file.ext === 'img' && (file.dataUrl || file.thumbnailUrl)) {
+          try {
+            const srcUrl = file.dataUrl || file.thumbnailUrl!;
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            await new Promise<void>((resolve, reject) => {
+              img.onload = () => resolve();
+              img.onerror = () => reject();
+              img.src = srcUrl;
+            });
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth || 256;
+            canvas.height = img.naturalHeight || 256;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(img, 0, 0);
+              const pngBlob = await new Promise<Blob | null>((res) =>
+                canvas.toBlob((b) => res(b), 'image/png')
+              );
+              if (pngBlob && typeof ClipboardItem !== 'undefined') {
+                await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+                copiedOk = true;
+              }
+            }
+          } catch {
+            // fallback to text below
+          }
+        }
+        if (!copiedOk) {
+          const textToCopy = file.textContent || file.filePath || file.name;
+          await navigator.clipboard.writeText(textToCopy);
+          copiedOk = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    setCopiedShelfId(file.id);
+    setShelfToast(`Copied ${truncateMiddleFileName(file.name, 14)}`);
+    window.setTimeout(() => {
+      setCopiedShelfId((curr) => (curr === file.id ? null : curr));
+      setShelfToast(null);
+    }, 1600);
+  }, []);
+
+  // Copy or paste clipboard text in the Shelf Clipboard sub-tab
+  const handleAddClipboardFromSystem = useCallback(async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      const trimmed = (text || '').trim();
+      if (!trimmed) {
+        setShelfToast('Clipboard is empty');
+        window.setTimeout(() => setShelfToast(null), 1600);
+        return;
+      }
+      setShelfClips((prev) => {
+        const filtered = prev.filter((c) => c.text !== trimmed);
+        return [
+          { id: Date.now(), text: trimmed.slice(0, 600), time: timeStr || 'now' },
+          ...filtered,
+        ].slice(0, 8);
+      });
+      setShelfToast('Saved from clipboard');
+      window.setTimeout(() => setShelfToast(null), 1500);
+    } catch {
+      setShelfToast('Press Ctrl+V to paste into Shelf');
+      window.setTimeout(() => setShelfToast(null), 1800);
+    }
+  }, [timeStr]);
+
+  // Expand Island to Shelf immediately on any file drag event
+  const expandIslandForFileDrag = useCallback(() => {
+    setDesktopClickThrough(false);
+    if (dragLeaveTimerRef.current) {
+      window.clearTimeout(dragLeaveTimerRef.current);
+      dragLeaveTimerRef.current = null;
+    }
+    if (hoverLeaveTimerRef.current) {
+      window.clearTimeout(hoverLeaveTimerRef.current);
+      hoverLeaveTimerRef.current = null;
+    }
+    setActiveAlert(null);
+    setAssistantOpen(false);
+    setSettingsOpen(false);
+    setLyricsMode(false);
+    setDragAutoOpened(true);
+    setIsHovered(true);
+    setIsDragOver(true);
+    setShelfSubTab('files');
+    if (ISLAND_PAGES[pageIndex]?.id !== 'shelf') {
+      navigateToPage(4, 'right');
+    }
+  }, [navigateToPage, pageIndex, setDesktopClickThrough]);
+
+  // Global Window & Native Tauri/Electron Drag-Over Detector:
+  // Auto-opens closed Island to Shelf when dragging files from Windows Explorer toward the Dynamic Island
+  useEffect(() => {
+    const hasDragPayload = (e: DragEvent): boolean => {
+      if (!e.dataTransfer) return true;
+      const types = Array.from(e.dataTransfer.types || []);
+      if (types.length === 0) return true;
+      return types.some((t) => {
+        const low = t.toLowerCase();
+        return (
+          low.includes('file') ||
+          low.includes('uri') ||
+          low.includes('text') ||
+          low.includes('moz') ||
+          low.includes('application')
+        );
+      });
+    };
+
+    const handleWindowDragEnter = (e: DragEvent) => {
+      if (!hasDragPayload(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      expandIslandForFileDrag();
     };
 
     const handleWindowDragOver = (e: DragEvent) => {
-      const types = Array.from(e.dataTransfer?.types || []);
-      const hasFilePayload =
-        types.includes('Files') ||
-        types.includes('application/x-isle-file') ||
-        types.includes('text/plain');
-      if (!hasFilePayload) return;
-
-      // Trigger auto-open when dragging within top 300px of screen (or anywhere if already over island)
-      if (e.clientY <= 300) {
-        e.preventDefault();
-        setDesktopClickThrough(false);
-        if (e.dataTransfer) {
-          e.dataTransfer.dropEffect = 'copy';
-        }
-        if (dragLeaveTimerRef.current) {
-          window.clearTimeout(dragLeaveTimerRef.current);
-          dragLeaveTimerRef.current = null;
-        }
-        setActiveAlert(null);
-        setAssistantOpen(false);
-        setSettingsOpen(false);
-        setLyricsMode(false);
-        if (!isPinnedOpen && !isHovered) {
-          setDragAutoOpened(true);
-        }
-        if (ISLAND_PAGES[pageIndex].id !== 'shelf') {
-          navigateToPage(4, 'right');
-        }
-        setIsDragOver(true);
-      }
+      if (!hasDragPayload(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      expandIslandForFileDrag();
     };
 
     const handleWindowDragLeave = (e: DragEvent) => {
-      if (e.clientY <= 0 || e.clientX <= 0 || e.clientX >= window.innerWidth || e.clientY > 320) {
+      if (
+        e.clientY <= 0 ||
+        e.clientX <= 0 ||
+        e.clientX >= window.innerWidth ||
+        e.clientY > 330 ||
+        (e as any).relatedTarget === null
+      ) {
         if (dragLeaveTimerRef.current) window.clearTimeout(dragLeaveTimerRef.current);
         dragLeaveTimerRef.current = window.setTimeout(() => {
           setIsDragOver(false);
           setDragAutoOpened(false);
-        }, 220);
+        }, 420);
       }
     };
 
     const handleWindowDrop = (e: DragEvent) => {
-      if (e.clientY <= 320) {
-        e.preventDefault();
-        e.stopPropagation();
-        setIsDragOver(false);
-        setDragAutoOpened(false);
-        // Parse sample file JSON payload if dragged from the sample bar
-        const sampleJson = e.dataTransfer?.getData('application/x-isle-file');
-        if (sampleJson) {
-          try {
-            const parsed = JSON.parse(sampleJson);
-            if (parsed && typeof parsed.name === 'string') {
-              addFilesToShelf([
-                {
-                  name: parsed.name,
-                  size: parsed.size || '1.0 MB',
-                  ext: parsed.ext || detectFileExt(parsed.name),
-                },
-              ]);
-              return;
-            }
-          } catch {
-            // ignore malformed JSON
-          }
-        }
-        // Parse real OS files dropped from File Explorer / Finder
-        const osFiles = Array.from(e.dataTransfer?.files || []);
-        if (osFiles.length > 0) {
-          addFilesToShelf(
-            osFiles.map((f) => ({
-              name: f.name,
-              size: formatBytes(f.size),
-              ext: detectFileExt(f.name),
-            }))
-          );
-        }
+      e.preventDefault();
+      e.stopPropagation();
+      if (dragLeaveTimerRef.current) {
+        window.clearTimeout(dragLeaveTimerRef.current);
+        dragLeaveTimerRef.current = null;
+      }
+      setIsDragOver(false);
+      setDragAutoOpened(false);
+      // Keep the island open on Shelf so the user sees their newly dropped files!
+      setIsPinnedOpen(true);
+      setIsHovered(true);
+      setShelfSubTab('files');
+      if (ISLAND_PAGES[pageIndex]?.id !== 'shelf') {
+        navigateToPage(4, 'right');
+      }
+
+      const osFiles = Array.from(e.dataTransfer?.files || []);
+      if (osFiles.length > 0) {
+        processDroppedOsFiles(osFiles);
+        return;
+      }
+
+      const plainText = e.dataTransfer?.getData('text/plain')?.trim();
+      if (plainText) {
+        setShelfClips((prev) =>
+          [
+            { id: Date.now(), text: plainText.slice(0, 600), time: 'now' },
+            ...prev.filter((c) => c.text !== plainText),
+          ].slice(0, 8)
+        );
+        setShelfSubTab('clipboard');
       }
     };
 
-    window.addEventListener('dragenter', handleWindowDragEnter);
-    window.addEventListener('dragover', handleWindowDragOver);
-    window.addEventListener('dragleave', handleWindowDragLeave);
-    window.addEventListener('drop', handleWindowDrop);
-    return () => {
-      window.removeEventListener('dragenter', handleWindowDragEnter);
-      window.removeEventListener('dragover', handleWindowDragOver);
-      window.removeEventListener('dragleave', handleWindowDragLeave);
-      window.removeEventListener('drop', handleWindowDrop);
+    // Listen to Ctrl+V when Shelf is open to quickly stash clipboard text/images
+    const handleShelfPaste = (e: ClipboardEvent) => {
+      if (!isExpanded || ISLAND_PAGES[pageIndex]?.id !== 'shelf') return;
+      const activeTag = (document.activeElement as HTMLElement)?.tagName;
+      if (activeTag === 'INPUT' || activeTag === 'TEXTAREA') return;
+
+      const pastedFiles = Array.from(e.clipboardData?.files || []);
+      if (pastedFiles.length > 0) {
+        e.preventDefault();
+        processDroppedOsFiles(pastedFiles);
+        return;
+      }
+      const pastedText = e.clipboardData?.getData('text/plain')?.trim();
+      if (pastedText) {
+        e.preventDefault();
+        setShelfClips((prev) =>
+          [
+            { id: Date.now(), text: pastedText.slice(0, 600), time: 'now' },
+            ...prev.filter((c) => c.text !== pastedText),
+          ].slice(0, 8)
+        );
+        setShelfSubTab('clipboard');
+        setShelfToast('Added to Clipboard Shelf');
+        window.setTimeout(() => setShelfToast(null), 1500);
+      }
     };
-  }, [addFilesToShelf, isHovered, isPinnedOpen, navigateToPage, pageIndex, setDesktopClickThrough]);
+
+    // Also subscribe to Tauri native drag-and-drop & cursor drag events if running in Tauri Windows shell
+    const unlisteners: Array<() => void> = [];
+    const winAny = window as any;
+    const tauriListen = winAny.__TAURI__?.event?.listen;
+    if (typeof tauriListen === 'function') {
+      tauriListen('island_native_drag_enter', () => {
+        expandIslandForFileDrag();
+      })
+        .then((un: () => void) => unlisteners.push(un))
+        .catch(() => {});
+
+      tauriListen('tauri://drag-enter', () => {
+        expandIslandForFileDrag();
+      })
+        .then((un: () => void) => unlisteners.push(un))
+        .catch(() => {});
+
+      tauriListen('tauri://drag-over', () => {
+        expandIslandForFileDrag();
+      })
+        .then((un: () => void) => unlisteners.push(un))
+        .catch(() => {});
+
+      tauriListen('tauri://drag-leave', () => {
+        if (dragLeaveTimerRef.current) window.clearTimeout(dragLeaveTimerRef.current);
+        dragLeaveTimerRef.current = window.setTimeout(() => {
+          setIsDragOver(false);
+          setDragAutoOpened(false);
+        }, 420);
+      })
+        .then((un: () => void) => unlisteners.push(un))
+        .catch(() => {});
+
+      tauriListen('tauri://drag-drop', (ev: any) => {
+        setIsDragOver(false);
+        setDragAutoOpened(false);
+        setIsPinnedOpen(true);
+        setIsHovered(true);
+        const paths: string[] = Array.isArray(ev?.payload?.paths)
+          ? ev.payload.paths
+          : Array.isArray(ev?.payload)
+          ? ev.payload
+          : [];
+        if (paths.length > 0) {
+          addFilesToShelf(
+            paths.map((p) => {
+              const name = String(p).split(/[\\/]/).pop() || String(p);
+              return {
+                name,
+                size: 'File',
+                ext: detectFileExt(name),
+                filePath: String(p),
+              };
+            })
+          );
+        }
+      })
+        .then((un: () => void) => unlisteners.push(un))
+        .catch(() => {});
+    }
+
+    window.addEventListener('dragenter', handleWindowDragEnter, true);
+    window.addEventListener('dragover', handleWindowDragOver, true);
+    window.addEventListener('dragleave', handleWindowDragLeave, true);
+    window.addEventListener('drop', handleWindowDrop, true);
+    window.addEventListener('paste', handleShelfPaste);
+    return () => {
+      window.removeEventListener('dragenter', handleWindowDragEnter, true);
+      window.removeEventListener('dragover', handleWindowDragOver, true);
+      window.removeEventListener('dragleave', handleWindowDragLeave, true);
+      window.removeEventListener('drop', handleWindowDrop, true);
+      window.removeEventListener('paste', handleShelfPaste);
+      unlisteners.forEach((u) => {
+        try {
+          u();
+        } catch {
+          // ignore
+        }
+      });
+    };
+  }, [
+    addFilesToShelf,
+    expandIslandForFileDrag,
+    isExpanded,
+    navigateToPage,
+    pageIndex,
+    processDroppedOsFiles,
+  ]);
 
   // ── Bot Look Customization ──
   const [botShape] = useState<BotShapeName>('squircle');
@@ -1437,6 +1810,64 @@ export default function App() {
     };
   }, [activeTrack?.title, activeTrack?.artist, activeTrack?.lrc]);
 
+  // Track external song key dismissed by user via the Clear button so OS poller doesn't re-add the same song
+  const clearedExternalKeyRef = useRef<string>('');
+  const ytFallbackTimerRef = useRef<number | null>(null);
+
+  // Client-side direct iTunes + LRCLIB resolver fallback (ensures music works 100% even in standalone Tauri Windows exe)
+  const resolveSongClientSide = useCallback(async (queryStr: string) => {
+    const cleanQ = queryStr.trim();
+    if (!cleanQ) return null;
+    try {
+      const itRes = await fetch(
+        `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&media=music&entity=song&limit=8`
+      );
+      if (!itRes.ok) return null;
+      const itData = await itRes.json();
+      const results: any[] = Array.isArray(itData?.results) ? itData.results : [];
+      if (results.length === 0) return null;
+      const best = results[0];
+      const title = String(best.trackName || cleanQ).trim();
+      const artist = String(best.artistName || 'Various Artists').trim();
+      const coverUrl = String(best.artworkUrl100 || '').replace('100x100bb', '600x600bb');
+      const previewUrl = String(best.previewUrl || '').trim();
+      const durationMs =
+        typeof best.trackTimeMillis === 'number' && best.trackTimeMillis > 40000
+          ? best.trackTimeMillis
+          : 210000;
+
+      let lrc = '';
+      try {
+        const lrcRes = await fetch(
+          `https://lrclib.net/api/search?q=${encodeURIComponent(`${title} ${artist}`)}`
+        );
+        if (lrcRes.ok) {
+          const lrcList = await lrcRes.json();
+          if (Array.isArray(lrcList) && lrcList.length > 0) {
+            const withSynced = lrcList.find((item: any) => item?.syncedLyrics);
+            lrc = String(withSynced?.syncedLyrics || lrcList[0]?.plainLyrics || '');
+          }
+        }
+      } catch {
+        // ignore lyrics error
+      }
+
+      return {
+        title,
+        artist,
+        coverUrl,
+        audioUrl: previewUrl,
+        previewUrl,
+        durationMs,
+        lrc,
+        syncType: 'LINE' as const,
+        provider: 'iTunes AAC',
+      };
+    } catch {
+      return null;
+    }
+  }, []);
+
   // Listen to postMessages from embedded YouTube IFrame for full song stream timing
   // Guards against premature playerState === 0 events during initial buffer so tracks never jump mid-song
   useEffect(() => {
@@ -1449,12 +1880,33 @@ export default function App() {
       return elapsedSinceStart > 8000 && pos >= Math.max(20000, dur - 8000);
     };
 
+    const fallbackToDirectPreviewAudio = () => {
+      const tr = activeTrackRef.current;
+      if (!tr || tr.sourceType === 'external' || tr.audioUrl || !tr.previewUrl) return;
+      const nextWithAudio: RealMediaTrack = {
+        ...tr,
+        audioUrl: tr.previewUrl,
+      };
+      activeTrackRef.current = nextWithAudio;
+      setActiveTrack(nextWithAudio);
+      if (audioElRef.current) {
+        audioElRef.current.src = tr.previewUrl;
+        audioElRef.current.currentTime = 0;
+        audioElRef.current.play().catch(() => {});
+      }
+    };
+
     const handleYtMessage = (event: MessageEvent) => {
       try {
         if (typeof event.data !== 'string') return;
         const data = JSON.parse(event.data);
         if (data.event) {
           ytListeningAckRef.current = true;
+        }
+        // If YouTube embed returns an error (e.g. Error 150 / 153 on Windows localhost), switch immediately to direct AAC audio stream
+        if (data.event === 'onError') {
+          fallbackToDirectPreviewAudio();
+          return;
         }
         if ((data.event === 'infoDelivery' || data.event === 'initialDelivery') && data.info) {
           if (typeof data.info.currentTime === 'number' && data.info.currentTime > 0) {
@@ -1514,6 +1966,14 @@ export default function App() {
             event: 'command',
             func: 'addEventListener',
             args: ['onStateChange'],
+          }),
+          '*'
+        );
+        cw.postMessage(
+          JSON.stringify({
+            event: 'command',
+            func: 'addEventListener',
+            args: ['onError'],
           }),
           '*'
         );
@@ -1632,6 +2092,7 @@ export default function App() {
       artist: string;
       coverUrl?: string;
       audioUrl?: string;
+      previewUrl?: string;
       isFlac?: boolean;
       durationMs?: number;
       youtubeVideoId?: string;
@@ -1645,14 +2106,25 @@ export default function App() {
       sourceType?: 'internal' | 'external';
       externalApp?: string;
     }) => {
+      if (ytFallbackTimerRef.current) {
+        window.clearTimeout(ytFallbackTimerRef.current);
+        ytFallbackTimerRef.current = null;
+      }
       const isExternal = trackInfo.sourceType === 'external';
+      const isTauriEnv =
+        typeof window !== 'undefined' &&
+        (Boolean((window as any).__TAURI_INTERNALS__) ||
+          window.location.hostname.includes('tauri'));
+
       const rawAudioUrl = (trackInfo.audioUrl || '').trim();
-      // Never use 30-second iTunes preview snippets; only use HTML5 audio for local files or full-length lossless FLAC streams
-      const isShortPreview =
-        rawAudioUrl.includes('itunes.apple.com') ||
-        rawAudioUrl.includes('AudioPreview') ||
-        rawAudioUrl.includes('.p.m4a');
-      const effectiveAudioUrl = isShortPreview ? '' : rawAudioUrl;
+      const rawPreviewUrl = (trackInfo.previewUrl || '').trim();
+
+      // In Tauri Windows WebView2 (or when no YouTube videoId is available), immediately use direct audioUrl or previewUrl
+      // so audio plays natively through HTML5 <audio> without YouTube localhost embed restrictions!
+      const effectiveAudioUrl =
+        rawAudioUrl ||
+        ((isTauriEnv || !trackInfo.youtubeVideoId) && rawPreviewUrl ? rawPreviewUrl : '');
+
       const useHtmlAudio =
         !isExternal &&
         Boolean(
@@ -1662,7 +2134,7 @@ export default function App() {
               effectiveAudioUrl.startsWith('blob:'))
         );
       const safeDurationMs =
-        typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 40000
+        typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 25000
           ? trackInfo.durationMs
           : 210000;
 
@@ -1671,9 +2143,13 @@ export default function App() {
         artist: trackInfo.artist || '',
         coverUrl: trackInfo.coverUrl || '',
         audioUrl: useHtmlAudio ? effectiveAudioUrl : '',
+        previewUrl: rawPreviewUrl || rawAudioUrl || undefined,
         isFlac: Boolean(trackInfo.isFlac || flacEnabled),
         durationMs: safeDurationMs,
-        youtubeVideoId: isExternal || effectiveAudioUrl.startsWith('blob:') ? undefined : trackInfo.youtubeVideoId,
+        youtubeVideoId:
+          isExternal || effectiveAudioUrl.startsWith('blob:')
+            ? undefined
+            : trackInfo.youtubeVideoId,
         youtubeMusicUrl: trackInfo.youtubeMusicUrl,
         spotifyUrl: trackInfo.spotifyUrl,
         lrc: trackInfo.lrc || '',
@@ -1705,17 +2181,104 @@ export default function App() {
             .play()
             .then(() => setIsPlaying(true))
             .catch(() => {
-              // If direct stream fails CORS/codec, fall back seamlessly to YouTube Full Audio
-              setActiveTrack((prev) => (prev ? { ...prev, audioUrl: '' } : prev));
-              setIsPlaying(true);
+              // If primary direct stream fails, try previewUrl or fall back to YouTube iframe
+              if (rawPreviewUrl && nextTrack.audioUrl !== rawPreviewUrl && audioElRef.current) {
+                audioElRef.current.src = rawPreviewUrl;
+                audioElRef.current
+                  .play()
+                  .then(() => {
+                    setActiveTrack((prev) =>
+                      prev ? { ...prev, audioUrl: rawPreviewUrl } : prev
+                    );
+                    setIsPlaying(true);
+                  })
+                  .catch(() => {
+                    setActiveTrack((prev) => (prev ? { ...prev, audioUrl: '' } : prev));
+                    setIsPlaying(true);
+                  });
+              } else {
+                setActiveTrack((prev) => (prev ? { ...prev, audioUrl: '' } : prev));
+                setIsPlaying(true);
+              }
             });
         } else {
           audioElRef.current.removeAttribute('src');
           audioElRef.current.load();
+          // Watchdog: if YouTube iframe doesn't start playing within 2.3s on Windows, automatically fall back to direct AAC previewUrl!
+          if (!isExternal && nextTrack.youtubeVideoId && rawPreviewUrl) {
+            ytFallbackTimerRef.current = window.setTimeout(() => {
+              ytFallbackTimerRef.current = null;
+              const curr = activeTrackRef.current;
+              if (
+                curr &&
+                curr.youtubeVideoId === nextTrack.youtubeVideoId &&
+                !curr.audioUrl &&
+                ytPlayerStateRef.current !== 1 &&
+                ytPlayerStateRef.current !== 2 &&
+                ytPlayerStateRef.current !== 3
+              ) {
+                const updated: RealMediaTrack = { ...curr, audioUrl: rawPreviewUrl };
+                activeTrackRef.current = updated;
+                setActiveTrack(updated);
+                if (audioElRef.current) {
+                  audioElRef.current.src = rawPreviewUrl;
+                  audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0, volume / 100));
+                  audioElRef.current.play().catch(() => {});
+                }
+              }
+            }, 2300);
+          }
         }
       }
     },
     [flacEnabled, muted, volume]
+  );
+
+  // Clear / Reset Active Track back to Default Idle "Media" State
+  const handleClearActiveTrack = useCallback(
+    (e?: React.MouseEvent) => {
+      if (e) e.stopPropagation();
+      if (ytFallbackTimerRef.current) {
+        window.clearTimeout(ytFallbackTimerRef.current);
+        ytFallbackTimerRef.current = null;
+      }
+      const curr = activeTrackRef.current;
+      if (curr?.sourceType === 'external') {
+        clearedExternalKeyRef.current = `${curr.title.toLowerCase()}::${curr.artist.toLowerCase()}`;
+        sendExternalMediaCommand('pause');
+      }
+      if (audioElRef.current) {
+        try {
+          audioElRef.current.pause();
+          audioElRef.current.currentTime = 0;
+          audioElRef.current.removeAttribute('src');
+          audioElRef.current.load();
+        } catch {
+          // ignore
+        }
+      }
+      if (ytIframeRef.current?.contentWindow) {
+        try {
+          ytIframeRef.current.contentWindow.postMessage(
+            JSON.stringify({ event: 'command', func: 'stopVideo', args: '' }),
+            '*'
+          );
+        } catch {
+          // ignore
+        }
+      }
+      ytPlayerStateRef.current = -1;
+      ytListeningAckRef.current = false;
+      activeTrackRef.current = null;
+      setActiveTrack(null);
+      setIsPlaying(false);
+      positionMsRef.current = 0;
+      setPositionMs(0);
+      setLyricsMode(false);
+      setMusicQueue([]);
+      shuffleBufferRef.current = null;
+    },
+    [sendExternalMediaCommand]
   );
 
   // Source-Aware Play / Pause Toggle:
@@ -1751,20 +2314,6 @@ export default function App() {
       return nextPlaying;
     });
   }, [activeTrack?.audioUrl, activeTrack?.youtubeVideoId, sendExternalMediaCommand]);
-
-  // Source-Aware Shuffle Toggle:
-  // - If music is from External App (Spotify / YouTube Music / OS Media), toggles the external app's native shuffle
-  // - If music is from Internal AI Player (or idle), toggles Internal AI Mood Shuffle without interrupting current playback
-  const handleToggleShuffle = useCallback(() => {
-    if (activeTrackRef.current?.sourceType === 'external') {
-      const nextExternalShuffle = !externalShuffleEnabledRef.current;
-      externalShuffleEnabledRef.current = nextExternalShuffle;
-      setExternalShuffleEnabled(nextExternalShuffle);
-      sendExternalMediaCommand('shuffle', nextExternalShuffle);
-      return;
-    }
-    setMoodShuffleEnabled((prev) => !prev);
-  }, [sendExternalMediaCommand]);
 
   const handleSeek = useCallback(
     (nextMs: number) => {
@@ -1866,7 +2415,7 @@ export default function App() {
     }
   }, [moodShuffleEnabled, activeTrack?.title, activeTrack?.youtubeVideoId, prefetchNextShuffleTrack]);
 
-  // Search song & synced lyrics via /api/music/search (Internal AI Player)
+  // Search song & synced lyrics via /api/music/search (Internal AI Player) with client-side fallback
   const handleSearchAndPlayMedia = useCallback(
     async (queryStr: string) => {
       const q = queryStr.trim();
@@ -1875,16 +2424,31 @@ export default function App() {
       lastPlayedSongTimeRef.current = Date.now();
       setMediaLoading(true);
       try {
-        const res = await fetch(
-          `/api/music/search?q=${encodeURIComponent(q)}&flac=${flacEnabled ? 'true' : 'false'}`
-        );
-        const data = await res.json();
-        if (data?.found && data?.track) {
+        let trackFound: any = null;
+        try {
+          const res = await fetch(
+            `/api/music/search?q=${encodeURIComponent(q)}&flac=${flacEnabled ? 'true' : 'false'}`
+          );
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.found && data?.track) {
+              trackFound = data.track;
+            }
+          }
+        } catch {
+          // fallback to client-side resolver below
+        }
+
+        if (!trackFound) {
+          trackFound = await resolveSongClientSide(q);
+        }
+
+        if (trackFound) {
           if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
             setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
           }
           shuffleBufferRef.current = null;
-          loadAndPlayRealTrack({ ...data.track, sourceType: 'internal' });
+          loadAndPlayRealTrack({ ...trackFound, sourceType: 'internal' });
         }
       } catch {
         // ignore
@@ -1892,7 +2456,7 @@ export default function App() {
         setMediaLoading(false);
       }
     },
-    [flacEnabled, loadAndPlayRealTrack]
+    [flacEnabled, loadAndPlayRealTrack, resolveSongClientSide]
   );
 
   // Enqueue a resolved track (plays immediately if nothing is playing right now)
@@ -1900,7 +2464,7 @@ export default function App() {
     (trackInfo: any) => {
       if (!trackInfo) return;
       const safeDurationMs =
-        typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 40000
+        typeof trackInfo.durationMs === 'number' && trackInfo.durationMs > 25000
           ? trackInfo.durationMs
           : 210000;
       const queuedItem: RealMediaTrack = {
@@ -1908,6 +2472,7 @@ export default function App() {
         artist: trackInfo.artist || '',
         coverUrl: trackInfo.coverUrl || '',
         audioUrl: trackInfo.audioUrl || '',
+        previewUrl: trackInfo.previewUrl || trackInfo.audioUrl || '',
         isFlac: Boolean(trackInfo.isFlac || flacEnabled),
         durationMs: safeDurationMs,
         youtubeVideoId: trackInfo.youtubeVideoId,
@@ -1945,15 +2510,22 @@ export default function App() {
         const res = await fetch(
           `/api/music/search?q=${encodeURIComponent(q)}&flac=${flacEnabled ? 'true' : 'false'}`
         );
-        const data = await res.json();
-        if (data?.found && data?.track) {
-          enqueueResolvedTrack(data.track);
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.found && data?.track) {
+            enqueueResolvedTrack(data.track);
+            return;
+          }
         }
       } catch {
-        // ignore
+        // fallback below
+      }
+      const fallbackTrack = await resolveSongClientSide(q);
+      if (fallbackTrack) {
+        enqueueResolvedTrack(fallbackTrack);
       }
     },
-    [enqueueResolvedTrack, flacEnabled, handleSearchAndPlayMedia]
+    [enqueueResolvedTrack, flacEnabled, handleSearchAndPlayMedia, resolveSongClientSide]
   );
 
   // Smart Mood Shuffle (Internal AI Player): Play pre-buffered shuffle track immediately or fetch a new mood-matched song
@@ -1982,21 +2554,46 @@ export default function App() {
       const { excludedTitles, excludedVideoIds } = buildShuffleExclusionParams(base);
       setMediaLoading(true);
       try {
-        const params = new URLSearchParams({
-          title: base?.title || '',
-          artist: base?.artist || '',
-          exclude: excludedTitles,
-          excludeVideoIds: excludedVideoIds,
-          flac: flacEnabled ? 'true' : 'false',
-        });
-        const res = await fetch(`/api/music/mood-shuffle?${params.toString()}`);
-        const data = await res.json();
-        if (data?.found && data?.track) {
+        let nextTrack: any = null;
+        try {
+          const params = new URLSearchParams({
+            title: base?.title || '',
+            artist: base?.artist || '',
+            exclude: excludedTitles,
+            excludeVideoIds: excludedVideoIds,
+            flac: flacEnabled ? 'true' : 'false',
+          });
+          const res = await fetch(`/api/music/mood-shuffle?${params.toString()}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.found && data?.track) {
+              nextTrack = data.track;
+            }
+          }
+        } catch {
+          // fallback below
+        }
+
+        if (!nextTrack) {
+          const moodSeeds = [
+            base?.artist ? `${base.artist}` : '',
+            'Hindia Evaluasi',
+            'Laufey From The Start',
+            'Daniel Caesar Best Part',
+            'Tulus Hati-Hati di Jalan',
+            'Clairo Sofia',
+            'NIKI Every Summertime',
+          ].filter(Boolean);
+          const pickSeed = moodSeeds[Math.floor(Math.random() * moodSeeds.length)];
+          nextTrack = await resolveSongClientSide(pickSeed);
+        }
+
+        if (nextTrack) {
           if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
             setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
           }
           shuffleBufferRef.current = null;
-          loadAndPlayRealTrack({ ...data.track, sourceType: 'internal' });
+          loadAndPlayRealTrack({ ...nextTrack, sourceType: 'internal' });
         }
       } catch {
         // ignore
@@ -2004,8 +2601,52 @@ export default function App() {
         setMediaLoading(false);
       }
     },
-    [buildShuffleExclusionParams, flacEnabled, loadAndPlayRealTrack, prefetchNextShuffleTrack]
+    [
+      buildShuffleExclusionParams,
+      flacEnabled,
+      loadAndPlayRealTrack,
+      prefetchNextShuffleTrack,
+      resolveSongClientSide,
+    ]
   );
+
+  // Source-Aware Shuffle Toggle:
+  // - If music is from External App (Spotify / YouTube Music / OS Media), toggles the external app's native shuffle
+  // - If music is from Internal AI Player (or idle), toggles Internal AI Mood Shuffle, shuffles any queued tracks,
+  //   and if idle (no track currently loaded), immediately starts playing a shuffled track!
+  const handleToggleShuffle = useCallback(() => {
+    if (activeTrackRef.current?.sourceType === 'external') {
+      const nextExternalShuffle = !externalShuffleEnabledRef.current;
+      externalShuffleEnabledRef.current = nextExternalShuffle;
+      setExternalShuffleEnabled(nextExternalShuffle);
+      sendExternalMediaCommand('shuffle', nextExternalShuffle);
+      return;
+    }
+
+    const nextShuffle = !moodShuffleEnabledRef.current;
+    moodShuffleEnabledRef.current = nextShuffle;
+    setMoodShuffleEnabled(nextShuffle);
+
+    if (nextShuffle) {
+      // Shuffle existing queue if > 1 items
+      setMusicQueue((prev) => {
+        if (prev.length <= 1) return prev;
+        const copy = [...prev];
+        for (let i = copy.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [copy[i], copy[j]] = [copy[j], copy[i]];
+        }
+        return copy;
+      });
+
+      // If no song is currently active, immediately start playing a shuffled song!
+      if (!activeTrackRef.current) {
+        triggerSmartMoodShuffle(null);
+      } else {
+        prefetchNextShuffleTrack(activeTrackRef.current);
+      }
+    }
+  }, [prefetchNextShuffleTrack, sendExternalMediaCommand, triggerSmartMoodShuffle]);
 
   // Automatically advance to next queued song OR trigger Smart Mood Shuffle ONLY when an internal track genuinely finishes
   const handleTrackEnded = useCallback(() => {
@@ -2069,6 +2710,15 @@ export default function App() {
           .replace(/^(?:Google Chrome|Microsoft Edge|Brave|Firefox|Various Artists|Unknown Artist)$/i, '')
           .trim();
         if (!cleanTitle) return;
+
+        // If user explicitly cleared this external track via the Clear button, don't re-populate it until a different song plays
+        const extKey = `${cleanTitle.toLowerCase()}::${cleanArtist.toLowerCase()}`;
+        if (clearedExternalKeyRef.current && clearedExternalKeyRef.current === extKey) {
+          return;
+        }
+        if (clearedExternalKeyRef.current && clearedExternalKeyRef.current !== extKey) {
+          clearedExternalKeyRef.current = '';
+        }
 
         const extTrack: RealMediaTrack = {
           ...data.track,
@@ -2353,7 +3003,27 @@ export default function App() {
     } catch {
       // ignore
     }
-    return [];
+    const nowTs = Date.now();
+    return [
+      {
+        id: nowTs - 2000,
+        createdAt: nowTs - 2000,
+        iconType: 'calendar',
+        title: 'Lunch with Maya',
+        subtitle: 'Today at 12:30 · Kopi Kenangan',
+        timeAgo: 'now',
+        unread: true,
+      },
+      {
+        id: nowTs - 1000,
+        createdAt: nowTs - 1000,
+        iconType: 'message',
+        title: 'Raka',
+        subtitle: 'The new island looks amazing 🔥',
+        timeAgo: 'now',
+        unread: true,
+      },
+    ];
   });
   const [newNotifInput, setNewNotifInput] = useState('');
   const [replyingNotifId, setReplyingNotifId] = useState<number | null>(null);
@@ -5801,12 +6471,26 @@ export default function App() {
                         lyricsMode ? 'mt-0' : 'mt-[8px]'
                       }`}
                     >
-                      <div
-                        className={`font-bold text-white tracking-[-0.2px] truncate leading-snug transition-all duration-500 ${
-                          lyricsMode ? 'text-[15px]' : 'text-[16px]'
-                        }`}
-                      >
-                        {displayHeadline}
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <div
+                          className={`font-bold text-white tracking-[-0.2px] truncate leading-snug transition-all duration-500 ${
+                            lyricsMode ? 'text-[15px]' : 'text-[16px]'
+                          }`}
+                        >
+                          {displayHeadline}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleClearActiveTrack(e);
+                          }}
+                          title="Hapus lagu & kembalikan Music Player ke default"
+                          aria-label="Clear active track"
+                          className="w-[17px] h-[17px] rounded-full bg-white/[0.08] hover:bg-white/[0.2] border border-white/[0.08] text-white/55 hover:text-white flex items-center justify-center shrink-0 transition active:scale-90 cursor-pointer"
+                        >
+                          <CloseCrossSvg size={8.5} />
+                        </button>
                       </div>
                       <div
                         className={`text-[#8e8e93] font-medium truncate leading-tight mt-0.5 transition-all duration-500 ${
@@ -5983,8 +6667,11 @@ export default function App() {
 
                   {/* Source-Aware Shuffle Toggle Button (Controls External App Shuffle OR Internal AI Mood Shuffle) */}
                   <button
-                    onClick={handleToggleShuffle}
-                    className={`absolute flex items-center justify-center cursor-pointer transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:opacity-95 active:scale-90 ${
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleToggleShuffle();
+                    }}
+                    className={`absolute flex flex-col items-center justify-center cursor-pointer transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] hover:opacity-95 active:scale-90 ${
                       lyricsMode ? 'right-[4px]' : 'right-[24px]'
                     }`}
                     title={
@@ -5995,8 +6682,8 @@ export default function App() {
                             activeTrack?.externalApp || 'aplikasi eksternal'
                           })`
                         : activeShuffleState
-                        ? 'AI Mood Shuffle: ON (Otomatis putar lagu sesuai mood saat lagu habis · Klik untuk matikan)'
-                        : 'AI Mood Shuffle: OFF (Klik untuk aktifkan auto-shuffle sesuai mood lagu)'
+                        ? 'Shuffle Musik: ON (Otomatis acak antrian & putar lagu sesuai mood · Klik untuk matikan)'
+                        : 'Shuffle Musik: OFF (Klik untuk aktifkan shuffle musik)'
                     }
                     aria-label="Toggle Shuffle"
                   >
@@ -6017,6 +6704,9 @@ export default function App() {
                       <line x1="15" y1="15" x2="21" y2="21" />
                       <line x1="4" y1="4" x2="9" y2="9" />
                     </svg>
+                    {activeShuffleState && (
+                      <span className="w-1 h-1 rounded-full bg-white mt-[2px] shadow-[0_0_6px_rgba(255,255,255,0.9)]" />
+                    )}
                   </button>
                 </div>
               </div>
@@ -6144,108 +6834,113 @@ export default function App() {
         return (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full h-full flex flex-col justify-between px-9 py-1 overflow-hidden"
+            className="w-full h-full flex flex-col justify-between px-8 py-0.5 overflow-hidden select-none"
           >
-            {/* Compact Top Action & Reminder Creator Row (Fits cleanly without clipping) */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                const text = newNotifInput.trim();
-                if (!text) return;
-                const parts = text.split(' - ');
-                const title = parts[0]?.trim() || text;
-                const sub = parts.slice(1).join(' - ').trim() || `Pengingat pukul ${timeStr}`;
-                pushRealNotification(title, sub, 'message');
-                setNewNotifInput('');
-              }}
-              className="isle-stagger-1 flex items-center gap-1.5 shrink-0"
-            >
-              <input
-                type="text"
-                value={newNotifInput}
-                onChange={(e) => setNewNotifInput(e.target.value)}
-                placeholder="Tambah pengingat cepat (misal: Scrim - 20:00)..."
-                className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 focus:border-white/25 rounded-full px-3 py-1 text-[10.5px] text-white placeholder-white/35 focus:outline-none"
-              />
-              <button
-                type="submit"
-                className="px-2.5 py-1 rounded-full bg-white text-black hover:bg-white/90 text-[10px] font-bold shrink-0 transition"
-              >
-                + Notify
-              </button>
-              <button
-                type="button"
-                onClick={() => setDndEnabled((d) => !d)}
-                title={dndEnabled ? 'Disable Do Not Disturb' : 'Enable Do Not Disturb'}
-                className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition ${
-                  dndEnabled
-                    ? 'bg-[#5e5ce6] text-white'
-                    : 'bg-white/[0.08] hover:bg-white/15 text-white/75'
-                }`}
-              >
-                {dndEnabled ? <MoonFilledSvg size={11} /> : <BellOutlineSvg size={11} />}
-              </button>
-              {notifications.length > 0 && (
+            {/* Clean Reference Header Row: "Notifications" on Left + Bell DND Toggle & "Clear" Pill on Right */}
+            <div className="isle-stagger-1 flex items-center justify-between shrink-0 mb-1">
+              <span className="text-[12.5px] font-medium text-[#8e8e93] tracking-tight">
+                Notifications
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setDndEnabled((d) => !d)}
+                  title={dndEnabled ? 'Do Not Disturb: ON (Klik untuk matikan)' : 'Do Not Disturb: OFF (Klik untuk aktifkan)'}
+                  className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition cursor-pointer ${
+                    dndEnabled
+                      ? 'bg-[#5e5ce6] text-white'
+                      : 'text-white/80 hover:text-white hover:bg-white/[0.08]'
+                  }`}
+                >
+                  {dndEnabled ? <MoonFilledSvg size={12} /> : <BellOutlineSvg size={12} />}
+                </button>
                 <button
                   type="button"
                   onClick={() => setNotifications([])}
-                  className="px-2 py-1 rounded-full bg-white/10 hover:bg-white/20 text-white/80 text-[10px] font-medium shrink-0 transition"
+                  disabled={notifications.length === 0}
+                  className={`px-3 py-0.5 rounded-full text-[11px] font-semibold shrink-0 transition cursor-pointer ${
+                    notifications.length > 0
+                      ? 'bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white'
+                      : 'bg-white/[0.06] text-white/35 cursor-default'
+                  }`}
                 >
                   Clear
                 </button>
-              )}
-            </form>
+              </div>
+            </div>
 
             {notifications.length === 0 ? (
-              <div className="isle-stagger-2 flex-1 min-h-0 flex items-center justify-center gap-2 text-white/40 text-[11px]">
+              <div className="isle-stagger-2 flex-1 min-h-0 flex items-center justify-center gap-2 text-white/40 text-[11.5px]">
                 <BellOutlineSvg size={13} />
                 <span className="truncate">
-                  {dndEnabled ? 'Do Not Disturb aktif · ' : ''}Belum ada notifikasi baru
+                  {dndEnabled ? 'Do Not Disturb aktif · ' : ''}Tidak ada notifikasi baru
                 </span>
               </div>
             ) : (
-              <div className="isle-stagger-2 flex-1 min-h-0 flex flex-col justify-start space-y-1 overflow-y-auto no-scrollbar pt-1.5">
-                {notifications.map((n, idx) => (
-                  <div
-                    key={n.id}
-                    style={{
-                      animation: 'isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
-                      animationDelay: `${Math.min(240, 40 + idx * 45)}ms`,
-                    }}
-                    className="group flex items-center justify-between gap-2 px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition shrink-0"
-                  >
-                    <div className="flex items-center gap-2 min-w-0 flex-1">
-                      <div className="w-4 h-4 rounded bg-white/10 text-white/85 flex items-center justify-center shrink-0">
-                        {n.iconType === 'calendar' && <CalendarGridSvg size={10} />}
-                        {n.iconType === 'download' && <ShelfTraySvg size={10} />}
-                        {n.iconType === 'message' && <MessageBubbleSvg size={10} />}
-                      </div>
-                      <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
-                        <span className="text-[11px] font-bold text-white shrink-0">
-                          {n.title}
-                        </span>
-                        <span className="text-[10.5px] text-white/60 truncate flex-1">
-                          {n.subtitle}
-                        </span>
-                      </div>
-                    </div>
+              <div className="isle-stagger-2 flex-1 min-h-0 flex flex-col justify-start space-y-1.5 overflow-y-auto no-scrollbar pt-0.5">
+                {notifications.map((n, idx) => {
+                  const diffSec = Math.max(0, Math.floor((Date.now() - (n.createdAt || 0)) / 1000));
+                  const displayTime =
+                    n.timeAgo === 'now' || diffSec < 90
+                      ? 'now'
+                      : diffSec < 3600
+                      ? `${Math.floor(diffSec / 60)}m`
+                      : n.timeAgo;
 
-                    <div className="shrink-0 flex items-center gap-1.5">
-                      <span className="text-[10px] text-white/40 tabular-nums">
-                        {n.timeAgo}
-                      </span>
-                      <button
-                        onClick={() =>
-                          setNotifications((prev) => prev.filter((item) => item.id !== n.id))
-                        }
-                        className="p-0.5 text-white/45 hover:text-white transition"
-                        title="Dismiss notification"
-                      >
-                        <CloseCrossSvg size={9} />
-                      </button>
+                  return (
+                    <div
+                      key={n.id}
+                      style={{
+                        animation: 'isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                        animationDelay: `${Math.min(240, 35 + idx * 45)}ms`,
+                      }}
+                      className="group flex items-center justify-between gap-2.5 px-3 py-[7px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.04] transition shrink-0"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                        {/* Left Colored Squircle App Icon Badge matching reference screenshot */}
+                        <div
+                          className={`w-[22px] h-[22px] rounded-[6px] text-white flex items-center justify-center shrink-0 shadow-sm ${
+                            n.iconType === 'calendar'
+                              ? 'bg-gradient-to-b from-[#ff7b54] to-[#ff453a]'
+                              : n.iconType === 'download'
+                              ? 'bg-gradient-to-b from-[#38bdf8] to-[#0284c7]'
+                              : 'bg-gradient-to-b from-[#6e6aff] to-[#4f46e5]'
+                          }`}
+                        >
+                          {n.iconType === 'calendar' && <CalendarGridSvg size={11} />}
+                          {n.iconType === 'download' && <ShelfTraySvg size={11} />}
+                          {n.iconType === 'message' && <MessageBubbleSvg size={11} />}
+                        </div>
+
+                        {/* Inline Title + Subtitle */}
+                        <div className="flex items-baseline gap-2 min-w-0 flex-1">
+                          <span className="text-[12px] font-bold text-white shrink-0 tracking-[-0.1px]">
+                            {n.title}
+                          </span>
+                          <span className="text-[11.5px] font-normal text-[#8e8e93] truncate flex-1">
+                            {n.subtitle}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="shrink-0 flex items-center gap-1.5">
+                        <span className="text-[11px] font-normal text-[#8e8e93] tabular-nums">
+                          {displayTime}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setNotifications((prev) => prev.filter((item) => item.id !== n.id))
+                          }
+                          className="opacity-0 group-hover:opacity-100 p-0.5 text-white/45 hover:text-white transition cursor-pointer"
+                          title="Dismiss notification"
+                        >
+                          <CloseCrossSvg size={9} />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -6555,9 +7250,15 @@ export default function App() {
         return (
           <div
             onClick={(e) => e.stopPropagation()}
+            onDragEnter={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsDragOver(true);
+            }}
             onDragOver={(e) => {
               e.preventDefault();
               e.stopPropagation();
+              if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
               setIsDragOver(true);
             }}
             onDragLeave={(e) => {
@@ -6576,114 +7277,249 @@ export default function App() {
               e.preventDefault();
               e.stopPropagation();
               setIsDragOver(false);
-
-              const sampleJson = e.dataTransfer?.getData('application/x-isle-file');
-              if (sampleJson) {
-                try {
-                  const parsed = JSON.parse(sampleJson);
-                  if (parsed && typeof parsed.name === 'string') {
-                    addFilesToShelf([
-                      {
-                        name: parsed.name,
-                        size: parsed.size || '1.0 MB',
-                        ext: parsed.ext || detectFileExt(parsed.name),
-                      },
-                    ]);
-                    return;
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-
-              const dropped = Array.from(e.dataTransfer?.files || []);
-              if (dropped.length > 0) {
-                addFilesToShelf(
-                  dropped.map((f) => ({
-                    name: f.name,
-                    size: formatBytes(f.size),
-                    ext: detectFileExt(f.name),
-                  }))
-                );
-              }
+              setDragAutoOpened(false);
+              processDroppedOsFiles(e.dataTransfer);
             }}
-            className="relative w-full h-full flex items-center justify-center px-10 py-1.5"
+            className="relative w-full h-full flex flex-col justify-between px-8 py-0.5 select-none overflow-hidden"
           >
-            {/* Optional Toast if Shelf is full */}
-            {shelfToast && (
-              <div className="absolute top-0.5 right-12 z-30 px-2.5 py-0.5 rounded-full bg-white/15 text-[10px] font-semibold text-white">
-                {shelfToast}
+            {/* Sub-Header Row: Segmented [Clipboard | Files] Pill on Left + Status / Hint on Right */}
+            <div className="isle-stagger-1 flex items-center justify-between gap-2 shrink-0">
+              <div className="inline-flex items-center rounded-full bg-[#1c1c1e] border border-white/[0.06] p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setShelfSubTab('clipboard')}
+                  className={`px-2.5 py-0.5 rounded-full text-[10.5px] font-semibold transition cursor-pointer ${
+                    shelfSubTab === 'clipboard'
+                      ? 'bg-[#3a3a3c] text-white shadow-sm'
+                      : 'text-[#8e8e93] hover:text-white/80'
+                  }`}
+                >
+                  Clipboard
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShelfSubTab('files')}
+                  className={`px-2.5 py-0.5 rounded-full text-[10.5px] font-semibold transition cursor-pointer ${
+                    shelfSubTab === 'files'
+                      ? 'bg-[#3a3a3c] text-white shadow-sm'
+                      : 'text-[#8e8e93] hover:text-white/80'
+                  }`}
+                >
+                  Files
+                </button>
               </div>
-            )}
 
-            {/* Base Shelf Area: Empty Prompt OR Staged Document File Cards (Matches 00:04 & 00:10-00:13) */}
-            {shelfFiles.length === 0 && !isDragOver ? (
-              <div
-                onClick={() => {
-                  addFilesToShelf([SAMPLE_DRAGGABLE_FILES[0]]);
-                }}
-                className="isle-stagger-1 w-full h-[108px] rounded-2xl border border-dashed border-white/25 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex flex-col items-center justify-center cursor-pointer"
-              >
-                <div className="isle-stagger-2 text-white/85 mb-1.5">
-                  <ShelfTraySvg size={22} />
+              <div className="text-[10.5px] font-medium text-[#8e8e93] tracking-tight truncate">
+                {shelfToast ? (
+                  <span className="text-white font-semibold">{shelfToast}</span>
+                ) : shelfSubTab === 'files' ? (
+                  `${shelfFiles.length} of 8 · click to copy, or drag into any app`
+                ) : (
+                  `${shelfClips.length} of 8 · click to copy, or press Ctrl+V`
+                )}
+              </div>
+            </div>
+
+            {/* Main Shelf Content Area: Files Tray OR Clipboard Tray */}
+            {shelfSubTab === 'files' ? (
+              shelfFiles.length === 0 && !isDragOver ? (
+                <div
+                  onClick={() => shelfFileInputRef.current?.click()}
+                  className="isle-stagger-2 w-full flex-1 my-1 rounded-xl border border-dashed border-white/20 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex items-center justify-center gap-3 cursor-pointer"
+                  title="Drag & drop file dari Windows Explorer ke Dynamic Island, atau klik untuk memilih file"
+                >
+                  <div className="text-white/80">
+                    <ShelfTraySvg size={20} />
+                  </div>
+                  <div className="flex flex-col items-start">
+                    <span className="text-[12px] font-semibold text-white leading-tight">
+                      Drop files here or click to browse
+                    </span>
+                    <span className="text-[10px] text-white/45 leading-tight mt-0.5">
+                      Files wait here with thumbnails until you drag them out or click to copy
+                    </span>
+                  </div>
                 </div>
-                <div className="isle-stagger-2 text-[12.5px] font-semibold text-white">Drop files here</div>
-                <div className="isle-stagger-3 text-[10.5px] text-white/40 mt-0.5">
-                  Drag out anytime · click to open
+              ) : (
+                <div className="isle-stagger-2 w-full flex-1 flex items-center justify-start gap-3.5 px-1 overflow-x-auto no-scrollbar">
+                  {shelfFiles.map((file, idx) => {
+                    const isCopied = copiedShelfId === file.id;
+                    return (
+                      <div
+                        key={file.id}
+                        draggable
+                        onClick={() => handleCopyShelfFile(file)}
+                        onDragStart={(ev) => {
+                          ev.dataTransfer.effectAllowed = 'copyMove';
+                          if (file.filePath && window.electronAPI?.startFileDrag) {
+                            ev.preventDefault();
+                            window.electronAPI.startFileDrag({
+                              filePath: file.filePath,
+                              name: file.name,
+                              dataUrl: file.dataUrl,
+                            });
+                            return;
+                          }
+                          if (file.dataUrl) {
+                            const mime = file.mimeType || 'application/octet-stream';
+                            ev.dataTransfer.setData(
+                              'DownloadURL',
+                              `${mime}:${file.name}:${file.dataUrl}`
+                            );
+                          }
+                          ev.dataTransfer.setData(
+                            'text/plain',
+                            file.textContent || file.filePath || file.name
+                          );
+                        }}
+                        style={{
+                          animation: 'shelfFilePopIn 320ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
+                          animationDelay: `${25 + idx * 40}ms`,
+                        }}
+                        className="relative group flex flex-col items-center w-[58px] shrink-0 cursor-pointer active:cursor-grabbing py-0.5 select-none"
+                        title={`${file.name} (${file.size}) — Klik untuk copy, atau drag keluar ke aplikasi lain`}
+                      >
+                        <div className="relative w-[46px] h-[46px] rounded-[11px] flex items-center justify-center transition-transform duration-200 group-hover:scale-105">
+                          {file.thumbnailUrl ? (
+                            <img
+                              src={file.thumbnailUrl}
+                              alt={file.name}
+                              draggable={false}
+                              className="w-[46px] h-[46px] rounded-[11px] object-cover shadow-md border border-white/10"
+                            />
+                          ) : (
+                            <div className="w-[46px] h-[46px] rounded-[11px] bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-md">
+                              <FileDocumentBadgeSvg ext={file.ext} size={36} />
+                            </div>
+                          )}
+
+                          {/* Top-Right Remove (×) Badge matching reference screenshot */}
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              setShelfFiles((prev) => prev.filter((f) => f.id !== file.id));
+                            }}
+                            className="absolute -top-1.5 -right-1.5 w-[16px] h-[16px] rounded-full bg-[#2c2c2e] hover:bg-[#3a3a3c] border border-white/20 flex items-center justify-center text-white/80 hover:text-white shadow-md transition z-10 cursor-pointer"
+                            title="Hapus dari Shelf"
+                          >
+                            <CloseCrossSvg size={8} />
+                          </button>
+
+                          {isCopied && (
+                            <div className="absolute inset-0 rounded-[11px] bg-black/65 backdrop-blur-[1px] flex items-center justify-center text-[#30d158]">
+                              <CheckTickSvg size={18} />
+                            </div>
+                          )}
+                        </div>
+
+                        <span className="text-[10.5px] font-medium text-white/85 group-hover:text-white truncate w-full text-center mt-1.5 leading-tight">
+                          {isCopied ? 'Copied!' : truncateMiddleFileName(file.name, 11)}
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                  {shelfFiles.length < 8 && (
+                    <button
+                      type="button"
+                      onClick={() => shelfFileInputRef.current?.click()}
+                      title="Tambah file dari komputer"
+                      className="w-[46px] h-[46px] rounded-[11px] border border-dashed border-white/15 hover:border-white/35 bg-white/[0.02] hover:bg-white/[0.06] text-white/45 hover:text-white/85 flex items-center justify-center shrink-0 transition cursor-pointer mb-3.5"
+                    >
+                      <PlusSvg size={15} />
+                    </button>
+                  )}
+                </div>
+              )
+            ) : shelfClips.length === 0 ? (
+              <div
+                onClick={handleAddClipboardFromSystem}
+                className="isle-stagger-2 w-full flex-1 my-1 rounded-xl border border-dashed border-white/20 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex items-center justify-center gap-3 cursor-pointer"
+                title="Klik atau tekan Ctrl+V untuk menyimpan teks dari Clipboard"
+              >
+                <PlusSvg size={16} className="text-white/75" />
+                <div className="flex flex-col items-start">
+                  <span className="text-[12px] font-semibold text-white leading-tight">
+                    Paste from Clipboard
+                  </span>
+                  <span className="text-[10px] text-white/45 leading-tight mt-0.5">
+                    Click here or press Ctrl+V to pin clipboard text
+                  </span>
                 </div>
               </div>
             ) : (
-              <div className="isle-stagger-1 w-full h-[108px] flex items-center justify-start gap-4 px-2 overflow-x-auto no-scrollbar">
-                {shelfFiles.map((file, idx) => (
-                  <div
-                    key={file.id}
-                    draggable
-                    onDragStart={(ev) => {
-                      ev.dataTransfer.setData('text/plain', file.name);
-                      ev.dataTransfer.effectAllowed = 'copyMove';
-                    }}
-                    style={{
-                      animation: 'shelfFilePopIn 320ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
-                      animationDelay: `${30 + idx * 45}ms`,
-                    }}
-                    className="relative group flex flex-col items-center w-[72px] shrink-0 cursor-grab active:cursor-grabbing py-1 rounded-xl hover:bg-white/[0.06] transition"
-                    title={`${file.name} (${file.size}) — Drag out or click × to remove`}
-                  >
-                    <div className="relative flex items-center justify-center drop-shadow-md group-hover:scale-105 transition-transform">
-                      <FileDocumentBadgeSvg ext={file.ext} size={42} />
-                    </div>
-                    <span className="text-[11px] font-semibold text-white/90 truncate w-full text-center mt-1.5 leading-tight">
-                      {truncateMiddleFileName(file.name, 11)}
-                    </span>
-                    <span className="text-[9.5px] font-medium text-white/45 tabular-nums leading-tight mt-0.5">
-                      {file.size}
-                    </span>
-                    <button
-                      onClick={(ev) => {
-                        ev.stopPropagation();
-                        setShelfFiles((prev) => prev.filter((f) => f.id !== file.id));
+              <div className="isle-stagger-2 w-full flex-1 flex items-center justify-start gap-2.5 px-1 overflow-x-auto no-scrollbar">
+                {shelfClips.map((clip) => {
+                  const isCopied = copiedShelfId === clip.id;
+                  return (
+                    <div
+                      key={clip.id}
+                      draggable
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(clip.text);
+                          setCopiedShelfId(clip.id);
+                          setShelfToast('Copied!');
+                          setTimeout(() => {
+                            setCopiedShelfId((prev) => (prev === clip.id ? null : prev));
+                            setShelfToast(null);
+                          }, 1300);
+                        } catch {
+                          // ignore
+                        }
                       }}
-                      className="opacity-0 group-hover:opacity-100 absolute top-0.5 right-1 w-4 h-4 rounded-full bg-black/90 border border-white/25 flex items-center justify-center text-white/80 hover:text-white transition"
-                      title="Remove from Shelf"
+                      onDragStart={(ev) => {
+                        ev.dataTransfer.setData('text/plain', clip.text);
+                        ev.dataTransfer.effectAllowed = 'copy';
+                      }}
+                      className="relative group w-[112px] h-[68px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.07] p-2 flex flex-col justify-between shrink-0 cursor-pointer transition"
+                      title="Klik untuk copy teks, atau drag ke aplikasi lain"
                     >
-                      <CloseCrossSvg size={9} />
-                    </button>
-                  </div>
-                ))}
+                      <p className="text-[10px] text-white/85 line-clamp-3 leading-snug break-words">
+                        {clip.text}
+                      </p>
+                      <span className="text-[9px] text-white/40 tabular-nums">
+                        {isCopied ? 'Copied!' : clip.timeLabel}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          setShelfClips((prev) => prev.filter((c) => c.id !== clip.id));
+                        }}
+                        className="absolute -top-1.5 -right-1.5 w-[16px] h-[16px] rounded-full bg-[#2c2c2e] hover:bg-[#3a3a3c] border border-white/20 flex items-center justify-center text-white/80 hover:text-white shadow-md transition z-10 cursor-pointer"
+                        title="Hapus clip"
+                      >
+                        <CloseCrossSvg size={8} />
+                      </button>
+                    </div>
+                  );
+                })}
+                {shelfClips.length < 8 && (
+                  <button
+                    type="button"
+                    onClick={handleAddClipboardFromSystem}
+                    title="Tempel teks dari Clipboard saat ini"
+                    className="w-[46px] h-[46px] rounded-[11px] border border-dashed border-white/15 hover:border-white/35 bg-white/[0.02] hover:bg-white/[0.06] text-white/45 hover:text-white/85 flex items-center justify-center shrink-0 transition cursor-pointer"
+                  >
+                    <PlusSvg size={15} />
+                  </button>
+                )}
               </div>
             )}
 
-            {/* Active Drag-Over Overlay ("Release to add") — Dims existing files behind dashed box (Matches 00:08 & 00:12) */}
+            {/* Active Drag-Over Overlay ("Release to add") */}
             {isDragOver && (
-              <div className="absolute inset-x-10 inset-y-1.5 z-20 rounded-2xl border-[1.5px] border-dashed border-white/65 bg-black/75 backdrop-blur-[2px] flex flex-col items-center justify-center pointer-events-none animate-[ isleFadeIn_140ms_ease-out ]">
+              <div className="absolute inset-x-8 inset-y-1 z-20 rounded-xl border-[1.5px] border-dashed border-white/65 bg-black/80 backdrop-blur-[2px] flex flex-col items-center justify-center pointer-events-none animate-[isleFadeIn_140ms_ease-out]">
                 <div
-                  className="text-white mb-1.5"
+                  className="text-white mb-1"
                   style={{ animation: 'shelfTrayBounce 0.9s ease-in-out infinite' }}
                 >
-                  <ShelfTraySvg size={23} />
+                  <ShelfTraySvg size={22} />
                 </div>
-                <div className="text-[13px] font-semibold text-white tracking-tight">
-                  Release to add
+                <div className="text-[12.5px] font-semibold text-white tracking-tight">
+                  Release to add to Shelf
                 </div>
               </div>
             )}
@@ -7423,13 +8259,36 @@ export default function App() {
                   return;
                 }
                 setIsHovered(false);
-                setIsPinnedOpen(false); // Clean auto-close on mouse leave per user specification
+                setIsPinnedOpen(false); // Clean auto-close on mouse leave with user-configured speed
                 setIsDragOver(false);
                 if (dragAutoOpened) {
                   setDragAutoOpened(false);
                 }
               }
-            }, 60);
+            }, Math.max(0, closeDelayMsRef.current));
+          }}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            expandIslandForFileDrag();
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            expandIslandForFileDrag();
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDragOver(false);
+            setDragAutoOpened(false);
+            setIsPinnedOpen(true);
+            setIsHovered(true);
+            if (pageIndex !== 4) {
+              navigateToPage(4);
+            }
+            processDroppedOsFiles(e.dataTransfer);
           }}
           onClick={(e) => {
             e.stopPropagation();
@@ -8510,22 +9369,28 @@ export default function App() {
                           </svg>
                         </button>
                       </div>
+                    ) : activePage === 'notifications' ? (
+                      <span className="text-[11px] font-medium text-white/35 tracking-tight">
+                        Isle Center
+                      </span>
                     ) : (
                       <>
                         <span className="text-[12.5px] font-bold text-white tracking-tight">
                           {ISLAND_PAGES.find((p) => p.id === activePage)?.label || activePage}
                         </span>
-                        {activePage === 'shelf' && shelfFiles.length > 0 && (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setShelfFiles([]);
-                            }}
-                            className="px-2.5 py-0.5 rounded-full bg-white/12 hover:bg-white/22 text-[10px] font-semibold text-white/90 transition animate-[ isleFadeIn_160ms_ease-out ]"
-                          >
-                            Clear
-                          </button>
-                        )}
+                        {activePage === 'shelf' &&
+                          (shelfSubTab === 'files' ? shelfFiles.length > 0 : shelfClips.length > 0) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (shelfSubTab === 'files') setShelfFiles([]);
+                                else setShelfClips([]);
+                              }}
+                              className="px-2.5 py-0.5 rounded-full bg-white/12 hover:bg-white/22 text-[10px] font-semibold text-white/90 transition animate-[isleFadeIn_160ms_ease-out] cursor-pointer"
+                            >
+                              Clear
+                            </button>
+                          )}
                       </>
                     )}
                   </div>
@@ -8641,25 +9506,26 @@ export default function App() {
                 </svg>
               </button>
 
-              {/* ── Quick Settings Overlay (Alt+Q Mode Selector + FLAC Lossless + Smart Mood Shuffle + Done) ── */}
+              {/* ── Quick Settings Overlay (Alt+Q Mode + Auto-Close Speed + FLAC Lossless + Mood Shuffle + Done) ── */}
               {settingsOpen ? (
                 <div
                   onClick={(e) => e.stopPropagation()}
-                  className="flex-1 flex flex-col justify-center gap-2.5 px-8 py-2 animate-[isleFadeIn_180ms_ease-out]"
+                  className="flex-1 flex flex-col justify-center gap-1.5 px-7 py-1 animate-[isleFadeIn_180ms_ease-out]"
                 >
-                  <div className="isle-stagger-1 flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-3 py-2">
+                  {/* Row 1: Shortcut Alt + Q */}
+                  <div className="isle-stagger-1 flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-2.5 py-1.5">
                     <div className="flex flex-col">
-                      <span className="text-[11px] font-semibold text-white tracking-tight">
+                      <span className="text-[10.5px] font-semibold text-white tracking-tight leading-tight">
                         Shortcut Alt + Q
                       </span>
-                      <span className="text-[9.5px] text-white/45">
-                        Mode default saat membuka Isle Assistant
+                      <span className="text-[9px] text-white/45 leading-tight">
+                        Mode saat buka Isle Assistant
                       </span>
                     </div>
-                    <div className="flex items-center bg-black/60 border border-white/10 rounded-[4px] p-0.5 text-[10px]">
+                    <div className="flex items-center bg-black/60 border border-white/10 rounded-[4px] p-0.5 text-[9.5px]">
                       <button
                         onClick={() => setDefaultAltQMode('conversation')}
-                        className={`px-3 py-1 rounded-[3px] font-medium transition cursor-pointer ${
+                        className={`px-2.5 py-0.5 rounded-[3px] font-medium transition cursor-pointer ${
                           defaultAltQMode === 'conversation'
                             ? 'bg-white text-black'
                             : 'text-white/60 hover:text-white'
@@ -8669,7 +9535,7 @@ export default function App() {
                       </button>
                       <button
                         onClick={() => setDefaultAltQMode('voice-pill')}
-                        className={`px-3 py-1 rounded-[3px] font-medium transition cursor-pointer ${
+                        className={`px-2.5 py-0.5 rounded-[3px] font-medium transition cursor-pointer ${
                           defaultAltQMode === 'voice-pill'
                             ? 'bg-white text-black'
                             : 'text-white/60 hover:text-white'
@@ -8680,33 +9546,72 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Audio & Playback Options (FLAC Lossless + Smart Mood Shuffle + Done) */}
-                  <div className="isle-stagger-2 flex items-center justify-between gap-2">
+                  {/* Row 2: Customizable Auto-Close Speed when Mouse Leaves Dynamic Island */}
+                  <div className="isle-stagger-2 flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-2.5 py-1.5">
+                    <div className="flex flex-col">
+                      <span className="text-[10.5px] font-semibold text-white tracking-tight leading-tight">
+                        Kecepatan Tutup Island
+                      </span>
+                      <span className="text-[9px] text-white/45 leading-tight">
+                        Jeda setelah mouse pergi
+                      </span>
+                    </div>
+                    <div className="flex items-center bg-black/60 border border-white/10 rounded-[4px] p-0.5 text-[9.5px] gap-0.5">
+                      {[
+                        { label: 'Instan', ms: 0 },
+                        { label: '0.1s', ms: 120 },
+                        { label: '0.3s', ms: 300 },
+                        { label: '0.6s', ms: 600 },
+                        { label: '1.2s', ms: 1200 },
+                      ].map((opt) => {
+                        const active = closeDelayMs === opt.ms;
+                        return (
+                          <button
+                            key={opt.ms}
+                            type="button"
+                            onClick={() => setCloseDelayMs(opt.ms)}
+                            className={`px-2 py-0.5 rounded-[3px] font-medium transition cursor-pointer tabular-nums ${
+                              active
+                                ? 'bg-white text-black font-semibold'
+                                : 'text-white/60 hover:text-white'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Row 3: Audio & Playback Options (FLAC Lossless + Smart Mood Shuffle + Done) */}
+                  <div className="isle-stagger-3 flex items-center justify-between gap-2">
                     <div
                       onClick={() => {
                         const nextFlac = !flacEnabled;
                         setFlacEnabled(nextFlac);
                         setActiveTrack((prev) => (prev ? { ...prev, isFlac: nextFlac } : prev));
                       }}
-                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-3 py-2 cursor-pointer transition select-none"
+                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-2.5 py-1.5 cursor-pointer transition select-none"
                     >
                       <div className="flex flex-col">
                         <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-white text-[10.5px]">FLAC Lossless</span>
-                          <span className="text-[7.5px] font-mono tracking-wider text-white/50 border border-white/10 px-1 py-0.2 rounded-[2px]">
+                          <span className="font-semibold text-white text-[10px] leading-tight">
+                            FLAC Lossless
+                          </span>
+                          <span className="text-[7px] font-mono tracking-wider text-white/50 border border-white/10 px-1 rounded-[2px]">
                             HI-RES
                           </span>
                         </div>
-                        <span className="text-[9px] text-white/40">Studio Audio</span>
+                        <span className="text-[8.5px] text-white/40 leading-tight">Studio Audio</span>
                       </div>
                       <div
-                        className={`w-7 h-3.5 rounded-[3px] p-0.5 transition shrink-0 border ${
+                        className={`w-6 h-3 rounded-[3px] p-0.5 transition shrink-0 border ${
                           flacEnabled ? 'bg-white border-white' : 'bg-black/50 border-white/20'
                         }`}
                       >
                         <div
-                          className={`w-2.5 h-2.5 rounded-[2px] transition-transform ${
-                            flacEnabled ? 'translate-x-3.5 bg-black' : 'translate-x-0 bg-white/40'
+                          className={`w-2 h-2 rounded-[1.5px] transition-transform ${
+                            flacEnabled ? 'translate-x-3 bg-black' : 'translate-x-0 bg-white/40'
                           }`}
                         />
                       </div>
@@ -8714,25 +9619,27 @@ export default function App() {
 
                     <div
                       onClick={() => setMoodShuffleEnabled((prev) => !prev)}
-                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-3 py-2 cursor-pointer transition select-none"
+                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-2.5 py-1.5 cursor-pointer transition select-none"
                     >
                       <div className="flex flex-col">
                         <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-white text-[10.5px]">Mood Shuffle</span>
-                          <span className="text-[7.5px] font-mono tracking-wider text-white/50 border border-white/10 px-1 py-0.2 rounded-[2px]">
+                          <span className="font-semibold text-white text-[10px] leading-tight">
+                            Mood Shuffle
+                          </span>
+                          <span className="text-[7px] font-mono tracking-wider text-white/50 border border-white/10 px-1 rounded-[2px]">
                             AUTO
                           </span>
                         </div>
-                        <span className="text-[9px] text-white/40">Mix Sesuai Mood</span>
+                        <span className="text-[8.5px] text-white/40 leading-tight">Mix Sesuai Mood</span>
                       </div>
                       <div
-                        className={`w-7 h-3.5 rounded-[3px] p-0.5 transition shrink-0 border ${
+                        className={`w-6 h-3 rounded-[3px] p-0.5 transition shrink-0 border ${
                           moodShuffleEnabled ? 'bg-white border-white' : 'bg-black/50 border-white/20'
                         }`}
                       >
                         <div
-                          className={`w-2.5 h-2.5 rounded-[2px] transition-transform ${
-                            moodShuffleEnabled ? 'translate-x-3.5 bg-black' : 'translate-x-0 bg-white/40'
+                          className={`w-2 h-2 rounded-[1.5px] transition-transform ${
+                            moodShuffleEnabled ? 'translate-x-3 bg-black' : 'translate-x-0 bg-white/40'
                           }`}
                         />
                       </div>
@@ -8740,7 +9647,7 @@ export default function App() {
 
                     <button
                       onClick={() => setSettingsOpen(false)}
-                      className="px-4 py-2 rounded-md bg-white text-black hover:bg-neutral-200 text-[10.5px] font-semibold shrink-0 transition cursor-pointer"
+                      className="px-3.5 py-1.5 rounded-md bg-white text-black hover:bg-neutral-200 text-[10px] font-semibold shrink-0 transition cursor-pointer"
                     >
                       Done
                     </button>
@@ -8898,6 +9805,53 @@ export default function App() {
         onChange={(e) => {
           const f = e.target.files?.[0];
           if (f) handleLocalAudioFile(f);
+          e.target.value = '';
+        }}
+        className="hidden"
+      />
+      <input
+        ref={shelfFileInputRef}
+        type="file"
+        multiple
+        onChange={async (e) => {
+          const files = Array.from(e.target.files || []);
+          if (files.length > 0) {
+            const items = await Promise.all(
+              files.map(async (f) => {
+                const ext = detectFileExt(f.name);
+                const filePath = window.electronAPI?.getPathForFile
+                  ? window.electronAPI.getPathForFile(f)
+                  : (f as any).path || '';
+                const isImg =
+                  f.type.startsWith('image/') ||
+                  ['PNG', 'JPG', 'JPEG', 'WEBP', 'GIF', 'SVG', 'BMP'].includes(ext);
+                let thumbnailUrl: string | undefined;
+                let dataUrl: string | undefined;
+                if (isImg) {
+                  thumbnailUrl = URL.createObjectURL(f);
+                  if (f.size <= 8 * 1024 * 1024) {
+                    dataUrl = await new Promise<string | undefined>((resolve) => {
+                      const reader = new FileReader();
+                      reader.onload = () =>
+                        resolve(typeof reader.result === 'string' ? reader.result : undefined);
+                      reader.onerror = () => resolve(undefined);
+                      reader.readAsDataURL(f);
+                    });
+                  }
+                }
+                return {
+                  name: f.name,
+                  size: formatBytes(f.size),
+                  ext,
+                  thumbnailUrl,
+                  dataUrl,
+                  filePath: filePath || undefined,
+                  mimeType: f.type || undefined,
+                };
+              })
+            );
+            addFilesToShelf(items);
+          }
           e.target.value = '';
         }}
         className="hidden"

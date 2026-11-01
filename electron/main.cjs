@@ -1,6 +1,7 @@
-const { app, BrowserWindow, screen, ipcMain, globalShortcut, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, Tray, Menu, nativeImage, clipboard, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const http = require('http');
 const { spawn, execFile } = require('child_process');
 
@@ -34,6 +35,9 @@ const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 }
+
+// Allow HTML5 audio & YouTube embed audio to play immediately after async AI responses without user gesture blocking
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 // Ultra-lightweight Chromium & V8 flags: enforces strictly minimal RAM footprint (<100MB)
 // Disables telemetry, crashpad collectors, multi-process site isolations, and unused background engines.
@@ -455,6 +459,13 @@ function createOverlayWindow() {
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
+  // Ensure window audio is never muted
+  try {
+    mainWindow.webContents.setAudioMuted(false);
+  } catch {
+    // ignore
+  }
+
   // Enable click-through on transparent areas by default while forwarding mousemove events
   mainWindow.setIgnoreMouseEvents(true, { forward: true });
 
@@ -503,11 +514,13 @@ function createOverlayWindow() {
   screen.on('display-removed', handleDisplayChange);
 
   // Windows OLE Drag & Drop DropTarget Support:
-  // When files are dragged from Windows Explorer towards the top center island pill,
-  // Windows OLE checks whether the window under the cursor accepts drops.
-  // When setIgnoreMouseEvents(true) is active, Windows skips the window, displaying the forbidden cursor 🚫.
-  // Polling cursor position at 65ms ensures drop target is enabled when cursor approaches the island notch!
-  let lastCursorInsideIsland = false;
+  // During an OS file drag in Windows Explorer (DoDragDrop), Windows suppresses WM_MOUSEMOVE,
+  // so the renderer's mousemove handler cannot disable click-through on its own.
+  // Polling cursor position every 45ms ensures that whenever the cursor enters the top-center
+  // island pill (or expanded island), setIgnoreMouseEvents(false) is ALWAYS enforced so Windows OLE
+  // immediately recognizes the Dynamic Island as a valid file drop target!
+  let lastCursorInsideOuter = false;
+  let lastCursorInsideNotch = false;
   const cursorCheckInterval = setInterval(() => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       clearInterval(cursorCheckInterval);
@@ -516,19 +529,35 @@ function createOverlayWindow() {
     try {
       const cursor = screen.getCursorScreenPoint();
       const bounds = mainWindow.getBounds();
-      const islandLeft = bounds.x + (bounds.width - 560) / 2;
-      const islandRight = bounds.x + (bounds.width + 560) / 2;
-      const islandBottom = bounds.y + 240;
+      const centerX = bounds.x + bounds.width / 2;
 
-      const insideIslandRegion =
-        cursor.x >= islandLeft &&
-        cursor.x <= islandRight &&
+      // Compact notch pill hit zone (generous top-center zone so dragging a file to the pill always hits)
+      const insideNotchZone =
+        Math.abs(cursor.x - centerX) <= 175 &&
         cursor.y >= bounds.y &&
-        cursor.y <= islandBottom;
+        cursor.y <= bounds.y + 62;
 
-      if (insideIslandRegion !== lastCursorInsideIsland) {
-        lastCursorInsideIsland = insideIslandRegion;
-        if (insideIslandRegion) {
+      // Expanded island outer zone
+      const insideOuterZone =
+        Math.abs(cursor.x - centerX) <= 290 &&
+        cursor.y >= bounds.y &&
+        cursor.y <= bounds.y + 250;
+
+      // Whenever cursor is inside the top-center notch zone, unconditionally disable click-through
+      // so OS file drag-and-drop (OLE IDropTarget) is NEVER blocked by WS_EX_TRANSPARENT!
+      if (insideNotchZone) {
+        mainWindow.setIgnoreMouseEvents(false);
+        if (!lastCursorInsideNotch) {
+          lastCursorInsideNotch = true;
+          mainWindow.webContents.send('cursor-entered-island');
+        }
+      } else {
+        lastCursorInsideNotch = false;
+      }
+
+      if (insideOuterZone !== lastCursorInsideOuter) {
+        lastCursorInsideOuter = insideOuterZone;
+        if (insideOuterZone) {
           mainWindow.setIgnoreMouseEvents(false);
         } else {
           mainWindow.webContents.send('cursor-left-island');
@@ -537,7 +566,7 @@ function createOverlayWindow() {
     } catch {
       // ignore
     }
-  }, 65);
+  }, 45);
 
   mainWindow.on('closed', () => {
     clearInterval(cursorCheckInterval);
@@ -555,9 +584,91 @@ ipcMain.on('set-ignore-mouse-events', (event, ignore, options) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win || win.isDestroyed()) return;
   if (ignore) {
+    // Do not enable click-through if the cursor is currently right inside the top-center notch zone!
+    try {
+      const cursor = screen.getCursorScreenPoint();
+      const bounds = win.getBounds();
+      const centerX = bounds.x + bounds.width / 2;
+      if (Math.abs(cursor.x - centerX) <= 150 && cursor.y >= bounds.y && cursor.y <= bounds.y + 48) {
+        win.setIgnoreMouseEvents(false);
+        return;
+      }
+    } catch {
+      // ignore
+    }
     win.setIgnoreMouseEvents(true, options || { forward: true });
   } else {
     win.setIgnoreMouseEvents(false);
+  }
+});
+
+// IPC handler to copy a Shelf file (image or text/path) to the Windows System Clipboard
+ipcMain.handle('shelf-copy-file', async (_event, payload) => {
+  try {
+    if (!payload || typeof payload !== 'object') return false;
+    const { filePath, dataUrl, name } = payload;
+    if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
+      const img = nativeImage.createFromDataURL(dataUrl);
+      if (!img.isEmpty()) {
+        clipboard.writeImage(img);
+        return true;
+      }
+    }
+    if (typeof filePath === 'string' && filePath && fs.existsSync(filePath)) {
+      const ext = path.extname(filePath).toLowerCase();
+      if (['.png', '.jpg', '.jpeg', '.webp', '.bmp'].includes(ext)) {
+        const img = nativeImage.createFromPath(filePath);
+        if (!img.isEmpty()) {
+          clipboard.writeImage(img);
+          return true;
+        }
+      }
+      clipboard.writeText(filePath);
+      return true;
+    }
+    if (typeof name === 'string' && name) {
+      clipboard.writeText(name);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+});
+
+// IPC handler to drag a Shelf file out into any Windows application (Explorer, Discord, WhatsApp, etc.)
+ipcMain.on('shelf-start-drag', (event, payload) => {
+  try {
+    if (!payload || typeof payload !== 'object') return;
+    let targetPath = payload.filePath;
+    const fileName = String(payload.name || 'file').replace(/[<>:"/\\|?*]/g, '_');
+
+    // If the file doesn't have a disk path yet (or was added via dataUrl), materialize it in os.tmpdir()
+    if ((!targetPath || !fs.existsSync(targetPath)) && typeof payload.dataUrl === 'string' && payload.dataUrl.includes(';base64,')) {
+      const base64Data = payload.dataUrl.split(';base64,').pop();
+      if (base64Data) {
+        const tempDir = path.join(os.tmpdir(), 'winisle-shelf');
+        fs.mkdirSync(tempDir, { recursive: true });
+        targetPath = path.join(tempDir, fileName);
+        fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
+      }
+    }
+
+    if (targetPath && fs.existsSync(targetPath)) {
+      let dragIcon = nativeImage.createFromDataURL(TRAY_ICON_BASE64);
+      if (typeof payload.dataUrl === 'string' && payload.dataUrl.startsWith('data:image/')) {
+        const thumb = nativeImage.createFromDataURL(payload.dataUrl);
+        if (!thumb.isEmpty()) {
+          dragIcon = thumb.resize({ width: 48, height: 48 });
+        }
+      }
+      event.sender.startDrag({
+        file: targetPath,
+        icon: dragIcon,
+      });
+    }
+  } catch (err) {
+    console.warn('[WinIsle] shelf-start-drag failed:', err?.message);
   }
 });
 
@@ -567,6 +678,26 @@ ipcMain.on('trim-memory', () => {
 });
 
 app.whenReady().then(async () => {
+  // Spoof Referer & Origin for YouTube embed requests so YouTube never blocks music videos on http://127.0.0.1 (Error 150/153)
+  try {
+    session.defaultSession.webRequest.onBeforeSendHeaders(
+      {
+        urls: [
+          '*://*.youtube.com/*',
+          '*://*.youtube-nocookie.com/*',
+          '*://*.googlevideo.com/*',
+        ],
+      },
+      (details, callback) => {
+        details.requestHeaders['Referer'] = 'https://www.youtube.com/';
+        details.requestHeaders['Origin'] = 'https://www.youtube.com';
+        callback({ requestHeaders: details.requestHeaders });
+      }
+    );
+  } catch {
+    // ignore
+  }
+
   // Configure automatic launch at Windows startup when packaged
   if (app.isPackaged && process.platform === 'win32') {
     try {

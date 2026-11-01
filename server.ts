@@ -1444,6 +1444,40 @@ async function resolveMonochromeFlacStream(
   return null;
 }
 
+async function resolveDirectYoutubeAudioStream(videoId: string): Promise<string> {
+  if (!videoId) return '';
+  const pipedInstances = [
+    'https://pipedapi.kavin.rocks',
+    'https://api.piped.private.coffee',
+    'https://pipedapi.tokhmi.xyz',
+  ];
+  for (const base of pipedInstances) {
+    try {
+      const res = await withTimeout(
+        fetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
+          headers: { Accept: 'application/json', 'User-Agent': 'WinIsle-Audio/2.0' },
+        }),
+        2000,
+        'piped-stream'
+      );
+      if (!res.ok) continue;
+      const data: any = await res.json();
+      const streams: any[] = Array.isArray(data?.audioStreams) ? data.audioStreams : [];
+      if (streams.length === 0) continue;
+      const m4aStreams = streams
+        .filter((s) => s?.url && (String(s.mimeType || '').includes('mp4') || String(s.format || '').includes('M4A')))
+        .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+      const bestStream = m4aStreams[0] || streams.find((s) => s?.url);
+      if (bestStream?.url && String(bestStream.url).startsWith('http')) {
+        return String(bestStream.url);
+      }
+    } catch {
+      // try next instance
+    }
+  }
+  return '';
+}
+
 async function resolveSongWithMultiSource(query: string, useFlac = false) {
   const cleanQ = sanitizeText(query, 120);
   if (!cleanQ) return null;
@@ -1451,12 +1485,13 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
   let title = cleanQ;
   let artist = '';
   let coverUrl = '';
-  let audioUrl = ''; // Strictly reserved for full-length lossless FLAC or local blob; NEVER 30s iTunes preview!
+  let audioUrl = '';
+  let previewUrl = '';
   let isFlac = false;
   let durationMs = 210000; // default to 3.5m full song duration
   let youtubeVideoId = '';
 
-  // 1. Fetch iTunes metadata (ONLY for accurate studio title, artist, 600x600 album art, and full studio durationMs)
+  // 1. Fetch iTunes metadata (for accurate studio title, artist, 600x600 album art, durationMs, and AAC previewUrl fallback)
   try {
     const itRes = await withTimeout(
       fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&media=music&entity=song&limit=10`),
@@ -1488,7 +1523,9 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
           if (typeof best.trackTimeMillis === 'number' && best.trackTimeMillis > 45000) {
             durationMs = best.trackTimeMillis;
           }
-          // NEVER assign best.previewUrl to audioUrl because previewUrl is only a 30-second snippet!
+          if (typeof best.previewUrl === 'string' && best.previewUrl.startsWith('http')) {
+            previewUrl = best.previewUrl;
+          }
         }
       }
     }
@@ -1625,6 +1662,14 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
     coverUrl = `https://img.youtube.com/vi/${youtubeVideoId}/hqdefault.jpg`;
   }
 
+  // 2b. If audioUrl is still empty, attempt fast direct YouTube audio stream resolution
+  if (!audioUrl && youtubeVideoId) {
+    const directStream = await resolveDirectYoutubeAudioStream(youtubeVideoId);
+    if (directStream) {
+      audioUrl = directStream;
+    }
+  }
+
   // 3. Fetch Synced Lyrics from Priority Providers (BetterLyrics -> SimpMusic -> LyricsPlus -> LRCLIB)
   // Pass the actual playing audio duration so lyric timestamps match 100% from second 0
   const effectiveDurationSec = matchedYtDurationSec > 60 ? matchedYtDurationSec : targetSec;
@@ -1658,6 +1703,7 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
     artist: artist || 'Various Artists',
     coverUrl,
     audioUrl,
+    previewUrl,
     isFlac,
     durationMs,
     youtubeVideoId,

@@ -37,6 +37,9 @@ export interface IslandSurfaceProps {
   nudgeTrigger?: number;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
+  onDragEnter?: (e: React.DragEvent) => void;
+  onDragOver?: (e: React.DragEvent) => void;
+  onDrop?: (e: React.DragEvent) => void;
   onClick?: (e: React.MouseEvent) => void;
   onContextMenu?: (e: React.MouseEvent) => void;
   children: React.ReactNode;
@@ -62,6 +65,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   nudgeTrigger = 0,
   onMouseEnter,
   onMouseLeave,
+  onDragEnter,
+  onDragOver,
+  onDrop,
   onClick,
   onContextMenu,
   children,
@@ -463,6 +469,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       }}
       onMouseEnter={isMiniHidden ? undefined : onMouseEnter}
       onMouseLeave={isMiniHidden ? undefined : onMouseLeave}
+      onDragEnter={isMiniHidden ? undefined : onDragEnter}
+      onDragOver={isMiniHidden ? undefined : onDragOver}
+      onDrop={isMiniHidden ? undefined : onDrop}
       onClick={isMiniHidden ? undefined : onClick}
       onContextMenu={isMiniHidden ? undefined : onContextMenu}
     >
