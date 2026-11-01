@@ -51,14 +51,17 @@
   }
   100% {
     opacity: 0;
-    transform: translate3d(-32px, 0, 0) scale(0.975);
+    transform: translate3d(-34px, 0, 0) scale(0.97);
   }
 }
 
 @keyframes islePageInRight {
   0% {
     opacity: 0;
-    transform: translate3d(32px, 0, 0) scale(0.975);
+    transform: translate3d(34px, 0, 0) scale(0.97);
+  }
+  35% {
+    opacity: 1;
   }
   100% {
     opacity: 1;
@@ -73,14 +76,17 @@
   }
   100% {
     opacity: 0;
-    transform: translate3d(32px, 0, 0) scale(0.975);
+    transform: translate3d(34px, 0, 0) scale(0.97);
   }
 }
 
 @keyframes islePageInLeft {
   0% {
     opacity: 0;
-    transform: translate3d(-32px, 0, 0) scale(0.975);
+    transform: translate3d(-34px, 0, 0) scale(0.97);
+  }
+  35% {
+    opacity: 1;
   }
   100% {
     opacity: 1;
@@ -114,11 +120,11 @@
 @keyframes shelfFilePopIn {
   0% {
     opacity: 0;
-    transform: translate3d(0, 8px, 0) scale(0.82);
+    transform: translate3d(0, 10px, 0) scale(0.75);
   }
-  70% {
+  68% {
     opacity: 1;
-    transform: translate3d(0, -1.5px, 0) scale(1.03);
+    transform: translate3d(0, -2px, 0) scale(1.05);
   }
   100% {
     opacity: 1;
@@ -185,11 +191,15 @@
   }
 }
 
-/* Fluid Seamless Staggered Entrance Animation when Opening Island (Zero Blur Filter Stutter) */
+/* Fluid Seamless Staggered Entrance Animation for All Menus & Elements (GPU 3D Transform, Zero Blur Stutter) */
 @keyframes isleMenuItemIn {
   0% {
     opacity: 0;
-    transform: translate3d(0, 6px, 0) scale(0.98);
+    transform: translate3d(0, 9px, 0) scale(0.95);
+  }
+  68% {
+    opacity: 1;
+    transform: translate3d(0, -1px, 0) scale(1.008);
   }
   100% {
     opacity: 1;
@@ -198,19 +208,23 @@
 }
 
 .isle-stagger-1 {
-  animation: isleMenuItemIn 240ms cubic-bezier(0.22, 1, 0.36, 1) 0ms both;
+  animation: isleMenuItemIn 320ms cubic-bezier(0.22, 1, 0.36, 1) 10ms both;
+  will-change: transform, opacity;
 }
 
 .isle-stagger-2 {
-  animation: isleMenuItemIn 260ms cubic-bezier(0.22, 1, 0.36, 1) 20ms both;
+  animation: isleMenuItemIn 350ms cubic-bezier(0.22, 1, 0.36, 1) 45ms both;
+  will-change: transform, opacity;
 }
 
 .isle-stagger-3 {
-  animation: isleMenuItemIn 280ms cubic-bezier(0.22, 1, 0.36, 1) 40ms both;
+  animation: isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) 80ms both;
+  will-change: transform, opacity;
 }
 
 .isle-stagger-4 {
-  animation: isleMenuItemIn 300ms cubic-bezier(0.22, 1, 0.36, 1) 60ms both;
+  animation: isleMenuItemIn 410ms cubic-bezier(0.22, 1, 0.36, 1) 115ms both;
+  will-change: transform, opacity;
 }
 
 .isle-outgoing-page,
@@ -219,11 +233,8 @@
   backface-visibility: hidden;
 }
 
-/* Prevent child stagger animations from double-running during or after carousel page switches */
-.isle-outgoing-page *,
-.isle-carousel-page .isle-stagger-1,
-.isle-carousel-page .isle-stagger-2,
-.isle-carousel-page .isle-stagger-3,
-.isle-carousel-page .isle-stagger-4 {
+/* Prevent ONLY the outgoing carousel layer from re-running entrance animations while sliding out */
+.isle-outgoing-page * {
   animation: none !important;
 }
+

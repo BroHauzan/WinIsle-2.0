@@ -6960,6 +6960,10 @@ export default function App() {
                   return (
                     <div
                       key={n.id}
+                      style={{
+                        animation: 'isleMenuItemIn 360ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                        animationDelay: `${Math.min(220, 30 + idx * 40)}ms`,
+                      }}
                       className="group flex items-center justify-between gap-2.5 px-3 py-[7px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.04] transition shrink-0"
                     >
                       <div className="flex items-center gap-2.5 min-w-0 flex-1">
@@ -8263,6 +8267,10 @@ export default function App() {
                   {weatherData.hourly.slice(0, 7).map((item, idx) => (
                     <div
                       key={`${item.time}-${idx}`}
+                      style={{
+                        animation: 'isleMenuItemIn 360ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                        animationDelay: `${45 + idx * 28}ms`,
+                      }}
                       className="flex flex-col items-center gap-0.5"
                     >
                       <span className="text-[9px] font-medium text-white/55 tabular-nums">
