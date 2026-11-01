@@ -561,6 +561,28 @@ export default function App() {
     []
   );
 
+  const stepCarouselPage = useCallback((delta: -1 | 1) => {
+    setPageIndex((currIdx) => {
+      const normalized =
+        (((currIdx + delta) % ISLAND_PAGES.length) + ISLAND_PAGES.length) %
+        ISLAND_PAGES.length;
+      if (normalized === currIdx) return currIdx;
+      setSlideDir(delta > 0 ? 'right' : 'left');
+      setPrevPageIndex(currIdx);
+      setSlideTick((t) => t + 1);
+
+      if (pageTransTimerRef.current) {
+        window.clearTimeout(pageTransTimerRef.current);
+      }
+      pageTransTimerRef.current = window.setTimeout(() => {
+        setPrevPageIndex(null);
+        pageTransTimerRef.current = null;
+      }, 280);
+
+      return normalized;
+    });
+  }, []);
+
   useEffect(() => {
     return () => {
       if (pageTransTimerRef.current) {
@@ -1108,6 +1130,7 @@ export default function App() {
   const shelfFileInputRef = useRef<HTMLInputElement | null>(null);
   const lastDropTimeRef = useRef<number>(0);
   const dragLeaveTimerRef = useRef<number | null>(null);
+  const isInternalShelfDragRef = useRef<boolean>(false);
 
   useEffect(() => {
     try {
@@ -1123,9 +1146,15 @@ export default function App() {
       assistantOpen) &&
     !activeAlert;
 
-  // Trigger lightweight native memory trimming whenever the island collapses back to compact notch
+  // Trigger lightweight native memory trimming and reset carousel slide tick whenever the island collapses back to compact notch
   useEffect(() => {
     if (!isExpanded) {
+      if (pageTransTimerRef.current) {
+        window.clearTimeout(pageTransTimerRef.current);
+        pageTransTimerRef.current = null;
+      }
+      setPrevPageIndex(null);
+      setSlideTick(0);
       const timer = window.setTimeout(() => {
         (window as any).electronAPI?.trimMemory?.();
       }, 400);
@@ -1357,8 +1386,9 @@ export default function App() {
     }
   }, [timeStr]);
 
-  // Expand Island to Shelf immediately on any file drag event
+  // Expand Island to Shelf immediately on any external file drag event
   const expandIslandForFileDrag = useCallback(() => {
+    if (isInternalShelfDragRef.current) return;
     setDesktopClickThrough(false);
     if (dragLeaveTimerRef.current) {
       window.clearTimeout(dragLeaveTimerRef.current);
@@ -1379,25 +1409,41 @@ export default function App() {
     if (ISLAND_PAGES[pageIndex]?.id !== 'shelf') {
       navigateToPage(4, 'right');
     }
+    // Auto-clear watchdog: if dragover stops firing for 380ms, automatically dismiss the overlay
+    dragLeaveTimerRef.current = window.setTimeout(() => {
+      setIsDragOver(false);
+      setDragAutoOpened(false);
+      dragLeaveTimerRef.current = null;
+    }, 380);
   }, [navigateToPage, pageIndex, setDesktopClickThrough]);
 
   // Global Window & Native Tauri/Electron Drag-Over Detector:
   // Auto-opens closed Island to Shelf when dragging files from Windows Explorer toward the Dynamic Island
   useEffect(() => {
     const hasDragPayload = (e: DragEvent): boolean => {
-      if (!e.dataTransfer) return true;
+      if (isInternalShelfDragRef.current) return false;
+      if (!e.dataTransfer) return false;
       const types = Array.from(e.dataTransfer.types || []);
-      if (types.length === 0) return true;
+      if (types.length === 0) return false;
       return types.some((t) => {
         const low = t.toLowerCase();
         return (
+          low === 'files' ||
           low.includes('file') ||
-          low.includes('uri') ||
-          low.includes('text') ||
-          low.includes('moz') ||
-          low.includes('application')
+          low.includes('uri-list') ||
+          low === 'text/plain'
         );
       });
+    };
+
+    const clearStaleDragState = () => {
+      if (dragLeaveTimerRef.current) {
+        window.clearTimeout(dragLeaveTimerRef.current);
+        dragLeaveTimerRef.current = null;
+      }
+      isInternalShelfDragRef.current = false;
+      setIsDragOver(false);
+      setDragAutoOpened(false);
     };
 
     const handleWindowDragEnter = (e: DragEvent) => {
@@ -1426,19 +1472,31 @@ export default function App() {
         dragLeaveTimerRef.current = window.setTimeout(() => {
           setIsDragOver(false);
           setDragAutoOpened(false);
-        }, 420);
+          dragLeaveTimerRef.current = null;
+        }, 180);
+      }
+    };
+
+    const handleWindowDragEnd = () => {
+      clearStaleDragState();
+    };
+
+    // Normal mousemove or mousedown never fires during an active OS file drag;
+    // use it to immediately clear any leftover drag-over state.
+    const handleNormalMouseActivity = () => {
+      if (isDragOver || dragAutoOpened) {
+        clearStaleDragState();
       }
     };
 
     const handleWindowDrop = (e: DragEvent) => {
+      if (isInternalShelfDragRef.current) {
+        isInternalShelfDragRef.current = false;
+        return;
+      }
       e.preventDefault();
       e.stopPropagation();
-      if (dragLeaveTimerRef.current) {
-        window.clearTimeout(dragLeaveTimerRef.current);
-        dragLeaveTimerRef.current = null;
-      }
-      setIsDragOver(false);
-      setDragAutoOpened(false);
+      clearStaleDragState();
       // Keep the island open on Shelf so the user sees their newly dropped files!
       setIsPinnedOpen(true);
       setIsHovered(true);
@@ -1492,17 +1550,11 @@ export default function App() {
       }
     };
 
-    // Also subscribe to Tauri native drag-and-drop & cursor drag events if running in Tauri Windows shell
+    // Also subscribe to Tauri native file drag-and-drop events if running in Tauri Windows shell
     const unlisteners: Array<() => void> = [];
     const winAny = window as any;
     const tauriListen = winAny.__TAURI__?.event?.listen;
     if (typeof tauriListen === 'function') {
-      tauriListen('island_native_drag_enter', () => {
-        expandIslandForFileDrag();
-      })
-        .then((un: () => void) => unlisteners.push(un))
-        .catch(() => {});
-
       tauriListen('tauri://drag-enter', () => {
         expandIslandForFileDrag();
       })
@@ -1520,14 +1572,14 @@ export default function App() {
         dragLeaveTimerRef.current = window.setTimeout(() => {
           setIsDragOver(false);
           setDragAutoOpened(false);
-        }, 420);
+          dragLeaveTimerRef.current = null;
+        }, 180);
       })
         .then((un: () => void) => unlisteners.push(un))
         .catch(() => {});
 
       tauriListen('tauri://drag-drop', (ev: any) => {
-        setIsDragOver(false);
-        setDragAutoOpened(false);
+        clearStaleDragState();
         setIsPinnedOpen(true);
         setIsHovered(true);
         const paths: string[] = Array.isArray(ev?.payload?.paths)
@@ -1556,13 +1608,19 @@ export default function App() {
     window.addEventListener('dragenter', handleWindowDragEnter, true);
     window.addEventListener('dragover', handleWindowDragOver, true);
     window.addEventListener('dragleave', handleWindowDragLeave, true);
+    window.addEventListener('dragend', handleWindowDragEnd, true);
     window.addEventListener('drop', handleWindowDrop, true);
+    window.addEventListener('mousemove', handleNormalMouseActivity, true);
+    window.addEventListener('mousedown', handleNormalMouseActivity, true);
     window.addEventListener('paste', handleShelfPaste);
     return () => {
       window.removeEventListener('dragenter', handleWindowDragEnter, true);
       window.removeEventListener('dragover', handleWindowDragOver, true);
       window.removeEventListener('dragleave', handleWindowDragLeave, true);
+      window.removeEventListener('dragend', handleWindowDragEnd, true);
       window.removeEventListener('drop', handleWindowDrop, true);
+      window.removeEventListener('mousemove', handleNormalMouseActivity, true);
+      window.removeEventListener('mousedown', handleNormalMouseActivity, true);
       window.removeEventListener('paste', handleShelfPaste);
       unlisteners.forEach((u) => {
         try {
@@ -1574,7 +1632,9 @@ export default function App() {
     };
   }, [
     addFilesToShelf,
+    dragAutoOpened,
     expandIslandForFileDrag,
+    isDragOver,
     isExpanded,
     navigateToPage,
     pageIndex,
@@ -6068,18 +6128,24 @@ export default function App() {
   // ── Carousel Navigation Handlers (Trigger Dual-Layer Simultaneous Slide) ──
   const goPrevPage = (e: React.MouseEvent) => {
     e.stopPropagation();
+    setIsDragOver(false);
+    setDragAutoOpened(false);
     setLyricsMode(false);
-    navigateToPage(pageIndex - 1, 'left');
+    stepCarouselPage(-1);
   };
 
   const goNextPage = (e: React.MouseEvent) => {
     e.stopPropagation();
+    setIsDragOver(false);
+    setDragAutoOpened(false);
     setLyricsMode(false);
-    navigateToPage(pageIndex + 1, 'right');
+    stepCarouselPage(1);
   };
 
   const selectTabPage = (idx: number, e: React.MouseEvent) => {
     e.stopPropagation();
+    setIsDragOver(false);
+    setDragAutoOpened(false);
     if (idx === pageIndex) return;
     setLyricsMode(false);
     navigateToPage(idx, idx > pageIndex ? 'right' : 'left');
@@ -6330,7 +6396,7 @@ export default function App() {
   };
 
   // ── Reusable Page Renderer (Enables Simultaneous Outgoing + Incoming Carousel Slide Animation) ──
-  const renderPageContent = (pageId: IslandPage) => {
+  const renderPageContent = (pageId: IslandPage, isOutgoing = false) => {
     switch (pageId) {
       case 'music': {
         const isExternalSource = Boolean(activeTrack && activeTrack.sourceType === 'external');
@@ -6358,7 +6424,9 @@ export default function App() {
             {/* Header Waktu & Baterai (.top-bar — Smoothly fades & collapses when entering Lyrics Mode) */}
             <div
               className={`isle-stagger-1 flex items-center justify-center gap-[7px] text-[13px] pl-[30px] whitespace-nowrap transition-all duration-400 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                lyricsMode
+                isOutgoing
+                  ? 'opacity-0 pointer-events-none max-h-[24px] mb-[2px]'
+                  : lyricsMode
                   ? 'max-h-0 opacity-0 -translate-y-2 scale-95 blur-[3px] mb-0 pointer-events-none overflow-hidden'
                   : 'max-h-[24px] opacity-100 translate-y-0 scale-100 blur-0 mb-[2px]'
               }`}
@@ -6805,7 +6873,9 @@ export default function App() {
             {/* Indikator Slide (.pagination — Smoothly fades & collapses in Lyrics Mode) */}
             <div
               className={`flex items-center justify-center gap-[5px] w-full transition-all duration-400 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                lyricsMode
+                isOutgoing
+                  ? 'opacity-0 pointer-events-none max-h-[10px]'
+                  : lyricsMode
                   ? 'max-h-0 opacity-0 translate-y-2 pointer-events-none overflow-hidden'
                   : 'max-h-[10px] opacity-100 translate-y-0'
               }`}
@@ -6890,10 +6960,6 @@ export default function App() {
                   return (
                     <div
                       key={n.id}
-                      style={{
-                        animation: 'isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
-                        animationDelay: `${Math.min(240, 35 + idx * 45)}ms`,
-                      }}
                       className="group flex items-center justify-between gap-2.5 px-3 py-[7px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.04] transition shrink-0"
                     >
                       <div className="flex items-center gap-2.5 min-w-0 flex-1">
@@ -7350,6 +7416,8 @@ export default function App() {
                         draggable
                         onClick={() => handleCopyShelfFile(file)}
                         onDragStart={(ev) => {
+                          isInternalShelfDragRef.current = true;
+                          setIsDragOver(false);
                           ev.dataTransfer.effectAllowed = 'copyMove';
                           if (file.filePath && window.electronAPI?.startFileDrag) {
                             ev.preventDefault();
@@ -7371,6 +7439,10 @@ export default function App() {
                             'text/plain',
                             file.textContent || file.filePath || file.name
                           );
+                        }}
+                        onDragEnd={() => {
+                          isInternalShelfDragRef.current = false;
+                          setIsDragOver(false);
                         }}
                         style={{
                           animation: 'shelfFilePopIn 320ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
@@ -7470,8 +7542,14 @@ export default function App() {
                         }
                       }}
                       onDragStart={(ev) => {
+                        isInternalShelfDragRef.current = true;
+                        setIsDragOver(false);
                         ev.dataTransfer.setData('text/plain', clip.text);
                         ev.dataTransfer.effectAllowed = 'copy';
+                      }}
+                      onDragEnd={() => {
+                        isInternalShelfDragRef.current = false;
+                        setIsDragOver(false);
                       }}
                       className="relative group w-[112px] h-[68px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.07] p-2 flex flex-col justify-between shrink-0 cursor-pointer transition"
                       title="Klik untuk copy teks, atau drag ke aplikasi lain"
@@ -8185,10 +8263,6 @@ export default function App() {
                   {weatherData.hourly.slice(0, 7).map((item, idx) => (
                     <div
                       key={`${item.time}-${idx}`}
-                      style={{
-                        animation: 'isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
-                        animationDelay: `${50 + idx * 30}ms`,
-                      }}
                       className="flex flex-col items-center gap-0.5"
                     >
                       <span className="text-[9px] font-medium text-white/55 tabular-nums">
@@ -8268,17 +8342,27 @@ export default function App() {
             }, Math.max(0, closeDelayMsRef.current));
           }}
           onDragEnter={(e) => {
+            if (isInternalShelfDragRef.current) return;
+            const types = Array.from(e.dataTransfer?.types || []);
+            if (types.length === 0) return;
             e.preventDefault();
             e.stopPropagation();
             expandIslandForFileDrag();
           }}
           onDragOver={(e) => {
+            if (isInternalShelfDragRef.current) return;
+            const types = Array.from(e.dataTransfer?.types || []);
+            if (types.length === 0) return;
             e.preventDefault();
             e.stopPropagation();
             if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
             expandIslandForFileDrag();
           }}
           onDrop={(e) => {
+            if (isInternalShelfDragRef.current) {
+              isInternalShelfDragRef.current = false;
+              return;
+            }
             e.preventDefault();
             e.stopPropagation();
             setIsDragOver(false);
@@ -9231,11 +9315,16 @@ export default function App() {
               {/* ── Top Header Row on Non-Music Pages (Clean Title / Weather City Search on Left + Battery, Date & Clock on Right) ── */}
               {activePage !== 'music' && (
                 <div
-                  key={`hdr-${activePage}-${isExpanded ? 'open' : 'closed'}`}
-                  className="isle-stagger-1 w-full flex items-center justify-between px-6 pt-2.5 pb-1 z-20 shrink-0"
+                  key={`hdr-${isExpanded ? 'open' : 'closed'}`}
+                  className={`${
+                    slideTick === 0 ? 'isle-stagger-1 ' : ''
+                  }w-full flex items-center justify-between px-6 pt-2.5 pb-1 z-20 shrink-0`}
                 >
                   {/* Left: Page Title OR Interactive Weather City & Manual Search Input */}
-                  <div className="flex items-center gap-2 min-w-0">
+                  <div
+                    key={`hdr-title-${activePage}`}
+                    className="flex items-center gap-2 min-w-0 animate-[isleFadeIn_180ms_ease-out]"
+                  >
                     {activePage === 'weather' ? (
                       <div
                         onClick={(e) => e.stopPropagation()}
@@ -9654,40 +9743,42 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                /* ── Dual-Layer Simultaneous Carousel Viewport (Outgoing + Incoming Pages Slide Together with Motion Blur) ── */
+                /* ── Dual-Layer Simultaneous Carousel Viewport (Outgoing + Incoming Pages Slide Together Smoothly) ── */
                 <div className="relative flex-1 overflow-hidden">
-                  {/* Outgoing Page Layer (Animates out over 360ms when switching pages) */}
+                  {/* Outgoing Page Layer (Animates out over 280ms when switching pages) */}
                   {prevPageIndex !== null && prevPageIndex !== pageIndex && (
                     <div
                       key={`out-${prevPageIndex}-${slideTick}`}
                       style={{
                         animation:
                           slideDir === 'right'
-                            ? 'islePageOutLeft 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards'
-                            : 'islePageOutRight 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
+                            ? 'islePageOutLeft 280ms cubic-bezier(0.22, 1, 0.36, 1) forwards'
+                            : 'islePageOutRight 280ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
                       }}
-                      className="absolute inset-0 flex flex-col justify-center pointer-events-none"
+                      className="isle-outgoing-page absolute inset-0 flex flex-col justify-center pointer-events-none"
                     >
-                      {renderPageContent(ISLAND_PAGES[prevPageIndex].id)}
+                      {renderPageContent(ISLAND_PAGES[prevPageIndex].id, true)}
                     </div>
                   )}
 
-                  {/* Incoming / Active Page Layer (Triggers staggered entrance when opening island or switching pages!) */}
+                  {/* Incoming / Active Page Layer (Persists .isle-carousel-page when slideTick > 0 so clearing prevPageIndex never restarts child animations) */}
                   <div
                     key={`in-${pageIndex}-${slideTick}-${isExpanded ? 'open' : 'closed'}`}
                     style={
-                      prevPageIndex !== null
+                      slideTick > 0
                         ? {
                             animation:
                               slideDir === 'right'
-                                ? 'islePageInRight 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards'
-                                : 'islePageInLeft 360ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
+                                ? 'islePageInRight 280ms cubic-bezier(0.22, 1, 0.36, 1) forwards'
+                                : 'islePageInLeft 280ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
                           }
                         : undefined
                     }
-                    className="relative w-full h-full flex flex-col justify-center"
+                    className={`relative w-full h-full flex flex-col justify-center ${
+                      slideTick > 0 ? 'isle-carousel-page' : ''
+                    }`}
                   >
-                    {renderPageContent(activePage)}
+                    {renderPageContent(activePage, false)}
                   </div>
                 </div>
               )}

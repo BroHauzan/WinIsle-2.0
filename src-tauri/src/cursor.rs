@@ -226,18 +226,10 @@ pub fn spawn_cursor_monitor(app_handle: AppHandle, state: Arc<CursorMonitorState
                 }
 
                 let currently_ignoring = state.currently_ignoring.load(Ordering::Relaxed);
-                let lbutton_down = unsafe {
-                    windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) < 0
-                };
 
                 if is_inside && currently_ignoring {
                     crate::window_decorations::set_click_through(&win, false);
                     state.currently_ignoring.store(false, Ordering::Relaxed);
-                    if lbutton_down {
-                        let _ = app_handle.emit("island_native_drag_enter", ());
-                    }
-                } else if is_inside && lbutton_down {
-                    let _ = app_handle.emit("island_native_drag_enter", ());
                 } else if !is_inside && !currently_ignoring {
                     crate::window_decorations::set_click_through(&win, true);
                     state.currently_ignoring.store(true, Ordering::Relaxed);
