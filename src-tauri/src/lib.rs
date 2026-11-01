@@ -237,6 +237,7 @@ pub fn run() {
             hardware::set_brightness,
             hardware::get_battery_status,
             screenshot::get_system_screenshot,
+            screenshot::get_island_backdrop,
             media::get_system_media,
             media::send_system_media_command,
             ai::ask_bynara_ai,

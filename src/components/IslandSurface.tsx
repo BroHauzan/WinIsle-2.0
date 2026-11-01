@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { updateIslandBounds } from '../core/tauri-bridge';
+import { getIslandBackdrop, updateIslandBounds } from '../core/tauri-bridge';
 
 interface SpringState {
   value: number;
@@ -99,10 +99,51 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     current: isExpanded ? 1 : 0,
     target: isExpanded ? 1 : 0,
   });
+  const backdropImgRef = useRef<HTMLImageElement | null>(null);
+  const wasExpandedRef = useRef<boolean>(false);
+  const noiseCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
     expandProgressRef.current.target = isExpanded ? 1 : 0;
+    if (isExpanded && !wasExpandedRef.current) {
+      wasExpandedRef.current = true;
+      // Capture the desktop area directly behind the island right as expansion starts
+      getIslandBackdrop()
+        .then((dataUrl) => {
+          if (!dataUrl) return;
+          const img = new Image();
+          img.onload = () => {
+            backdropImgRef.current = img;
+          };
+          img.src = dataUrl;
+        })
+        .catch(() => {});
+    } else if (!isExpanded) {
+      wasExpandedRef.current = false;
+    }
   }, [isExpanded]);
+
+  useEffect(() => {
+    // Create a tiny 64x64 subtle frosted acrylic grain tile once
+    if (typeof document === 'undefined' || noiseCanvasRef.current) return;
+    const nc = document.createElement('canvas');
+    nc.width = 64;
+    nc.height = 64;
+    const nctx = nc.getContext('2d');
+    if (nctx) {
+      const imgData = nctx.createImageData(64, 64);
+      const data = imgData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        const v = (Math.random() * 255) | 0;
+        data[i] = v;
+        data[i + 1] = v;
+        data[i + 2] = v;
+        data[i + 3] = 7; // subtle frosted acrylic diffusion
+      }
+      nctx.putImageData(imgData, 0, 0);
+      noiseCanvasRef.current = nc;
+    }
+  }, []);
 
   useEffect(() => {
     if (tintRgb && tintRgb.length === 3) {
@@ -257,42 +298,63 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           };
 
           // Draw notch body:
-          // When in compact/small form (ep <= 0.02): completely solid pitch black (#000000, 100% opaque, no transparency)
-          // When expanding/expanded: smoothly blends into Liquid Glass (dark gradient at top fading to translucent frosted glass at bottom)
-          traceOutline();
+          // When in compact/small form (ep <= 0.02): completely solid pitch black (#000000, 100% opaque)
+          // When expanding/expanded: real blurred desktop backdrop + rich frosted dark acrylic glass
+          // so any desktop text behind the Dynamic Island is blurred and never interferes with readability
           if (ep <= 0.02) {
+            traceOutline();
             ctx.fillStyle = '#000000';
             ctx.fill();
           } else {
-            const liquidGlassGrad = ctx.createLinearGradient(0, 0, 0, curH);
-            liquidGlassGrad.addColorStop(0, '#000000');
-            liquidGlassGrad.addColorStop(
-              0.25,
-              `rgba(8, 10, 15, ${(1 - 0.12 * ep).toFixed(3)})`
-            );
-            liquidGlassGrad.addColorStop(
-              0.65,
-              `rgba(12, 15, 23, ${(1 - 0.38 * ep).toFixed(3)})`
-            );
-            liquidGlassGrad.addColorStop(
-              1,
-              `rgba(15, 18, 28, ${(1 - 0.62 * ep).toFixed(3)})`
-            );
-            ctx.fillStyle = liquidGlassGrad;
-            ctx.fill();
-          }
-
-          // Subtle glass frosted noise & diffuse specular reflection (only when expanded)
-          if (ep > 0.02) {
             ctx.save();
             traceOutline();
             ctx.clip();
+
+            // 1. If a real desktop backdrop snapshot is available (Windows Tauri), draw it heavily Gaussian-blurred
+            if (backdropImgRef.current) {
+              ctx.save();
+              ctx.filter = 'blur(24px) saturate(165%)';
+              const winW = window.innerWidth || 740;
+              const winH = window.innerHeight || 340;
+              const drawX = (left + right) / 2 - winW / 2;
+              ctx.drawImage(backdropImgRef.current, drawX - 18, -18, winW + 36, winH + 36);
+              ctx.restore();
+            }
+
+            // 2. Frosted Dark Acrylic Glass Gradient (High contrast readability so background text never bleeds through)
+            const liquidGlassGrad = ctx.createLinearGradient(0, 0, 0, curH);
+            liquidGlassGrad.addColorStop(0, '#000000');
+            liquidGlassGrad.addColorStop(
+              0.28,
+              `rgba(8, 10, 16, ${(1 - 0.05 * ep).toFixed(3)})`
+            );
+            liquidGlassGrad.addColorStop(
+              0.68,
+              `rgba(11, 14, 22, ${(1 - 0.13 * ep).toFixed(3)})`
+            );
+            liquidGlassGrad.addColorStop(
+              1,
+              `rgba(14, 18, 28, ${(1 - 0.20 * ep).toFixed(3)})`
+            );
+            ctx.fillStyle = liquidGlassGrad;
+            ctx.fillRect(0, 0, outerW, outerH);
+
+            // 3. Subtle Frosted Acrylic Matte Sheen & Micro-Grain Diffusion
             const glassSheen = ctx.createLinearGradient(left, 0, right, curH);
-            glassSheen.addColorStop(0, `rgba(255, 255, 255, ${(0.08 * ep).toFixed(3)})`);
-            glassSheen.addColorStop(0.4, `rgba(255, 255, 255, ${(0.015 * ep).toFixed(3)})`);
-            glassSheen.addColorStop(1, `rgba(255, 255, 255, ${(0.05 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(0, `rgba(255, 255, 255, ${(0.085 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(0.45, `rgba(255, 255, 255, ${(0.028 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(1, `rgba(255, 255, 255, ${(0.06 * ep).toFixed(3)})`);
             ctx.fillStyle = glassSheen;
             ctx.fillRect(0, 0, outerW, outerH);
+
+            if (noiseCanvasRef.current) {
+              const pat = ctx.createPattern(noiseCanvasRef.current, 'repeat');
+              if (pat) {
+                ctx.fillStyle = pat;
+                ctx.fillRect(0, 0, outerW, outerH);
+              }
+            }
+
             ctx.restore();
           }
 
@@ -409,9 +471,9 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             ctx.save();
             traceSidesAndBottom();
             const rimGrad = ctx.createLinearGradient(left, top, right, curH);
-            rimGrad.addColorStop(0, `rgba(255, 255, 255, ${(0.20 * ep).toFixed(3)})`);
-            rimGrad.addColorStop(0.5, `rgba(255, 255, 255, ${(0.12 * ep).toFixed(3)})`);
-            rimGrad.addColorStop(1, `rgba(255, 255, 255, ${(0.24 * ep).toFixed(3)})`);
+            rimGrad.addColorStop(0, `rgba(255, 255, 255, ${(0.22 * ep).toFixed(3)})`);
+            rimGrad.addColorStop(0.5, `rgba(255, 255, 255, ${(0.14 * ep).toFixed(3)})`);
+            rimGrad.addColorStop(1, `rgba(255, 255, 255, ${(0.26 * ep).toFixed(3)})`);
             ctx.strokeStyle = rimGrad;
             ctx.lineWidth = 1.2;
             ctx.stroke();
@@ -481,17 +543,18 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       />
       <div
         className={`relative z-10 overflow-hidden flex flex-col justify-between ${
-          dims.h > 36 ? 'backdrop-blur-2xl backdrop-saturate-[180%]' : ''
+          dims.h > 34 ? 'backdrop-blur-3xl backdrop-saturate-[190%]' : ''
         }`}
         style={{
           width: `${dims.w}px`,
           height: `${dims.h}px`,
           borderBottomLeftRadius: `${dims.r}px`,
           borderBottomRightRadius: `${dims.r}px`,
-          clipPath: `inset(0px 0px 0px 0px round 0px 0px ${dims.r}px ${dims.r}px)`,
+          backdropFilter: dims.h > 34 ? 'blur(48px) saturate(190%)' : 'none',
+          WebkitBackdropFilter: dims.h > 34 ? 'blur(48px) saturate(190%)' : 'none',
           background:
-            dims.h > 36
-              ? 'linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0.01) 40%, rgba(255, 255, 255, 0.02) 100%)'
+            dims.h > 34
+              ? 'linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, rgba(255, 255, 255, 0.015) 45%, rgba(255, 255, 255, 0.03) 100%)'
               : 'transparent',
         }}
       >

@@ -387,6 +387,20 @@ export async function getSystemScreenshot(): Promise<string> {
 }
 
 /**
+ * Captures a fast 4x-downsampled backdrop image of the desktop area directly behind the Dynamic Island.
+ */
+export async function getIslandBackdrop(): Promise<string | null> {
+  if (isTauri()) {
+    try {
+      return await invoke<string>('get_island_backdrop');
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Queries active system media playback from Windows GSMTC (e.g. YouTube Music, Chrome, Spotify).
  */
 export async function getSystemMedia(): Promise<SystemMediaInfo | null> {

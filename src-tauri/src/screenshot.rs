@@ -217,6 +217,142 @@ pub fn get_system_screenshot() -> Result<String, String> {
     }
 }
 
+/// Captures the desktop region directly beneath the Dynamic Island overlay window,
+/// downsampled 4x with box-averaging for <0.4ms IPC transfer and natural frosted pre-blur.
+#[command]
+pub fn get_island_backdrop(window: tauri::WebviewWindow) -> Result<String, String> {
+    let _desktop_guard = ScopedInputDesktop::acquire();
+
+    unsafe {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+
+        let (win_x, win_y, win_w, win_h) = if let Ok(pos) = window.outer_position() {
+            let size = window.outer_size().unwrap_or_default();
+            let w = (size.width as i32).max(200);
+            let h = (size.height as i32).max(120);
+            (pos.x, pos.y, w, h)
+        } else {
+            let screen_w = GetSystemMetrics(SM_CXSCREEN).max(800);
+            let w = (740.0 * scale).round() as i32;
+            let h = (340.0 * scale).round() as i32;
+            ((screen_w - w) / 2, 0, w, h)
+        };
+
+        let hdc_screen = GetDC(HWND(std::ptr::null_mut()));
+        if hdc_screen.is_invalid() {
+            return Err("Failed to acquire desktop DC".into());
+        }
+
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        if hdc_mem.is_invalid() {
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err("Failed to create memory DC".into());
+        }
+
+        let hbitmap = CreateCompatibleBitmap(hdc_screen, win_w, win_h);
+        if hbitmap.is_invalid() {
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err("Failed to create bitmap".into());
+        }
+
+        let old_bitmap = SelectObject(hdc_mem, hbitmap);
+        let blit_ok = BitBlt(hdc_mem, 0, 0, win_w, win_h, hdc_screen, win_x, win_y, SRCCOPY);
+        if blit_ok.is_err() {
+            let _ = SelectObject(hdc_mem, old_bitmap);
+            let _ = DeleteObject(hbitmap);
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            return Err("BitBlt failed".into());
+        }
+
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: win_w,
+                biHeight: -win_h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let pixel_count = (win_w * win_h) as usize;
+        let mut pixels: Vec<u32> = vec![0u32; pixel_count];
+
+        let get_di_ok = GetDIBits(
+            hdc_screen,
+            hbitmap,
+            0,
+            win_h as u32,
+            Some(pixels.as_mut_ptr() as *mut _),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+
+        let _ = SelectObject(hdc_mem, old_bitmap);
+        let _ = DeleteObject(hbitmap);
+        let _ = DeleteDC(hdc_mem);
+        let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+
+        if get_di_ok == 0 {
+            return Err("GetDIBits failed".into());
+        }
+
+        // 4x box-filter downsample for instant transfer & silky pre-blur
+        let step = 4usize;
+        let out_w = (win_w as usize / step).max(1);
+        let out_h = (win_h as usize / step).max(1);
+        let src_w = win_w as usize;
+        let mut small_rgba: Vec<u8> = Vec::with_capacity(out_w * out_h * 4);
+
+        for oy in 0..out_h {
+            let sy_base = oy * step;
+            for ox in 0..out_w {
+                let sx_base = ox * step;
+                let mut r_sum = 0u32;
+                let mut g_sum = 0u32;
+                let mut b_sum = 0u32;
+                for dy in 0..step {
+                    let row_offset = (sy_base + dy) * src_w + sx_base;
+                    for dx in 0..step {
+                        let px = pixels[row_offset + dx];
+                        b_sum += px & 0xFF;
+                        g_sum += (px >> 8) & 0xFF;
+                        r_sum += (px >> 16) & 0xFF;
+                    }
+                }
+                small_rgba.push((r_sum >> 4) as u8);
+                small_rgba.push((g_sum >> 4) as u8);
+                small_rgba.push((b_sum >> 4) as u8);
+                small_rgba.push(255u8);
+            }
+        }
+
+        let mut png_bytes = Vec::with_capacity(out_w * out_h);
+        {
+            let mut encoder =
+                png::Encoder::new(Cursor::new(&mut png_bytes), out_w as u32, out_h as u32);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            encoder.set_filter(png::Filter::NoFilter);
+
+            let mut writer = encoder
+                .write_header()
+                .map_err(|e| format!("PNG header error: {}", e))?;
+            writer
+                .write_image_data(&small_rgba)
+                .map_err(|e| format!("PNG data error: {}", e))?;
+        }
+
+        Ok(format!("data:image/png;base64,{}", STANDARD.encode(&png_bytes)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
