@@ -301,15 +301,20 @@ if (typeof window !== 'undefined') {
         try {
           if (requestedCity) {
             const gRes = await origFetch(
-              `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(requestedCity)}&count=1&language=id&format=json`
+              `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(requestedCity)}&count=5&format=json`
             );
             if (gRes.ok) {
               const gData = await gRes.json();
-              const first = gData?.results?.[0];
-              if (first) {
-                city = first.name || requestedCity;
-                lat = first.latitude ?? lat;
-                lon = first.longitude ?? lon;
+              const results: any[] = Array.isArray(gData?.results) ? gData.results : [];
+              if (results.length > 0) {
+                const idMatch = results.find((r) => r.country_code?.toUpperCase() === 'ID');
+                const best =
+                  idMatch ||
+                  [...results].sort((a, b) => (b.population || 0) - (a.population || 0))[0] ||
+                  results[0];
+                city = best.name || requestedCity;
+                lat = typeof best.latitude === 'number' ? best.latitude : lat;
+                lon = typeof best.longitude === 'number' ? best.longitude : lon;
               }
             }
           } else if (!params.get('lat')) {
@@ -328,13 +333,21 @@ if (typeof window !== 'undefined') {
             }
           }
           const wRes = await origFetch(
-            `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code,is_day&hourly=temperature_2m,weather_code&daily=sunrise,sunset&timezone=auto&forecast_days=2`
+            `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,sunrise,sunset,precipitation_probability_max,wind_speed_10m_max&timezone=auto&forecast_days=3`
           );
           if (wRes.ok) {
             const wData = await wRes.json();
             const currentTemp = Math.round(Number(wData?.current?.temperature_2m ?? 28));
-            const weatherCode = Number(wData?.current?.weather_code ?? 2);
+            const apparentTemp = Math.round(Number(wData?.current?.apparent_temperature ?? currentTemp));
+            const humidity = Math.round(Number(wData?.current?.relative_humidity_2m ?? 70));
+            const windSpeed = Math.round(Number(wData?.current?.wind_speed_10m ?? 10));
+            const weatherCode = Number(wData?.current?.weather_code ?? 1);
             const isDay = Number(wData?.current?.is_day ?? 1) === 1;
+
+            const tempMax = Math.round(Number(wData?.daily?.temperature_2m_max?.[0] ?? currentTemp + 2));
+            const tempMin = Math.round(Number(wData?.daily?.temperature_2m_min?.[0] ?? currentTemp - 4));
+            const precipitationProb = Math.round(Number(wData?.daily?.precipitation_probability_max?.[0] ?? 0));
+
             const fmtClock = (iso: string, fallback: string) => {
               const part = String(iso || '').split('T')[1];
               if (!part) return fallback;
@@ -343,13 +356,20 @@ if (typeof window !== 'undefined') {
             };
             const sunrise = fmtClock(wData?.daily?.sunrise?.[0] || '', '5:49');
             const sunset = fmtClock(wData?.daily?.sunset?.[0] || '', '17:52');
-            const times: string[] = wData?.hourly?.time || [];
-            const temps: number[] = wData?.hourly?.temperature_2m || [];
-            const codes: number[] = wData?.hourly?.weather_code || [];
-            const utcOffsetSec =
-              typeof wData?.utc_offset_seconds === 'number' ? wData.utc_offset_seconds : 25200;
-            const cityNow = new Date(Date.now() + utcOffsetSec * 1000);
-            const startIdx = Math.max(0, cityNow.getUTCHours());
+
+            const times: string[] = Array.isArray(wData?.hourly?.time) ? wData.hourly.time : [];
+            const temps: number[] = Array.isArray(wData?.hourly?.temperature_2m) ? wData.hourly.temperature_2m : [];
+            const codes: number[] = Array.isArray(wData?.hourly?.weather_code) ? wData.hourly.weather_code : [];
+            const precipProbs: number[] = Array.isArray(wData?.hourly?.precipitation_probability) ? wData.hourly.precipitation_probability : [];
+
+            const currentIso = String(wData?.current?.time || '');
+            let startIdx = times.findIndex((t) => currentIso && t.slice(0, 13) === currentIso.slice(0, 13));
+            if (startIdx < 0) {
+              const fallbackHourStr = String(new Date().getHours()).padStart(2, '0') + ':00';
+              startIdx = times.findIndex((t) => t.endsWith(`T${fallbackHourStr}`));
+              if (startIdx < 0) startIdx = 0;
+            }
+
             const hourly = Array.from({ length: 7 }, (_, i) => {
               const idx = startIdx + i;
               const tIso = times[idx] || '';
@@ -357,18 +377,27 @@ if (typeof window !== 'undefined') {
                 time: tIso.includes('T') ? tIso.split('T')[1].slice(0, 5) : `${String((startIdx + i) % 24).padStart(2, '0')}:00`,
                 temp: typeof temps[idx] === 'number' ? Math.round(temps[idx]) : currentTemp,
                 code: typeof codes[idx] === 'number' ? codes[idx] : weatherCode,
+                precipitationProb: typeof precipProbs[idx] === 'number' ? Math.round(precipProbs[idx]) : 0,
               };
             });
+
             return jsonResponse({
               ok: true,
               city,
               lat,
               lon,
               currentTemp,
+              apparentTemp,
+              humidity,
+              windSpeed,
               weatherCode,
               isDay,
+              tempMax,
+              tempMin,
+              precipitationProb,
               sunrise,
               sunset,
+              timezone: wData?.timezone || 'Asia/Jakarta',
               utcOffsetSeconds:
                 typeof wData?.utc_offset_seconds === 'number'
                   ? wData.utc_offset_seconds
@@ -385,10 +414,17 @@ if (typeof window !== 'undefined') {
           lat,
           lon,
           currentTemp: 28,
+          apparentTemp: 31,
+          humidity: 70,
+          windSpeed: 10,
           weatherCode: 2,
           isDay: true,
+          tempMax: 32,
+          tempMin: 24,
+          precipitationProb: 20,
           sunrise: '5:49',
           sunset: '17:52',
+          timezone: 'Asia/Jakarta',
           hourly: [],
         });
       }

@@ -182,15 +182,23 @@ export interface WeatherHourItem {
   time: string;
   temp: number;
   code: number;
+  precipitationProb?: number;
 }
 
 export interface WeatherData {
   city: string;
   currentTemp: number;
+  apparentTemp?: number;
+  humidity?: number;
+  windSpeed?: number;
+  tempMax?: number;
+  tempMin?: number;
+  precipitationProb?: number;
   weatherCode: number;
   isDay: boolean;
   sunrise: string;
   sunset: string;
+  timezone?: string;
   utcOffsetSeconds?: number;
   hourly: WeatherHourItem[];
 }
@@ -334,6 +342,48 @@ function pcm16Base64ToFloat32(base64: string): Float32Array {
   return float32;
 }
 
+// Convert recorded Float32 audio chunks into valid 16kHz Mono WAV base64 string
+function float32ToWavBase64(chunks: Float32Array[], sampleRate = 16000): string {
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  if (totalLen === 0) return '';
+  const merged = new Float32Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+  const buffer = new ArrayBuffer(44 + merged.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (off: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + merged.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // Mono channel
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, merged.length * 2, true);
+  let idx = 44;
+  for (let i = 0; i < merged.length; i++, idx += 2) {
+    const s = Math.max(-1, Math.min(1, merged[i]));
+    view.setInt16(idx, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
+
 const MONTH_NAMES = [
   'JANUARY',
   'FEBRUARY',
@@ -381,6 +431,7 @@ declare global {
       setIgnoreMouseEvents?: (ignore: boolean, options?: { forward?: boolean }) => void;
       onToggleAssistant?: (callback: () => void) => () => void;
       onToggleMiniCapsule?: (callback: () => void) => () => void;
+      onCursorLeftIsland?: (callback: () => void) => () => void;
     };
   }
 }
@@ -587,6 +638,8 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  const [lyricsMode, setLyricsMode] = useState(false);
+
   // Input ref for immediate auto-focus when opening Assistant in Type mode (Alt+Q)
   const assistantInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -634,6 +687,18 @@ export default function App() {
           clientY <= rect.bottom;
 
         setDesktopClickThrough(!insideBounds);
+        if (!insideBounds && !lyricsMode && !assistantOpen) {
+          if (hoverLeaveTimerRef.current !== null) {
+            window.clearTimeout(hoverLeaveTimerRef.current);
+          }
+          hoverLeaveTimerRef.current = window.setTimeout(() => {
+            hoverLeaveTimerRef.current = null;
+            setIsHovered(false);
+            setIsPinnedOpen(false);
+            setIsDragOver(false);
+            setDragAutoOpened(false);
+          }, 240);
+        }
       });
     };
 
@@ -642,7 +707,22 @@ export default function App() {
       if (rafId) window.cancelAnimationFrame(rafId);
       window.removeEventListener('mousemove', handleGlobalMouseMove);
     };
-  }, [setDesktopClickThrough, miniCapsuleMode, assistantOpen]);
+  }, [setDesktopClickThrough, miniCapsuleMode, assistantOpen, lyricsMode]);
+
+  // Subscribe to Electron main process cursor-left-island event for rock-solid auto-close
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.onCursorLeftIsland) return;
+    const unbind = window.electronAPI.onCursorLeftIsland(() => {
+      if (!lyricsMode && !assistantOpen) {
+        setIsHovered(false);
+        setIsPinnedOpen(false);
+        setIsDragOver(false);
+        setDragAutoOpened(false);
+        setDesktopClickThrough(true);
+      }
+    });
+    return unbind;
+  }, [lyricsMode, assistantOpen, setDesktopClickThrough]);
 
   useEffect(() => {
     if (assistantOpen && assistantMode === 'conversation') {
@@ -969,7 +1049,6 @@ export default function App() {
   const lastDropTimeRef = useRef<number>(0);
   const dragLeaveTimerRef = useRef<number | null>(null);
 
-  const [lyricsMode, setLyricsMode] = useState(false);
   const activePage = ISLAND_PAGES[pageIndex].id;
   const isExpanded =
     ((!miniCapsuleMode && (isHovered || isPinnedOpen || dragAutoOpened || isDragOver || lyricsMode)) ||
@@ -1022,6 +1101,19 @@ export default function App() {
 
   // Global Window Drag-Over Detector: Auto-opens closed Island to Shelf when dragging files near top of screen
   useEffect(() => {
+    const handleWindowDragEnter = (e: DragEvent) => {
+      const types = Array.from(e.dataTransfer?.types || []);
+      const hasFilePayload =
+        types.includes('Files') ||
+        types.includes('application/x-isle-file') ||
+        types.includes('text/plain');
+      if (hasFilePayload && e.clientY <= 320) {
+        e.preventDefault();
+        setDesktopClickThrough(false);
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      }
+    };
+
     const handleWindowDragOver = (e: DragEvent) => {
       const types = Array.from(e.dataTransfer?.types || []);
       const hasFilePayload =
@@ -1030,9 +1122,13 @@ export default function App() {
         types.includes('text/plain');
       if (!hasFilePayload) return;
 
-      // Trigger auto-open when dragging within top 260px of screen (or anywhere if already over island)
-      if (e.clientY <= 260) {
+      // Trigger auto-open when dragging within top 300px of screen (or anywhere if already over island)
+      if (e.clientY <= 300) {
         e.preventDefault();
+        setDesktopClickThrough(false);
+        if (e.dataTransfer) {
+          e.dataTransfer.dropEffect = 'copy';
+        }
         if (dragLeaveTimerRef.current) {
           window.clearTimeout(dragLeaveTimerRef.current);
           dragLeaveTimerRef.current = null;
@@ -1052,7 +1148,7 @@ export default function App() {
     };
 
     const handleWindowDragLeave = (e: DragEvent) => {
-      if (e.clientY <= 0 || e.clientX <= 0 || e.clientX >= window.innerWidth || e.clientY > 290) {
+      if (e.clientY <= 0 || e.clientX <= 0 || e.clientX >= window.innerWidth || e.clientY > 320) {
         if (dragLeaveTimerRef.current) window.clearTimeout(dragLeaveTimerRef.current);
         dragLeaveTimerRef.current = window.setTimeout(() => {
           setIsDragOver(false);
@@ -1062,9 +1158,11 @@ export default function App() {
     };
 
     const handleWindowDrop = (e: DragEvent) => {
-      if (e.clientY <= 260) {
+      if (e.clientY <= 320) {
         e.preventDefault();
+        e.stopPropagation();
         setIsDragOver(false);
+        setDragAutoOpened(false);
         // Parse sample file JSON payload if dragged from the sample bar
         const sampleJson = e.dataTransfer?.getData('application/x-isle-file');
         if (sampleJson) {
@@ -1098,15 +1196,17 @@ export default function App() {
       }
     };
 
+    window.addEventListener('dragenter', handleWindowDragEnter);
     window.addEventListener('dragover', handleWindowDragOver);
     window.addEventListener('dragleave', handleWindowDragLeave);
     window.addEventListener('drop', handleWindowDrop);
     return () => {
+      window.removeEventListener('dragenter', handleWindowDragEnter);
       window.removeEventListener('dragover', handleWindowDragOver);
       window.removeEventListener('dragleave', handleWindowDragLeave);
       window.removeEventListener('drop', handleWindowDrop);
     };
-  }, [addFilesToShelf, isHovered, isPinnedOpen, navigateToPage, pageIndex]);
+  }, [addFilesToShelf, isHovered, isPinnedOpen, navigateToPage, pageIndex, setDesktopClickThrough]);
 
   // ── Bot Look Customization ──
   const [botShape] = useState<BotShapeName>('squircle');
@@ -2298,15 +2398,22 @@ export default function App() {
         ...prev.slice(0, 24),
       ]);
 
-      if (!dndEnabled && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-        try {
-          new Notification(cleanTitle, { body: cleanSub });
-        } catch {
-          // ignore
+      if (!dndEnabled) {
+        triggerAlert('notification', {
+          confirmTitle: cleanTitle,
+          confirmSubtitle: cleanSub,
+          confirmCategory: 'system',
+        });
+        if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+          try {
+            new Notification(cleanTitle, { body: cleanSub });
+          } catch {
+            // ignore
+          }
         }
       }
     },
-    [dndEnabled]
+    [dndEnabled, triggerAlert]
   );
 
   // Automatically clear expired/stale notifications (> 7 days) from localStorage & memory
@@ -2351,11 +2458,54 @@ export default function App() {
       setPomoRemainingSeconds((prev) => {
         if (prev <= elapsed) {
           setPomoRunning(false);
+          // Play subtle, pleasing finish chime so user hears it even if looking away
+          try {
+            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+            if (AudioCtx) {
+              const ctx = new AudioCtx();
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.type = 'sine';
+              osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+              osc.frequency.setValueAtTime(880, ctx.currentTime + 0.14);
+              gain.gain.setValueAtTime(0.22, ctx.currentTime);
+              gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.75);
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.start();
+              osc.stop(ctx.currentTime + 0.75);
+            }
+          } catch {
+            // ignore audio error
+          }
+
           if (pomoMode === 'focus') {
             setPomoSessionsCompleted((s) => s + 1);
-            pushRealNotification('Focus Session Selesai!', 'Waktu fokus selesai — saatnya istirahat sejenak.', 'calendar');
+            triggerActionConfirmation(
+              'Focus Session Selesai!',
+              'Waktu fokus selesai — istirahat sejenak',
+              '00:00',
+              'timer',
+              2
+            );
+            pushRealNotification(
+              'Focus Session Selesai!',
+              'Waktu fokus selesai — saatnya istirahat sejenak.',
+              'calendar'
+            );
           } else {
-            pushRealNotification('Waktu Break Selesai!', 'Siap kembali lanjut fokus?', 'calendar');
+            triggerActionConfirmation(
+              'Waktu Break Selesai!',
+              'Siap kembali lanjut fokus?',
+              '00:00',
+              'timer',
+              2
+            );
+            pushRealNotification(
+              'Waktu Break Selesai!',
+              'Siap kembali lanjut fokus?',
+              'calendar'
+            );
           }
           return 0;
         }
@@ -2363,7 +2513,7 @@ export default function App() {
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [pomoRunning, pomoMode, pushRealNotification]);
+  }, [pomoRunning, pomoMode, pushRealNotification, triggerActionConfirmation]);
 
   const formatPomoTime = (sec: number) => {
     const m = String(Math.floor(sec / 60)).padStart(2, '0');
@@ -2593,7 +2743,7 @@ export default function App() {
     [pushRealNotification]
   );
 
-  // ── Page 7: Real-Time Weather & Solar Arc State (Auto Location + Manual City Override) ──
+  // ── Page 7: Real-Time Weather & Solar Arc State (Auto Location + Manual City Override via Open-Meteo) ──
   const [weatherData, setWeatherData] = useState<WeatherData>(() => {
     const h = new Date().getHours();
     let savedCity = 'Jakarta';
@@ -2606,14 +2756,22 @@ export default function App() {
     return {
       city: savedCity,
       currentTemp: 28,
+      apparentTemp: 31,
+      humidity: 70,
+      windSpeed: 10,
+      tempMax: 32,
+      tempMin: 24,
+      precipitationProb: 20,
       weatherCode: 2,
       isDay: h >= 6 && h < 18,
       sunrise: '5:49',
       sunset: '17:52',
+      timezone: 'Asia/Jakarta',
       hourly: Array.from({ length: 7 }, (_, i) => ({
         time: `${String((h + i) % 24).padStart(2, '0')}:00`,
         temp: 28 - (i % 3),
         code: i < 3 ? 2 : 3,
+        precipitationProb: 15,
       })),
     };
   });
@@ -2626,7 +2784,7 @@ export default function App() {
   const animatedSunTRef = useRef<number>(0.48);
 
   // Compute target solar progress (0.08 .. 0.92) from the location's sunrise, sunset, and timezone offset
-  const targetSunT = useMemo(() => {
+  const { targetSunT, isWeatherNight } = useMemo(() => {
     const parseClockMin = (str: string, defMin: number) => {
       const m = str.match(/(\d{1,2}):(\d{2})/);
       if (!m) return defMin;
@@ -2639,18 +2797,34 @@ export default function App() {
       const cityDate = new Date(nowDate.getTime() + weatherData.utcOffsetSeconds * 1000);
       cityNowMin = cityDate.getUTCHours() * 60 + cityDate.getUTCMinutes();
     }
-    const rawProgress =
-      sunsetMin > sunriseMin
-        ? (cityNowMin - sunriseMin) / (sunsetMin - sunriseMin)
-        : 0.48;
-    return Math.min(0.92, Math.max(0.08, rawProgress));
+
+    const isDayWindow =
+      sunsetMin > sunriseMin && cityNowMin >= sunriseMin && cityNowMin < sunsetMin;
+
+    if (isDayWindow) {
+      const dayDuration = Math.max(1, sunsetMin - sunriseMin);
+      const rawDayProgress = (cityNowMin - sunriseMin) / dayDuration;
+      return {
+        targetSunT: Math.min(0.92, Math.max(0.08, rawDayProgress)),
+        isWeatherNight: false,
+      };
+    }
+
+    const nightDuration = Math.max(1, 1440 - sunsetMin + sunriseMin);
+    const elapsedNight =
+      cityNowMin >= sunsetMin
+        ? cityNowMin - sunsetMin
+        : cityNowMin + 1440 - sunsetMin;
+    const rawNightProgress = elapsedNight / nightDuration;
+    return {
+      targetSunT: Math.min(0.92, Math.max(0.08, rawNightProgress)),
+      isWeatherNight: true,
+    };
   }, [weatherData.sunrise, weatherData.sunset, weatherData.utcOffsetSeconds, nowDate]);
 
   // Smoothly animate the sun & active horizon arc along the quadratic Bezier curve whenever location or sunrise/sunset updates
   useEffect(() => {
     const currentT = animatedSunTRef.current;
-    // If refreshing the same location or switching between nearby cities with similar solar progress,
-    // sweep from slightly earlier on the horizon arc so the update is visually fluid
     const startT =
       Math.abs(targetSunT - currentT) < 0.025 && weatherAnimTick > 0
         ? Math.max(0.08, targetSunT - 0.16)
@@ -2669,7 +2843,6 @@ export default function App() {
     const step = (now: number) => {
       const elapsed = now - startTime;
       const p = Math.min(1, Math.max(0, elapsed / durationMs));
-      // Smooth cubic-out easing
       const eased = 1 - Math.pow(1 - p, 3);
       const nextVal = startT + deltaT * eased;
       animatedSunTRef.current = nextVal;
@@ -2715,7 +2888,7 @@ export default function App() {
     };
 
     try {
-      // 1. Try Direct Open-Meteo Geocoding + Forecast first so manual city typing works in both Web & Tauri standalone .exe
+      // 1. Try Direct Open-Meteo Geocoding + Accurate Forecast
       let resolvedCity = targetCity || 'Jakarta';
       let lat = -6.2088;
       let lon = 106.8456;
@@ -2726,15 +2899,20 @@ export default function App() {
           const geoRes = await fetch(
             `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
               targetCity
-            )}&count=1&language=id&format=json`
+            )}&count=5&format=json`
           );
           if (geoRes.ok) {
             const geoData = await geoRes.json();
-            const first = geoData?.results?.[0];
-            if (first && typeof first.latitude === 'number' && typeof first.longitude === 'number') {
-              resolvedCity = first.name || targetCity;
-              lat = first.latitude;
-              lon = first.longitude;
+            const results: any[] = Array.isArray(geoData?.results) ? geoData.results : [];
+            if (results.length > 0) {
+              const idMatch = results.find((r) => r.country_code?.toUpperCase() === 'ID');
+              const best =
+                idMatch ||
+                [...results].sort((a, b) => (b.population || 0) - (a.population || 0))[0] ||
+                results[0];
+              resolvedCity = best.name || targetCity;
+              lat = typeof best.latitude === 'number' ? best.latitude : lat;
+              lon = typeof best.longitude === 'number' ? best.longitude : lon;
               coordsFound = true;
             }
           }
@@ -2742,31 +2920,86 @@ export default function App() {
           // fallback to /api/weather below
         }
       } else {
-        try {
-          const ipRes = await fetch('https://ipwho.is/');
-          if (ipRes.ok) {
-            const ipData = await ipRes.json();
-            if (ipData?.success && typeof ipData.latitude === 'number' && typeof ipData.longitude === 'number') {
-              resolvedCity = ipData.city || resolvedCity;
-              lat = ipData.latitude;
-              lon = ipData.longitude;
+        // Auto-detect: First attempt HTML5 device GPS if available and fast
+        if (typeof navigator !== 'undefined' && navigator.geolocation) {
+          try {
+            const gpsCoords = await new Promise<{ lat: number; lon: number } | null>((res) => {
+              const tm = setTimeout(() => res(null), 2000);
+              navigator.geolocation.getCurrentPosition(
+                (pos) => {
+                  clearTimeout(tm);
+                  res({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+                },
+                () => {
+                  clearTimeout(tm);
+                  res(null);
+                },
+                { timeout: 1900, maximumAge: 300000, enableHighAccuracy: false }
+              );
+            });
+            if (gpsCoords) {
+              lat = gpsCoords.lat;
+              lon = gpsCoords.lon;
               coordsFound = true;
+              // Try reverse geocoding with OpenStreetMap Nominatim for clean city name
+              try {
+                const revRes = await fetch(
+                  `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`,
+                  { headers: { 'Accept-Language': 'id' } }
+                );
+                if (revRes.ok) {
+                  const revData = await revRes.json();
+                  const addr = revData?.address || {};
+                  const foundCity =
+                    addr.city || addr.town || addr.city_district || addr.county || addr.state;
+                  if (foundCity) {
+                    resolvedCity = String(foundCity).replace(/^(Kota|Kabupaten)\s+/i, '');
+                  }
+                }
+              } catch {
+                // keep resolvedCity
+              }
             }
+          } catch {
+            // ignore GPS error
           }
-        } catch {
-          // fallback below
+        }
+
+        if (!coordsFound) {
+          try {
+            const ipRes = await fetch('https://ipwho.is/');
+            if (ipRes.ok) {
+              const ipData = await ipRes.json();
+              if (ipData?.success && typeof ipData.latitude === 'number' && typeof ipData.longitude === 'number') {
+                resolvedCity = ipData.city || resolvedCity;
+                lat = ipData.latitude;
+                lon = ipData.longitude;
+                coordsFound = true;
+              }
+            }
+          } catch {
+            // fallback below
+          }
         }
       }
 
       if (coordsFound) {
         const wRes = await fetch(
-          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code,is_day&hourly=temperature_2m,weather_code&daily=sunrise,sunset&timezone=auto&forecast_days=2`
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,sunrise,sunset,precipitation_probability_max,wind_speed_10m_max&timezone=auto&forecast_days=3`
         );
         if (wRes.ok) {
           const wData = await wRes.json();
           const currentTemp = Math.round(Number(wData?.current?.temperature_2m ?? 28));
-          const weatherCode = Number(wData?.current?.weather_code ?? 2);
+          const apparentTemp = Math.round(Number(wData?.current?.apparent_temperature ?? currentTemp));
+          const humidity = Math.round(Number(wData?.current?.relative_humidity_2m ?? 70));
+          const windSpeed = Math.round(Number(wData?.current?.wind_speed_10m ?? 10));
+          const weatherCode = Number(wData?.current?.weather_code ?? 1);
           const isDay = Number(wData?.current?.is_day ?? 1) === 1;
+
+          const tempMax = Math.round(Number(wData?.daily?.temperature_2m_max?.[0] ?? currentTemp + 2));
+          const tempMin = Math.round(Number(wData?.daily?.temperature_2m_min?.[0] ?? currentTemp - 4));
+          const precipitationProb = Math.round(Number(wData?.daily?.precipitation_probability_max?.[0] ?? 0));
+
           const utcOffsetSeconds =
             typeof wData?.utc_offset_seconds === 'number' ? wData.utc_offset_seconds : undefined;
           const fmtClock = (iso: string, fallback: string) => {
@@ -2780,14 +3013,20 @@ export default function App() {
           const times: string[] = Array.isArray(wData?.hourly?.time) ? wData.hourly.time : [];
           const temps: number[] = Array.isArray(wData?.hourly?.temperature_2m) ? wData.hourly.temperature_2m : [];
           const codes: number[] = Array.isArray(wData?.hourly?.weather_code) ? wData.hourly.weather_code : [];
+          const precipProbs: number[] = Array.isArray(wData?.hourly?.precipitation_probability) ? wData.hourly.precipitation_probability : [];
 
-          let localHour = new Date().getHours();
-          if (typeof utcOffsetSeconds === 'number') {
-            localHour = new Date(Date.now() + utcOffsetSeconds * 1000).getUTCHours();
+          // Exact current hour match using Open-Meteo's current timestamp
+          const currentIso = String(wData?.current?.time || '');
+          let startIdx = times.findIndex((t) => currentIso && t.slice(0, 13) === currentIso.slice(0, 13));
+          if (startIdx < 0) {
+            let localHour = new Date().getHours();
+            if (typeof utcOffsetSeconds === 'number') {
+              localHour = new Date(Date.now() + utcOffsetSeconds * 1000).getUTCHours();
+            }
+            const nowHourStr = String(localHour).padStart(2, '0') + ':00';
+            startIdx = times.findIndex((t) => t.endsWith(`T${nowHourStr}`));
+            if (startIdx < 0) startIdx = Math.max(0, localHour);
           }
-          const nowHourStr = String(localHour).padStart(2, '0') + ':00';
-          let startIdx = times.findIndex((t) => t.endsWith(`T${nowHourStr}`));
-          if (startIdx < 0) startIdx = Math.max(0, localHour);
 
           const hourly = Array.from({ length: 7 }, (_, i) => {
             const idx = startIdx + i;
@@ -2795,19 +3034,27 @@ export default function App() {
             return {
               time: tIso.includes('T')
                 ? tIso.split('T')[1].slice(0, 5)
-                : `${String((localHour + i) % 24).padStart(2, '0')}:00`,
+                : `${String((startIdx + i) % 24).padStart(2, '0')}:00`,
               temp: typeof temps[idx] === 'number' ? Math.round(temps[idx]) : currentTemp,
               code: typeof codes[idx] === 'number' ? codes[idx] : weatherCode,
+              precipitationProb: typeof precipProbs[idx] === 'number' ? Math.round(precipProbs[idx]) : 0,
             };
           });
 
           setWeatherData({
             city: resolvedCity,
             currentTemp,
+            apparentTemp,
+            humidity,
+            windSpeed,
+            tempMax,
+            tempMin,
+            precipitationProb,
             weatherCode,
             isDay,
             sunrise,
             sunset,
+            timezone: wData?.timezone || 'Asia/Jakarta',
             utcOffsetSeconds,
             hourly,
           });
@@ -2829,10 +3076,17 @@ export default function App() {
           setWeatherData((prev) => ({
             city: data.city || targetCity || 'Jakarta',
             currentTemp: typeof data.currentTemp === 'number' ? data.currentTemp : 28,
+            apparentTemp: typeof data.apparentTemp === 'number' ? data.apparentTemp : prev.apparentTemp,
+            humidity: typeof data.humidity === 'number' ? data.humidity : prev.humidity,
+            windSpeed: typeof data.windSpeed === 'number' ? data.windSpeed : prev.windSpeed,
+            tempMax: typeof data.tempMax === 'number' ? data.tempMax : prev.tempMax,
+            tempMin: typeof data.tempMin === 'number' ? data.tempMin : prev.tempMin,
+            precipitationProb: typeof data.precipitationProb === 'number' ? data.precipitationProb : prev.precipitationProb,
             weatherCode: typeof data.weatherCode === 'number' ? data.weatherCode : 2,
             isDay: Boolean(data.isDay ?? true),
             sunrise: data.sunrise || '5:49',
             sunset: data.sunset || '17:52',
+            timezone: data.timezone || prev.timezone,
             utcOffsetSeconds:
               typeof data.utcOffsetSeconds === 'number' ? data.utcOffsetSeconds : undefined,
             hourly:
@@ -2876,6 +3130,59 @@ export default function App() {
         const n = parseFloat(clean);
         return Number.isFinite(n) ? n : 1;
       };
+
+      // 0. Dynamic Windows App Launch ("buka discord", "tolong buka spotify", "open chrome", "jalankan whatsapp")
+      const appLaunchMatch = raw.match(
+        /\b(?:tolong\s+)?(?:buka(?:kan|in)?|jalankan|run|open|launch|start)\s+(?:aplikasi|app|program|software)?\s*([a-zA-Z0-9_\-\.\s]{2,40})/i
+      );
+      if (appLaunchMatch && appLaunchMatch[1]) {
+        const rawTarget = appLaunchMatch[1].trim();
+        const isInternalTrigger =
+          /\b(terminal|cmd|powershell|cuaca|weather|shelf|notifikasi|notification|tugas|task|todo|kalender|calendar|pomodoro|timer|lirik|lyrics|lagu|musik|bluetooth|wifi|wi-fi|kecerahan|brightness|volume|mini capsule|kapsul mini)\b/i.test(
+            rawTarget
+          );
+        if (!isInternalTrigger) {
+          const cleanAppName = rawTarget
+            .replace(/\b(sekarang|dong|ya|bro|please|plis)\b/gi, '')
+            .trim();
+          if (cleanAppName.length >= 2) {
+            fetch('/api/system/launch-app', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ appName: cleanAppName }),
+            })
+              .then((r) => r.json())
+              .then((res) => {
+                if (res?.success) {
+                  const resolvedName = res.matchedName || cleanAppName;
+                  triggerActionConfirmation(
+                    `Membuka ${resolvedName}`,
+                    `“Buka ${resolvedName}”`,
+                    'OPEN',
+                    'system'
+                  );
+                }
+              })
+              .catch(() => {});
+
+            triggerActionConfirmation(
+              `Membuka ${cleanAppName}`,
+              `“Buka ${cleanAppName}”`,
+              'OPEN',
+              'system'
+            );
+            pushRealNotification(
+              'Membuka Aplikasi',
+              `Meluncurkan ${cleanAppName} di Windows...`,
+              'message'
+            );
+            return {
+              handled: true,
+              reply: `Membuka ${cleanAppName}...`,
+            };
+          }
+        }
+      }
 
       // 0a. Scheduled Task / To-Do ("tambahin task olahraga di jam 5 pagi", "tambahkan tugas untuk besok", "buat task meeting jam 14:30")
       const todoCmdMatch = raw.match(
@@ -3500,7 +3807,10 @@ export default function App() {
   const activeAudioNodesRef = useRef<AudioBufferSourceNode[]>([]);
   const liveInputAccRef = useRef<string>('');
   const liveOutputAccRef = useRef<string>('');
-  const handleAskGeminiRef = useRef<(promptText: string) => void>(() => {});
+  const handleAskGeminiRef = useRef<(promptText: string, optionalAudioB64?: string) => void>(() => {});
+  const recordedVoiceChunksRef = useRef<Float32Array[]>([]);
+  const hasDetectedSpeechRef = useRef<boolean>(false);
+  const lastSpeechDetectedTimeRef = useRef<number>(0);
 
   // Real Voice Agent State (No fake transcripts!)
   const [agentTranscript, setAgentTranscript] = useState('');
@@ -3725,6 +4035,9 @@ export default function App() {
       outputAudioCtxRef.current.close().catch(() => {});
       outputAudioCtxRef.current = null;
     }
+    recordedVoiceChunksRef.current = [];
+    hasDetectedSpeechRef.current = false;
+    lastSpeechDetectedTimeRef.current = 0;
     setVoiceListening(false);
     setLiveConnected(false);
   }, []);
@@ -4005,7 +4318,7 @@ export default function App() {
     wifiEnabled,
   ]);
 
-  const handleAskGemini = async (promptText: string) => {
+  const handleAskGemini = async (promptText: string, optionalAudioB64?: string) => {
     const rawQ = promptText.trim().slice(0, 1000);
     // Detect auto-screenshot intent ("ambil screenshot", "tangkap layar", "lihat layarku sekarang", etc.)
     const isAutoScreenshotIntent =
@@ -4013,7 +4326,7 @@ export default function App() {
         rawQ
       );
 
-    if (!rawQ && !pendingImage && !isAutoScreenshotIntent) return;
+    if (!rawQ && !pendingImage && !isAutoScreenshotIntent && !optionalAudioB64) return;
 
     // Chaos Guard: Block duplicate rapid-fire Enter spam while a request is already in-flight
     const now = Date.now();
@@ -4030,7 +4343,7 @@ export default function App() {
     setAssistantInput('');
     setShowAllChatHistory(false);
     const effectivePrompt =
-      rawQ || 'Tolong analisis dan jelaskan apa yang ada pada gambar ini secara ringkas.';
+      rawQ || (optionalAudioB64 ? 'Pesan suara' : 'Tolong analisis dan jelaskan apa yang ada pada gambar ini secara ringkas.');
     setAgentTranscript(effectivePrompt);
     setAssistantLoading(true);
     setBotForm('thinking');
@@ -4043,10 +4356,14 @@ export default function App() {
     }
 
     // Only execute local non-vision shortcut commands if there is no image/screenshot to analyze
-    const localCmd = !imageToSend ? executeIslandCommand(effectivePrompt) : { handled: false };
+    const localCmd = !imageToSend && !optionalAudioB64 ? executeIslandCommand(effectivePrompt) : { handled: false };
     setAgentHeadline(
       localCmd.reply ||
-        (imageToSend ? 'Menganalisis gambar dengan Vision AI...' : 'Isle Assistant thinking...')
+        (optionalAudioB64
+          ? 'Memproses pesan suara dengan Gemini AI...'
+          : imageToSend
+          ? 'Menganalisis gambar dengan Vision AI...'
+          : 'Isle Assistant thinking...')
     );
 
     const userMsgId = now;
@@ -4095,6 +4412,12 @@ export default function App() {
         body: JSON.stringify({
           prompt: effectivePrompt,
           model: assistantModel,
+          audio: optionalAudioB64
+            ? {
+                data: optionalAudioB64,
+                mimeType: 'audio/wav',
+              }
+            : undefined,
           image: imageToSend
             ? {
                 data: imageToSend.base64,
@@ -4137,6 +4460,15 @@ export default function App() {
       setAgentHeadline(replyText);
       const sources = Array.isArray(data.searchSources) ? data.searchSources : [];
       setLatestSearchSources(sources);
+
+      // Cancel any ongoing speech synthesis if any
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel();
+        } catch {
+          // ignore
+        }
+      }
 
       const newReplyId = Date.now() + 2;
       const initialChars = Math.min(replyText.length, Math.max(8, Math.ceil(replyText.length / 18)));
@@ -4398,6 +4730,35 @@ export default function App() {
           triggerAlert('brightness', { value: next });
           return next;
         });
+      } else if (data.action === 'launch_app' && data.actionParam) {
+        const appTarget = data.actionParam.trim();
+        fetch('/api/system/launch-app', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ appName: appTarget }),
+        })
+          .then((r) => r.json())
+          .then((res) => {
+            const resolved = res?.matchedName || appTarget;
+            triggerActionConfirmation(
+              `Membuka ${resolved}`,
+              `“Buka ${resolved}”`,
+              'OPEN',
+              'system'
+            );
+          })
+          .catch(() => {});
+        triggerActionConfirmation(
+          `Membuka ${appTarget}`,
+          `“Buka ${appTarget}”`,
+          'OPEN',
+          'system'
+        );
+        pushRealNotification(
+          'Membuka Aplikasi',
+          `Meluncurkan ${appTarget} di Windows...`,
+          'message'
+        );
       } else if (data.action === 'brightness_down') {
         setBrightness((curr) => {
           const next = Math.max(1, curr - 2);
@@ -4588,7 +4949,45 @@ export default function App() {
         // Fallback to SpeechRecognition if WS fails
       }
 
-      // 2. Capture 16kHz Microphone Audio Stream & Stream PCM chunks to Gemini 3.8 Live WS
+      // 2. State & Handlers for Speech Recognition and Audio Multimodal Fallback
+      recordedVoiceChunksRef.current = [];
+      hasDetectedSpeechRef.current = false;
+      lastSpeechDetectedTimeRef.current = 0;
+      let latestCombinedTranscript = '';
+      let submitted = false;
+
+      const submitFallbackIfLiveSilent = (textToSubmit: string) => {
+        if (submitted) return;
+        const cleaned = textToSubmit.trim();
+        if (!cleaned) return;
+        // If Gemini 3.8 Live already responded with audio/transcription, execute local command only
+        if (wsConnected && liveOutputAccRef.current.trim().length > 0) {
+          executeIslandCommand(cleaned);
+          return;
+        }
+        submitted = true;
+        stopVoiceRecognition();
+        handleAskGeminiRef.current(cleaned);
+      };
+
+      const submitAudioFallbackIfLiveSilent = () => {
+        if (submitted) return;
+        if (wsConnected && liveOutputAccRef.current.trim().length > 0) {
+          return;
+        }
+        if (latestCombinedTranscript.trim().length > 0) {
+          submitFallbackIfLiveSilent(latestCombinedTranscript);
+          return;
+        }
+        if (recordedVoiceChunksRef.current.length < 5) return;
+        submitted = true;
+        const wavB64 = float32ToWavBase64(recordedVoiceChunksRef.current, 16000);
+        stopVoiceRecognition();
+        setAgentHeadline('Memproses pesan suara...');
+        handleAskGeminiRef.current('Pesan suara', wavB64);
+      };
+
+      // 3. Capture 16kHz Microphone Audio Stream & Stream PCM chunks to Gemini 3.8 Live WS + Record WAV Buffer
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         navigator.mediaDevices
           .getUserMedia({
@@ -4611,6 +5010,12 @@ export default function App() {
 
             processor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
+              // Save raw audio chunk for multimodal audio fallback (cap at ~250 chunks ~32s)
+              recordedVoiceChunksRef.current.push(new Float32Array(inputData));
+              if (recordedVoiceChunksRef.current.length > 250) {
+                recordedVoiceChunksRef.current.shift();
+              }
+
               // Update real-time microphone RMS energy for BotCanvas
               let sum = 0;
               for (let i = 0; i < inputData.length; i += 4) {
@@ -4619,9 +5024,25 @@ export default function App() {
               const rms = Math.sqrt(sum / (inputData.length / 4));
               voiceEnergyRef.current = Math.min(1, Math.max(0.12, rms * 6.5));
 
+              if (rms > 0.012) {
+                hasDetectedSpeechRef.current = true;
+                lastSpeechDetectedTimeRef.current = Date.now();
+              }
+
               if (liveWsRef.current && liveWsRef.current.readyState === WebSocket.OPEN) {
                 const base64Pcm = float32ToPcm16Base64(inputData);
                 liveWsRef.current.send(JSON.stringify({ audio: base64Pcm }));
+              }
+
+              // VAD Silence Detection Fallback: if user spoke and then fell silent for > 1200ms
+              if (
+                hasDetectedSpeechRef.current &&
+                lastSpeechDetectedTimeRef.current > 0 &&
+                Date.now() - lastSpeechDetectedTimeRef.current > 1200 &&
+                !submitted &&
+                liveOutputAccRef.current.trim().length === 0
+              ) {
+                submitAudioFallbackIfLiveSilent();
               }
             };
 
@@ -4633,7 +5054,7 @@ export default function App() {
           });
       }
 
-      // 3. Parallel Browser SpeechRecognition for live local transcript & Search-Grounded action fallback
+      // 4. Parallel Browser SpeechRecognition for live local transcript & Search-Grounded action fallback
       const SpeechRec =
         (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
@@ -4645,23 +5066,6 @@ export default function App() {
           rec.interimResults = true;
           rec.continuous = true;
           rec.maxAlternatives = 1;
-
-          let latestCombinedTranscript = '';
-          let submitted = false;
-
-          const submitFallbackIfLiveSilent = (textToSubmit: string) => {
-            if (submitted) return;
-            const cleaned = textToSubmit.trim();
-            if (!cleaned) return;
-            // If Gemini 3.8 Live already responded with audio/transcription, execute local command only
-            if (wsConnected && liveOutputAccRef.current.trim().length > 0) {
-              executeIslandCommand(cleaned);
-              return;
-            }
-            submitted = true;
-            stopVoiceRecognition();
-            handleAskGeminiRef.current(cleaned);
-          };
 
           rec.onresult = (event: any) => {
             let finalPart = '';
@@ -4678,6 +5082,8 @@ export default function App() {
             const combined = (finalPart + interimPart).trim();
             if (combined) {
               latestCombinedTranscript = combined;
+              hasDetectedSpeechRef.current = true;
+              lastSpeechDetectedTimeRef.current = Date.now();
               setAgentTranscript(combined);
               setAssistantInput(combined);
 
@@ -5066,23 +5472,23 @@ export default function App() {
           tintRgb: [1, 0.6, 0.1] as [number, number, number],
         };
       }
-      if (activeAlert.type === 'action_confirm') {
+      if (activeAlert.type === 'action_confirm' || activeAlert.type === 'notification') {
         return {
-          targetW: 416,
-          targetH: 56,
-          targetR: 22,
-          targetS: 13,
+          targetW: 468,
+          targetH: 62,
+          targetR: 24,
+          targetS: 14,
           tintStyle: 'glow' as const,
-          tintRgb: [0.95, 0.72, 0.22] as [number, number, number],
+          tintRgb: [0.18, 0.72, 0.96] as [number, number, number],
         };
       }
       return {
-        targetW: 384,
+        targetW: 416,
         targetH: 56,
         targetR: 22,
         targetS: 13,
-        tintStyle: 'none' as const,
-        tintRgb: [0.2, 0.5, 0.95] as [number, number, number],
+        tintStyle: 'glow' as const,
+        tintRgb: [0.18, 0.72, 0.96] as [number, number, number],
       };
     }
 
@@ -5119,12 +5525,12 @@ export default function App() {
           tintRgb: [0.56, 0.4, 1] as [number, number, number],
         };
       }
-      // Sleek Compact AI Width (388px) + Auto-Fitting Height for Full AI Answer + Vision Preview
-      let dynamicAiHeight = pendingImage ? 148 : 112;
+      // Sleek AI Width (418px) + Generous Auto-Fitting Height so New Chat and Responses Never Cut Off
+      let dynamicAiHeight = pendingImage ? 190 : 172;
       if (showAllChatHistory) {
-        dynamicAiHeight = 236;
+        dynamicAiHeight = 244;
       } else if (assistantLoading) {
-        dynamicAiHeight = pendingImage ? 146 : 114;
+        dynamicAiHeight = pendingImage ? 190 : 172;
       } else if (latestAssistantMessage) {
         const estLines = Math.max(1, Math.ceil(latestAssistantMessage.text.length / 42));
         const hasSources = Boolean(
@@ -5136,19 +5542,19 @@ export default function App() {
         );
         const hasImg = Boolean(latestAssistantMessage.imageUrl || pendingImage);
         dynamicAiHeight = Math.min(
-          260,
+          270,
           Math.max(
-            132,
-            86 +
-              estLines * 17 +
-              (hasSources ? 16 : 0) +
-              (hasCmdOrFiles ? 34 : 0) +
-              (hasImg ? 36 : 0)
+            172,
+            100 +
+              estLines * 18 +
+              (hasSources ? 20 : 0) +
+              (hasCmdOrFiles ? 36 : 0) +
+              (hasImg ? 40 : 0)
           )
         );
       }
       return {
-        targetW: 388,
+        targetW: 418,
         targetH: dynamicAiHeight,
         targetR: 24,
         targetS: 14,
@@ -5281,7 +5687,7 @@ export default function App() {
           >
             {/* Header Waktu & Baterai (.top-bar — Smoothly fades & collapses when entering Lyrics Mode) */}
             <div
-              className={`flex items-center justify-center gap-[7px] text-[13px] pl-[30px] whitespace-nowrap transition-all duration-400 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              className={`isle-stagger-1 flex items-center justify-center gap-[7px] text-[13px] pl-[30px] whitespace-nowrap transition-all duration-400 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                 lyricsMode
                   ? 'max-h-0 opacity-0 -translate-y-2 scale-95 blur-[3px] mb-0 pointer-events-none overflow-hidden'
                   : 'max-h-[24px] opacity-100 translate-y-0 scale-100 blur-0 mb-[2px]'
@@ -5297,7 +5703,7 @@ export default function App() {
             {/* Optional Top-Right Waveform / Queue / FLAC when playing (Fades out smoothly in Lyrics Mode) */}
             {(activeTrack || flacEnabled || musicQueue.length > 0) && (
               <div
-                className={`absolute top-[13px] right-[26px] flex items-center gap-1.5 z-10 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                className={`isle-stagger-1 absolute top-[13px] right-[26px] flex items-center gap-1.5 z-10 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                   lyricsMode
                     ? 'opacity-0 scale-90 blur-[2px] pointer-events-none'
                     : 'opacity-100 scale-100 blur-0'
@@ -5355,7 +5761,7 @@ export default function App() {
               >
                 {/* Album Art & Teks (.media-info) */}
                 <div
-                  className={`flex items-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  className={`isle-stagger-2 flex items-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     lyricsMode ? 'gap-[14px] mt-0 mb-[10px]' : 'gap-[18px] -mt-[10px] mb-[12px]'
                   }`}
                 >
@@ -5371,7 +5777,7 @@ export default function App() {
                     />
                   ) : (
                     <div
-                      className={`bg-[#1c1c1e] flex items-center justify-center shrink-0 transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                      className={`bg-white/[0.06] border border-white/[0.08] flex items-center justify-center shrink-0 transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                         lyricsMode
                           ? 'w-[56px] h-[56px] rounded-[13px]'
                           : 'w-[66px] h-[66px] rounded-[14px]'
@@ -5381,7 +5787,7 @@ export default function App() {
                         width={lyricsMode ? 26 : 32}
                         height={lyricsMode ? 26 : 32}
                         viewBox="0 0 24 24"
-                        fill="#555558"
+                        fill="#8e8e93"
                         className="transition-all duration-500"
                       >
                         <path d="M20 3L9 5v10.55c-.59-.34-1.27-.55-2-.55-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V9.82l8-1.6v5.33c-.59-.34-1.27-.55-2-.55-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V3z" />
@@ -5424,14 +5830,14 @@ export default function App() {
 
                 {/* Progress Bar (.progress-row — Smoothly morphs width with Left Column) */}
                 <div
-                  className={`flex items-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  className={`isle-stagger-3 flex items-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     lyricsMode ? 'gap-[10px] mb-[8px]' : 'gap-[12px] mb-[10px]'
                   }`}
                 >
                   <span
                     className={`font-medium tracking-[-0.3px] tabular-nums shrink-0 transition-all duration-300 ${
                       lyricsMode ? 'text-[13px]' : 'text-[14px]'
-                    } ${controlsActive ? 'text-white' : 'text-[#555558]'}`}
+                    } ${controlsActive ? 'text-white' : 'text-white/45'}`}
                   >
                     {formatTrackTime(activeTrack ? positionMs : 0)}
                   </span>
@@ -5444,7 +5850,7 @@ export default function App() {
                       handleSeek(nextMs);
                     }}
                     className={`flex-1 h-[5px] rounded-[3px] relative cursor-pointer flex items-center overflow-hidden transition-colors duration-300 ${
-                      controlsActive ? 'bg-white/25' : 'bg-[#242426]'
+                      controlsActive ? 'bg-white/25' : 'bg-white/15'
                     }`}
                   >
                     {activeTrack && activeTrack.durationMs > 0 && (
@@ -5459,7 +5865,7 @@ export default function App() {
                   <span
                     className={`font-medium tracking-[-0.3px] tabular-nums shrink-0 transition-all duration-300 ${
                       lyricsMode ? 'text-[13px]' : 'text-[14px]'
-                    } ${controlsActive ? 'text-white' : 'text-[#555558]'}`}
+                    } ${controlsActive ? 'text-white' : 'text-white/45'}`}
                   >
                     {activeTrack
                       ? formatTrackTime(Math.max(0, activeTrack.durationMs - positionMs), true)
@@ -5469,7 +5875,7 @@ export default function App() {
 
                 {/* Tombol Kontrol (.controls-row — Glides smoothly with Left Column) */}
                 <div
-                  className={`relative flex items-center justify-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  className={`isle-stagger-4 relative flex items-center justify-center w-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     lyricsMode ? 'h-[28px] mb-0' : 'h-[26px] mb-[8px]'
                   }`}
                 >
@@ -5752,7 +6158,7 @@ export default function App() {
                 pushRealNotification(title, sub, 'message');
                 setNewNotifInput('');
               }}
-              className="flex items-center gap-1.5 shrink-0"
+              className="isle-stagger-1 flex items-center gap-1.5 shrink-0"
             >
               <input
                 type="text"
@@ -5791,17 +6197,21 @@ export default function App() {
             </form>
 
             {notifications.length === 0 ? (
-              <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-white/40 text-[11px]">
+              <div className="isle-stagger-2 flex-1 min-h-0 flex items-center justify-center gap-2 text-white/40 text-[11px]">
                 <BellOutlineSvg size={13} />
                 <span className="truncate">
                   {dndEnabled ? 'Do Not Disturb aktif · ' : ''}Belum ada notifikasi baru
                 </span>
               </div>
             ) : (
-              <div className="flex-1 min-h-0 flex flex-col justify-start space-y-1 overflow-y-auto no-scrollbar pt-1.5">
-                {notifications.map((n) => (
+              <div className="isle-stagger-2 flex-1 min-h-0 flex flex-col justify-start space-y-1 overflow-y-auto no-scrollbar pt-1.5">
+                {notifications.map((n, idx) => (
                   <div
                     key={n.id}
+                    style={{
+                      animation: 'isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                      animationDelay: `${Math.min(240, 40 + idx * 45)}ms`,
+                    }}
                     className="group flex items-center justify-between gap-2 px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition shrink-0"
                   >
                     <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -5850,7 +6260,7 @@ export default function App() {
             className="w-full h-full flex flex-col justify-center items-center gap-3 px-6 py-2"
           >
             {/* Center Section: Centered Left Glowing Red Badge, Big Timer & Reset, Subtitle */}
-            <div className="flex items-center justify-center gap-6 px-1 w-full">
+            <div className="isle-stagger-1 flex items-center justify-center gap-6 px-1 w-full">
               {/* Left Glowing Red Circular Stopwatch Badge */}
               <div
                 onClick={() => setPomoRunning((r) => !r)}
@@ -5891,7 +6301,7 @@ export default function App() {
             </div>
 
             {/* Bottom Row: [ Short Break ], [ ▶ ] Red Pill, [ Focus Time ] */}
-            <div className="flex items-center justify-center gap-3 pt-1">
+            <div className="isle-stagger-2 flex items-center justify-center gap-3 pt-1">
               <button
                 onClick={() => {
                   setPomoRunning(false);
@@ -5944,7 +6354,7 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
             className="w-full h-full flex items-center justify-between px-10 py-1 gap-5"
           >
-            <div className="flex flex-col justify-between h-full py-1">
+            <div className="isle-stagger-1 flex flex-col justify-between h-full py-1">
               <div>
                 <div className="text-[28px] font-bold tracking-tight text-white leading-none tabular-nums">
                   {completedCount}/{tasks.length}
@@ -5983,7 +6393,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="w-[260px] h-[104px] rounded-2xl bg-[#121216] border border-white/[0.07] p-2.5 overflow-y-auto no-scrollbar flex flex-col justify-between">
+            <div className="isle-stagger-2 w-[260px] h-[104px] rounded-2xl bg-white/[0.04] backdrop-blur-md border border-white/[0.08] p-2.5 overflow-y-auto no-scrollbar flex flex-col justify-between">
               <div className="space-y-1.5">
                 {tasks.length === 0 && !addingTask ? (
                   <div className="text-[11px] text-white/40 py-2 text-center">
@@ -6212,19 +6622,19 @@ export default function App() {
                 onClick={() => {
                   addFilesToShelf([SAMPLE_DRAGGABLE_FILES[0]]);
                 }}
-                className="w-full h-[108px] rounded-2xl border border-dashed border-white/25 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex flex-col items-center justify-center cursor-pointer"
+                className="isle-stagger-1 w-full h-[108px] rounded-2xl border border-dashed border-white/25 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex flex-col items-center justify-center cursor-pointer"
               >
-                <div className="text-white/85 mb-1.5">
+                <div className="isle-stagger-2 text-white/85 mb-1.5">
                   <ShelfTraySvg size={22} />
                 </div>
-                <div className="text-[12.5px] font-semibold text-white">Drop files here</div>
-                <div className="text-[10.5px] text-white/40 mt-0.5">
+                <div className="isle-stagger-2 text-[12.5px] font-semibold text-white">Drop files here</div>
+                <div className="isle-stagger-3 text-[10.5px] text-white/40 mt-0.5">
                   Drag out anytime · click to open
                 </div>
               </div>
             ) : (
-              <div className="w-full h-[108px] flex items-center justify-start gap-4 px-2 overflow-x-auto no-scrollbar">
-                {shelfFiles.map((file) => (
+              <div className="isle-stagger-1 w-full h-[108px] flex items-center justify-start gap-4 px-2 overflow-x-auto no-scrollbar">
+                {shelfFiles.map((file, idx) => (
                   <div
                     key={file.id}
                     draggable
@@ -6233,7 +6643,8 @@ export default function App() {
                       ev.dataTransfer.effectAllowed = 'copyMove';
                     }}
                     style={{
-                      animation: 'shelfFilePopIn 280ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
+                      animation: 'shelfFilePopIn 320ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
+                      animationDelay: `${30 + idx * 45}ms`,
                     }}
                     className="relative group flex flex-col items-center w-[72px] shrink-0 cursor-grab active:cursor-grabbing py-1 rounded-xl hover:bg-white/[0.06] transition"
                     title={`${file.name} (${file.size}) — Drag out or click × to remove`}
@@ -6286,7 +6697,7 @@ export default function App() {
             className="w-full h-full flex items-stretch justify-between px-9 py-0.5 gap-4 overflow-hidden"
           >
             {/* Compact Left Calendar Grid (Fits 6 weeks cleanly inside 170px uniform island height with zero clipping) */}
-            <div className="w-[162px] shrink-0 flex flex-col justify-between py-0.5">
+            <div className="isle-stagger-1 w-[162px] shrink-0 flex flex-col justify-between py-0.5">
               <div className="flex items-center justify-between leading-none">
                 <div
                   onClick={() => {
@@ -6381,7 +6792,7 @@ export default function App() {
             </div>
 
             {/* Right Column: Events, Smart Alarms & World Clocks */}
-            <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5 overflow-hidden">
+            <div className="isle-stagger-2 flex-1 min-w-0 flex flex-col justify-between py-0.5 overflow-hidden">
               <div className="flex items-center justify-between gap-1.5 shrink-0 whitespace-nowrap leading-none">
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button
@@ -6428,7 +6839,7 @@ export default function App() {
                       e.preventDefault();
                       handleAddCalendarEvent(newEventInput);
                     }}
-                    className="flex items-center gap-1.5 bg-[#1c1c21] border border-white/[0.06] rounded-full px-2.5 py-0.5 my-1 shrink-0"
+                    className="isle-stagger-3 flex items-center gap-1.5 bg-white/[0.06] border border-white/[0.08] rounded-full px-2.5 py-0.5 my-1 shrink-0"
                   >
                     <span className="text-white/45">
                       <PlusSvg size={10} />
@@ -6442,7 +6853,7 @@ export default function App() {
                     />
                   </form>
 
-                  <div className="flex-1 min-h-0 space-y-1 overflow-y-auto no-scrollbar">
+                  <div className="isle-stagger-3 flex-1 min-h-0 space-y-1 overflow-y-auto no-scrollbar">
                     {selectedDayEvents.length === 0 ? (
                       <div className="text-[10.5px] text-white/35 py-0.5 truncate">
                         No events scheduled for this day
@@ -6601,15 +7012,18 @@ export default function App() {
 
         const getWeatherConditionLabel = (code: number, isDayTime: boolean): string => {
           if (code === 0) return isDayTime ? 'Cerah' : 'Malam Cerah';
-          if (code === 1 || code === 2) return 'Cerah Berawan';
+          if (code === 1) return isDayTime ? 'Cerah Sebagian' : 'Sebagian Cerah';
+          if (code === 2) return 'Cerah Berawan';
           if (code === 3) return 'Berawan';
-          if (code === 45 || code === 48) return 'Berkabut';
-          if (code >= 51 && code <= 57) return 'Gerimis';
-          if (code >= 61 && code <= 67) return 'Hujan Ringan';
+          if (code === 45) return 'Berkabut';
+          if (code === 48) return 'Kabut Tebal';
+          if (code >= 51 && code <= 55) return 'Gerimis';
+          if (code >= 56 && code <= 57) return 'Gerimis Dingin';
+          if (code >= 61 && code <= 67) return 'Hujan';
           if (code >= 71 && code <= 77) return 'Bersalju';
           if (code >= 80 && code <= 82) return 'Hujan Deras';
           if (code >= 95) return 'Hujan Petir';
-          return 'Cerah Berawan';
+          return isDayTime ? 'Cerah Berawan' : 'Berawan';
         };
 
         const weatherConditionText = getWeatherConditionLabel(
@@ -6684,32 +7098,33 @@ export default function App() {
             );
           }
 
-          // 3, 45, 48: Overcast / Fog (Layered Sculpted Clouds)
+          // 3, 45, 48: Overcast / Fog (Clean Minimalist Luxury Cloud — No dark circle behind)
           if (code === 3 || code === 45 || code === 48) {
             return (
               <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
-                <circle cx={19.5} cy={8.5} r={4} fill="#64748b" opacity={0.85} />
                 <path
-                  d="M8.5 18.5h10.2c2.6 0 4.6-2 4.6-4.5 0-2.3-1.7-4.2-3.9-4.4-.7-2.6-3-4.5-5.8-4.5-3.3 0-6 2.7-6 6 0 .3 0 .6.1.9-1.6.5-2.8 2-2.8 3.8 0 1.5 1.6 2.7 3.6 2.7z"
-                  fill="#94a3b8"
+                  d="M8.5 18.2h10.4c2.5 0 4.5-1.9 4.5-4.3 0-2.2-1.6-4-3.8-4.3-.7-2.5-3-4.3-5.7-4.3-3.2 0-5.8 2.6-5.8 5.8 0 .3 0 .6.1.8-1.5.5-2.7 1.9-2.7 3.6 0 1.5 1.5 2.7 3 2.7z"
+                  fill="rgba(226, 232, 240, 0.88)"
                 />
               </svg>
             );
           }
 
-          // 1, 2 (Default): Partly Cloudy (Warm Sun by Day or Soft Moon Accent by Night behind Cloud)
+          // 1, 2 (Default): Partly Cloudy (Warm Sun Accent by Day, Clean Sculpted Cloud by Night without dark blob)
           return (
             <svg width={24} height={18} viewBox="0 0 28 22" className="shrink-0">
-              <circle
-                cx={19.5}
-                cy={8.2}
-                r={4}
-                fill={isNightHour ? '#8fa0b5' : '#facc15'}
-                opacity={0.9}
-              />
+              {!isNightHour && (
+                <circle
+                  cx={19.2}
+                  cy={8.2}
+                  r={3.6}
+                  fill="#fbbf24"
+                  opacity={0.95}
+                />
+              )}
               <path
-                d="M8.5 18.5h10.2c2.6 0 4.6-2 4.6-4.5 0-2.3-1.7-4.2-3.9-4.4-.7-2.6-3-4.5-5.8-4.5-3.3 0-6 2.7-6 6 0 .3 0 .6.1.9-1.6.5-2.8 2-2.8 3.8 0 1.5 1.6 2.7 3.6 2.7z"
-                fill={isNightHour ? '#64748b' : '#cbd5e1'}
+                d="M8.5 18.2h10.4c2.5 0 4.5-1.9 4.5-4.3 0-2.2-1.6-4-3.8-4.3-.7-2.5-3-4.3-5.7-4.3-3.2 0-5.8 2.6-5.8 5.8 0 .3 0 .6.1.8-1.5.5-2.7 1.9-2.7 3.6 0 1.5 1.5 2.7 3 2.7z"
+                fill={isNightHour ? 'rgba(203, 213, 225, 0.85)' : 'rgba(241, 245, 249, 0.95)'}
               />
             </svg>
           );
@@ -6722,8 +7137,8 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
             className="relative w-full h-full flex flex-col justify-between overflow-hidden rounded-b-[32px] select-none pt-0.5 pb-0.5"
           >
-            {/* Center Current Conditions (Golden Solar Horizon Curve + Sunrise/Sunset + Cleanly Spaced Center Temp) */}
-            <div className="relative w-full h-[68px] flex items-center justify-center shrink-0 -mt-1">
+            {/* Center Current Conditions (Day Solar / Night Lunar Horizon Curve + Sunrise/Sunset + Minimalist Center Temp) */}
+            <div className="isle-stagger-1 relative w-full h-[68px] flex items-center justify-center shrink-0 -mt-1">
               <div
                 className={`relative w-full h-full flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                   isSwitchingCity
@@ -6738,6 +7153,7 @@ export default function App() {
                   className="overflow-visible pointer-events-none"
                 >
                   <defs>
+                    {/* Day Solar Gradients */}
                     <linearGradient id="isleSolarArcBaseGrad" x1="0%" y1="0%" x2="100%" y2="0%">
                       <stop offset="0%" stopColor="#eab308" stopOpacity="0.08" />
                       <stop offset="25%" stopColor="#facc15" stopOpacity="0.32" />
@@ -6755,44 +7171,124 @@ export default function App() {
                       <stop offset="55%" stopColor="#eab308" stopOpacity="0.16" />
                       <stop offset="100%" stopColor="#eab308" stopOpacity="0" />
                     </radialGradient>
+
+                    {/* Night Lunar Dark Blue Gradients */}
+                    <linearGradient id="isleLunarArcBaseGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#1e3a8a" stopOpacity="0.12" />
+                      <stop offset="25%" stopColor="#1d4ed8" stopOpacity="0.38" />
+                      <stop offset="50%" stopColor="#3b82f6" stopOpacity="0.48" />
+                      <stop offset="75%" stopColor="#1d4ed8" stopOpacity="0.38" />
+                      <stop offset="100%" stopColor="#1e3a8a" stopOpacity="0.12" />
+                    </linearGradient>
+                    <linearGradient id="isleLunarArcActiveGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#1e3a8a" stopOpacity="0.35" />
+                      <stop offset="50%" stopColor="#2563eb" stopOpacity="0.92" />
+                      <stop offset="100%" stopColor="#60a5fa" stopOpacity="1" />
+                    </linearGradient>
+                    <radialGradient id="isleMoonGlow" cx="50%" cy="50%" r="50%">
+                      <stop offset="0%" stopColor="#60a5fa" stopOpacity="0.44" />
+                      <stop offset="55%" stopColor="#1d4ed8" stopOpacity="0.18" />
+                      <stop offset="100%" stopColor="#1e3a8a" stopOpacity="0" />
+                    </radialGradient>
                   </defs>
 
-                  {/* Full Horizon Base Track */}
+                  {/* Full Horizon Base Track (Smoothly cross-fades between Day Gold and Night Dark Blue) */}
                   <path
                     d={`M ${p0x} ${p0y} Q ${p1x} ${p1y} ${p2x} ${p2y}`}
                     fill="none"
                     stroke="url(#isleSolarArcBaseGrad)"
                     strokeWidth={3.6}
                     strokeLinecap="round"
+                    style={{
+                      opacity: isWeatherNight ? 0 : 1,
+                      transition: 'opacity 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                    }}
+                  />
+                  <path
+                    d={`M ${p0x} ${p0y} Q ${p1x} ${p1y} ${p2x} ${p2y}`}
+                    fill="none"
+                    stroke="url(#isleLunarArcBaseGrad)"
+                    strokeWidth={3.6}
+                    strokeLinecap="round"
+                    style={{
+                      opacity: isWeatherNight ? 1 : 0,
+                      transition: 'opacity 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                    }}
                   />
 
-                  {/* Smoothly Animated Traversed Solar Arc up to Current Sun Position */}
+                  {/* Smoothly Animated Traversed Arc up to Current Sun / Moon Position */}
                   <path
                     d={`M ${p0x} ${p0y} Q ${activeCtrlX} ${activeCtrlY} ${sunX} ${sunY}`}
                     fill="none"
                     stroke="url(#isleSolarArcActiveGrad)"
                     strokeWidth={4}
                     strokeLinecap="round"
+                    style={{
+                      opacity: isWeatherNight ? 0 : 1,
+                      transition: 'opacity 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                    }}
+                  />
+                  <path
+                    d={`M ${p0x} ${p0y} Q ${activeCtrlX} ${activeCtrlY} ${sunX} ${sunY}`}
+                    fill="none"
+                    stroke="url(#isleLunarArcActiveGrad)"
+                    strokeWidth={4}
+                    strokeLinecap="round"
+                    style={{
+                      opacity: isWeatherNight ? 1 : 0,
+                      transition: 'opacity 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                    }}
                   />
 
-                  {/* Ambient Warm Solar Glow Behind Sun (Follows exact Bezier curve coordinates) */}
-                  <circle cx={sunX} cy={sunY} r={30} fill="url(#isleSunGlow)" />
+                  {/* Ambient Glow Behind Celestial Body */}
+                  <circle
+                    cx={sunX}
+                    cy={sunY}
+                    r={30}
+                    fill={isWeatherNight ? 'url(#isleMoonGlow)' : 'url(#isleSunGlow)'}
+                  />
 
-                  {/* Sun Core + 8 Surrounding Ray Dots */}
+                  {/* Celestial Body: Sun Core + Rays by Day, Crescent Moon + Star Accents by Night */}
                   <g transform={`translate(${sunX}, ${sunY})`}>
-                    <circle cx={0} cy={0} r={10.5} fill="#f7d648" />
-                    {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => {
-                      const rad = (deg * Math.PI) / 180;
-                      const rx = Math.cos(rad) * 16.5;
-                      const ry = Math.sin(rad) * 16.5;
-                      return <circle key={deg} cx={rx} cy={ry} r={1.6} fill="#f7d648" />;
-                    })}
+                    {/* Day Sun Element */}
+                    <g
+                      style={{
+                        opacity: isWeatherNight ? 0 : 1,
+                        transform: isWeatherNight ? 'scale(0.65) rotate(-25deg)' : 'scale(1) rotate(0deg)',
+                        transition: 'opacity 450ms ease, transform 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                      }}
+                    >
+                      <circle cx={0} cy={0} r={10.5} fill="#f7d648" />
+                      {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => {
+                        const rad = (deg * Math.PI) / 180;
+                        const rx = Math.cos(rad) * 16.5;
+                        const ry = Math.sin(rad) * 16.5;
+                        return <circle key={deg} cx={rx} cy={ry} r={1.6} fill="#f7d648" />;
+                      })}
+                    </g>
+
+                    {/* Night Crescent Moon Element */}
+                    <g
+                      style={{
+                        opacity: isWeatherNight ? 1 : 0,
+                        transform: isWeatherNight ? 'scale(1) rotate(0deg)' : 'scale(0.65) rotate(25deg)',
+                        transition: 'opacity 450ms ease, transform 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                      }}
+                    >
+                      <circle cx={0} cy={0} r={12.5} fill="#0f172a" opacity={0.55} />
+                      <path
+                        d="M2.2 -9.8A10.2 10.2 0 1 0 10.2 5.4A8.2 8.2 0 0 1 2.2 -9.8Z"
+                        fill="#e2e8f0"
+                      />
+                      <circle cx={-12} cy={-7} r={1.15} fill="#93c5fd" opacity={0.9} />
+                      <circle cx={11} cy={-8.5} r={0.95} fill="#bfdbfe" opacity={0.75} />
+                    </g>
                   </g>
                 </svg>
 
                 {/* Left Sunrise Label */}
                 <div
-                  className={`absolute left-9 bottom-0.5 flex flex-col items-center leading-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  className={`isle-stagger-2 absolute left-9 bottom-0.5 flex flex-col items-center leading-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     isSwitchingCity
                       ? 'opacity-60 scale-95 translate-y-0.5'
                       : 'opacity-100 scale-100 translate-y-0'
@@ -6804,25 +7300,29 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* Center Temperature & Condition Readout (Positioned cleanly below the elevated solar curve apex) */}
+                {/* Center Temperature & Condition Readout (Minimalist & Clean) */}
                 <div
-                  className={`absolute inset-x-0 -bottom-1 flex flex-col items-center justify-center pointer-events-none transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  className={`isle-stagger-2 absolute inset-x-0 -bottom-0.5 flex flex-col items-center justify-center pointer-events-none transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     isSwitchingCity
                       ? 'opacity-60 scale-95 translate-y-0.5'
                       : 'opacity-100 scale-100 translate-y-0'
                   }`}
                 >
-                  <span className="text-[19px] font-bold text-white tracking-tight tabular-nums leading-none">
+                  <span className="text-[20px] font-bold text-white tracking-tight tabular-nums leading-none">
                     {weatherData.currentTemp}°C
                   </span>
-                  <span className="text-[9px] font-medium text-[#f7d648]/90 tracking-tight mt-1">
+                  <span
+                    className={`mt-0.5 text-[9.5px] font-medium tracking-tight transition-colors duration-500 ${
+                      isWeatherNight ? 'text-sky-300/90' : 'text-[#f7d648]/90'
+                    }`}
+                  >
                     {weatherConditionText}
                   </span>
                 </div>
 
                 {/* Right Sunset Label */}
                 <div
-                  className={`absolute right-9 bottom-0.5 flex flex-col items-center leading-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  className={`isle-stagger-2 absolute right-9 bottom-0.5 flex flex-col items-center leading-tight transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                     isSwitchingCity
                       ? 'opacity-60 scale-95 translate-y-0.5'
                       : 'opacity-100 scale-100 translate-y-0'
@@ -6836,45 +7336,35 @@ export default function App() {
               </div>
             </div>
 
-            {/* Bottom Translucent Wave Silhouette + 7 Hourly Forecast Columns */}
-            <div className="relative w-full pt-0.5 pb-0.5 px-7 z-10 shrink-0 overflow-hidden rounded-b-[30px]">
-              {/* Subtle Translucent Wave Backdrop (Preserves Dynamic Music Album Wash) */}
-              <svg
-                viewBox="0 0 440 52"
-                preserveAspectRatio="none"
-                className="absolute inset-x-3 bottom-0 w-[calc(100%-24px)] h-[46px] pointer-events-none"
-              >
-                <defs>
-                  <linearGradient id="isleWeatherWaveFill" x1="0%" y1="0%" x2="0%" y2="100%">
-                    <stop offset="0%" stopColor="rgb(255, 255, 255)" stopOpacity="0.06" />
-                    <stop offset="65%" stopColor="rgb(0, 0, 0)" stopOpacity="0.14" />
-                    <stop offset="100%" stopColor="rgb(0, 0, 0)" stopOpacity="0" />
-                  </linearGradient>
-                </defs>
-                <path
-                  d="M0,18 Q95,-2 215,18 T440,12 L440,52 L0,52 Z"
-                  fill="url(#isleWeatherWaveFill)"
-                />
-              </svg>
-
-              <div
-                className={`relative z-10 grid grid-cols-7 gap-1 items-center justify-items-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                  isSwitchingCity
-                    ? 'opacity-65 scale-[0.98] translate-y-0.5'
-                    : 'opacity-100 scale-100 translate-y-0 blur-0'
-                }`}
-              >
-                {weatherData.hourly.slice(0, 7).map((item, idx) => (
-                  <div key={`${item.time}-${idx}`} className="flex flex-col items-center gap-0">
-                    <span className="text-[9px] font-medium text-white/60 tabular-nums">
-                      {item.time}
-                    </span>
-                    <div className="my-0.5">{renderHourlyWeatherIcon(item.code, item.time)}</div>
-                    <span className="text-[10px] font-bold text-white tabular-nums">
-                      {item.temp}°
-                    </span>
-                  </div>
-                ))}
+            {/* Clean Luxury Minimalist 7-Hour Forecast Strip (No weird wave shape behind icons) */}
+            <div className="isle-stagger-3 relative w-full pt-1.5 pb-1 px-7 z-10 shrink-0">
+              <div className="mx-auto w-full border-t border-white/[0.06] pt-1.5">
+                <div
+                  className={`relative z-10 grid grid-cols-7 gap-1 items-center justify-items-center transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isSwitchingCity
+                      ? 'opacity-65 scale-[0.98] translate-y-0.5'
+                      : 'opacity-100 scale-100 translate-y-0 blur-0'
+                  }`}
+                >
+                  {weatherData.hourly.slice(0, 7).map((item, idx) => (
+                    <div
+                      key={`${item.time}-${idx}`}
+                      style={{
+                        animation: 'isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                        animationDelay: `${50 + idx * 30}ms`,
+                      }}
+                      className="flex flex-col items-center gap-0.5"
+                    >
+                      <span className="text-[9px] font-medium text-white/55 tabular-nums">
+                        {item.time}
+                      </span>
+                      <div className="my-0.5">{renderHourlyWeatherIcon(item.code, item.time)}</div>
+                      <span className="text-[10.5px] font-semibold text-white tabular-nums leading-none">
+                        {item.temp}°
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
@@ -6895,6 +7385,7 @@ export default function App() {
           radius={targetR}
           shoulder={targetS}
           topInset={0}
+          isExpanded={isExpanded || Boolean(activeAlert && targetH > 40)}
           hidden={miniCapsuleMode && !assistantOpen && !activeAlert}
           tintStyle={tintStyle}
           tintRgb={tintRgb}
@@ -6922,24 +7413,23 @@ export default function App() {
               window.clearTimeout(hoverLeaveTimerRef.current);
             }
             // Immediately re-enable click-through the instant the cursor leaves the island surface
-            // so clicking Chrome tabs right after leaving the island never steals focus
             setDesktopClickThrough(true);
             hoverLeaveTimerRef.current = window.setTimeout(() => {
               hoverLeaveTimerRef.current = null;
               if (activeAlert) {
                 setAlertHovered(false);
               } else {
-                if (lyricsMode) {
-                  // Keep Island open while in lyrics view per user requirement
+                if (lyricsMode || assistantOpen) {
                   return;
                 }
                 setIsHovered(false);
+                setIsPinnedOpen(false); // Clean auto-close on mouse leave per user specification
                 setIsDragOver(false);
                 if (dragAutoOpened) {
                   setDragAutoOpened(false);
                 }
               }
-            }, 450);
+            }, 60);
           }}
           onClick={(e) => {
             e.stopPropagation();
@@ -7165,30 +7655,47 @@ export default function App() {
               )}
 
               {activeAlert.type === 'notification' && (
-                <div className="w-full flex items-center justify-between px-0.5">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-8 h-8 rounded-full bg-white/10 text-white flex items-center justify-center shrink-0">
-                      <MailEnvelopeSvg size={14} />
-                    </div>
-                    <div className="flex flex-col min-w-0 pr-2">
-                      <span className="text-[12.5px] font-semibold text-white leading-tight">
-                        Ana
-                      </span>
-                      <span className="text-[11px] text-white/55 truncate leading-tight">
-                        Lunch at 12? I booked the place by the park...
-                      </span>
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveAlert(null);
+                    navigateToPage(1);
+                    setIsPinnedOpen(true);
+                  }}
+                  className="relative w-full h-full flex items-center justify-between px-3 cursor-pointer select-none animate-[isleFadeIn_180ms_ease-out]"
+                >
+                  {/* Subtle Glowing Neon Bottom Rim Accent (Matches reference screenshot) */}
+                  <div className="absolute inset-x-2 -bottom-[1px] h-[2px] bg-gradient-to-r from-transparent via-cyan-400/90 to-transparent blur-[0.6px] shadow-[0_0_14px_rgba(56,189,248,0.9)] pointer-events-none" />
+
+                  {/* Left: White Avatar Badge with Two Vertical Eyes */}
+                  <div className="relative w-8 h-8 rounded-full bg-white shadow-[0_0_14px_rgba(255,255,255,0.4)] flex items-center justify-center shrink-0">
+                    <div className="flex items-center gap-[4px]">
+                      <span className="w-1.5 h-3 rounded-full bg-[#0a0a0f]" />
+                      <span className="w-1.5 h-3 rounded-full bg-[#0a0a0f]" />
                     </div>
                   </div>
+
+                  {/* Center: Two-Line Typography */}
+                  <div className="flex-1 min-w-0 flex flex-col justify-center px-3">
+                    <span className="text-[11px] font-normal text-white/55 italic tracking-tight truncate leading-tight">
+                      {`“${activeAlert.confirmSubtitle || 'New Notification'}”`}
+                    </span>
+                    <span className="text-[13.5px] font-semibold text-white tracking-tight truncate leading-tight mt-0.5">
+                      {activeAlert.confirmTitle || 'Notification received'}
+                    </span>
+                  </div>
+
+                  {/* Right: Dark Circular Button with Centered White Square */}
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       setActiveAlert(null);
-                      navigateToPage(1);
-                      setIsPinnedOpen(true);
                     }}
-                    className="px-3 py-1 rounded-full bg-white/12 hover:bg-white/20 text-white text-[11.5px] font-medium transition shrink-0"
+                    title="Dismiss"
+                    className="w-7 h-7 rounded-full bg-white/[0.14] hover:bg-white/[0.25] active:scale-95 flex items-center justify-center transition cursor-pointer shrink-0"
                   >
-                    Reply
+                    <span className="w-2.5 h-2.5 rounded-[2px] bg-white shadow-sm" />
                   </button>
                 </div>
               )}
@@ -7332,7 +7839,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* ── Seamless Fluid Action Confirmation Alert (Task Added, Timer Set, Alarm Set, Weather, Music, System) ── */}
+              {/* ── Seamless Fluid Modern Action Confirmation Alert (Matches user's reference image!) ── */}
               {activeAlert.type === 'action_confirm' && (
                 <div
                   onClick={(e) => {
@@ -7344,44 +7851,43 @@ export default function App() {
                       setIsPinnedOpen(true);
                     }
                   }}
-                  className="w-full flex items-center justify-between px-1.5 cursor-pointer select-none animate-[isleFadeIn_180ms_ease-out]"
+                  className="relative w-full h-full flex items-center justify-between px-3 cursor-pointer select-none animate-[isleFadeIn_180ms_ease-out]"
                 >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-8 h-8 rounded-[10px] bg-white/[0.08] border border-white/15 text-white flex items-center justify-center shrink-0">
-                      {activeAlert.confirmCategory === 'task' ? (
-                        <TaskCheckBoxSvg size={15} />
-                      ) : activeAlert.confirmCategory === 'timer' ? (
-                        <TimerStopwatchSvg size={15} />
-                      ) : activeAlert.confirmCategory === 'alarm' ? (
-                        <AlarmBellSvg size={15} />
-                      ) : activeAlert.confirmCategory === 'weather' ? (
-                        <SunBrightnessSvg size={15} />
-                      ) : activeAlert.confirmCategory === 'music' ? (
-                        <MusicNoteSvg size={15} />
-                      ) : (
-                        <CheckTickSvg size={14} />
-                      )}
-                    </div>
-                    <div className="flex flex-col min-w-0 pr-2">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[12px] font-bold text-white truncate leading-tight">
-                          {activeAlert.confirmTitle || 'Berhasil Dilaksanakan'}
-                        </span>
-                        <span className="text-white/70 shrink-0">
-                          <CheckTickSvg size={10} />
-                        </span>
-                      </div>
-                      <span className="text-[10.5px] text-white/60 font-medium truncate leading-tight mt-0.5">
-                        {activeAlert.confirmSubtitle || 'Dynamic Island diperbarui'}
-                      </span>
+                  {/* Subtle Glowing Neon Bottom Rim Accent (Matches reference screenshot) */}
+                  <div className="absolute inset-x-2 -bottom-[1px] h-[2px] bg-gradient-to-r from-transparent via-cyan-400/90 to-transparent blur-[0.6px] shadow-[0_0_14px_rgba(56,189,248,0.9)] pointer-events-none" />
+
+                  {/* Left: White Avatar Badge with Two Vertical Eyes */}
+                  <div className="relative w-8 h-8 rounded-full bg-white shadow-[0_0_14px_rgba(255,255,255,0.4)] flex items-center justify-center shrink-0">
+                    <div className="flex items-center gap-[4px]">
+                      <span className="w-1.5 h-3 rounded-full bg-[#0a0a0f]" />
+                      <span className="w-1.5 h-3 rounded-full bg-[#0a0a0f]" />
                     </div>
                   </div>
 
-                  {activeAlert.confirmBadge && (
-                    <div className="px-2.5 py-1 rounded-[8px] bg-white/[0.09] border border-white/15 text-[11.5px] font-bold text-white tabular-nums tracking-tight shrink-0">
-                      {activeAlert.confirmBadge}
-                    </div>
-                  )}
+                  {/* Center: Two-Line Minimalist Typography */}
+                  <div className="flex-1 min-w-0 flex flex-col justify-center px-3">
+                    <span className="text-[11px] font-normal text-white/55 italic tracking-tight truncate leading-tight">
+                      {activeAlert.confirmSubtitle
+                        ? `“${activeAlert.confirmSubtitle}”`
+                        : '“Voice Command”'}
+                    </span>
+                    <span className="text-[13.5px] font-semibold text-white tracking-tight truncate leading-tight mt-0.5">
+                      {activeAlert.confirmTitle || 'Finding jazz on Spotify'}
+                    </span>
+                  </div>
+
+                  {/* Right: Modern Dark Circular Button with Centered White Square */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActiveAlert(null);
+                    }}
+                    title="Dismiss"
+                    className="w-7 h-7 rounded-full bg-white/[0.14] hover:bg-white/[0.25] active:scale-95 flex items-center justify-center transition cursor-pointer shrink-0"
+                  >
+                    <span className="w-2.5 h-2.5 rounded-[2px] bg-white shadow-sm" />
+                  </button>
                 </div>
               )}
             </div>
@@ -7392,7 +7898,7 @@ export default function App() {
              ========================================================= */}
           {!activeAlert && (
             <div
-              className={`absolute inset-x-0 top-0 h-[32px] flex items-center justify-between px-3.5 text-white transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              className={`absolute inset-x-0 top-0 h-[32px] w-full max-w-[164px] mx-auto flex items-center justify-between px-3.5 text-white transition-all duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                 !isExpanded && !(miniCapsuleMode && !topEdgeHover)
                   ? 'opacity-100 scale-100 blur-0 pointer-events-auto z-20'
                   : 'opacity-0 scale-90 blur-[4px] pointer-events-none z-0'
@@ -7413,32 +7919,335 @@ export default function App() {
           )}
 
           {/* =========================================================
-              3. REAL-TIME VOICE (gemini-3.8-live) & SEARCH-GROUNDED AI (gemini-3.8-flash)
+              3. UNIFIED LIQUID GLASS ISLE ASSISTANT (Minimalist Capsule & Clean Reading Area)
              ========================================================= */}
           {!activeAlert && isExpanded && assistantOpen && (
             <div
               onClick={(e) => e.stopPropagation()}
-              className="w-full h-full flex flex-col justify-between text-white animate-[ isleFadeIn_200ms_ease-out ]"
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const droppedFiles = Array.from(e.dataTransfer?.files || []) as File[];
+                const imgFile = droppedFiles.find((f) => f.type.startsWith('image/'));
+                if (imgFile) {
+                  attachImageFile(imgFile);
+                }
+              }}
+              className="w-full h-full flex flex-col justify-between px-4 py-2.5 text-white animate-[isleFadeIn_200ms_ease-out]"
             >
-              {/* STAGE 1: REAL-TIME ISLE ASSISTANT VOICE PILL (Minimalist, Zero AI Slop) */}
-              {assistantMode === 'voice-pill' ? (
-                <div
-                  onWheel={(e) => {
-                    if (e.deltaY < -5) setAssistantMode('conversation');
+              {/* Minimalist Clean Header (Zero Pill / Zero Ball AI Slop) */}
+              <div className="isle-stagger-1 flex items-center justify-between shrink-0 pb-1 border-b border-white/[0.07]">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="text-[12.5px] font-semibold tracking-tight text-white">
+                    Isle Assistant
+                  </span>
+                  <span className="text-white/25 text-[11px] select-none font-light">/</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAssistantModel((m) =>
+                        m === 'agnes-3.0-flash' || m === 'agnes-2.5-flash'
+                          ? 'muse-spark-1.3-contributor'
+                          : 'agnes-3.0-flash'
+                      )
+                    }
+                    title="Klik untuk beralih mode model: Agnes (Fast + Web) / Muse Spark (Deep Think)"
+                    className="text-[11.5px] text-white/50 hover:text-white transition tracking-tight font-normal cursor-pointer select-none"
+                  >
+                    {assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
+                      ? 'Agnes Fast'
+                      : 'Muse Spark'}
+                  </button>
+
+                  {voiceListening && (
+                    <span className="text-[10px] text-[#30d158] font-normal animate-pulse truncate ml-1 select-none">
+                      mendengarkan...
+                    </span>
+                  )}
+                  {spamNotice && (
+                    <span className="text-[10px] text-[#ff9f0a] font-normal truncate select-none">
+                      · {spamNotice}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => {
+                      setMessages([]);
+                      setLatestSearchSources([]);
+                      setPendingImage(null);
+                      setShowAllChatHistory(false);
+                      setAnimatingMsgId(null);
+                      assistantInputRef.current?.focus();
+                    }}
+                    title="Mulai obrolan baru (+)"
+                    className="w-6 h-6 rounded-full bg-white/[0.06] hover:bg-white/16 flex items-center justify-center text-white/60 hover:text-white transition"
+                  >
+                    <PlusSvg size={10} />
+                  </button>
+                  <button
+                    onClick={closeAssistantAndCollapse}
+                    title="Tutup Isle Assistant (Esc)"
+                    className="w-6 h-6 rounded-full bg-white/[0.06] hover:bg-white/16 flex items-center justify-center text-white/60 hover:text-white transition"
+                  >
+                    <CloseCrossSvg size={10} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Clean, Airy Response Area */}
+              <div
+                ref={chatScrollRef}
+                className="isle-stagger-2 flex-1 min-h-0 overflow-y-auto no-scrollbar pr-0.5 my-1.5 flex flex-col justify-center"
+              >
+                {assistantLoading ? (
+                  <div className="my-auto flex items-center gap-2.5 py-2 pl-0.5 animate-[isleFadeIn_180ms_ease-out]">
+                    <div className="shrink-0">
+                      <BotCanvas
+                        size={20}
+                        shape={botShape}
+                        color={botColor}
+                        form="thinking"
+                        voiceLevelRef={voiceEnergyRef}
+                      />
+                    </div>
+                    <GeminiThinkingIndicator
+                      label={
+                        agentHeadline ||
+                        (assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
+                          ? 'Agnes sedang mencari informasi & merespons...'
+                          : 'Muse Spark sedang berpikir mendalam...')
+                      }
+                    />
+                  </div>
+                ) : voiceListening && agentTranscript ? (
+                  <div className="my-auto flex items-center gap-2.5 py-1.5 px-2 rounded-xl bg-white/[0.04] border border-white/10 animate-[isleFadeIn_150ms_ease-out]">
+                    <div className="w-2.5 h-2.5 rounded-full bg-[#ff453a] animate-ping shrink-0" />
+                    <span className="text-[12px] text-white/95 italic font-medium">
+                      “{agentTranscript}”
+                    </span>
+                  </div>
+                ) : latestAssistantMessage ? (
+                  <div
+                    key={latestAssistantMessage.id}
+                    className="my-auto flex flex-col gap-1.5 py-0.5 animate-[isleFadeIn_240ms_ease-out]"
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <div className="shrink-0 mt-0.5">
+                        <BotCanvas
+                          size={18}
+                          shape={botShape}
+                          color={botColor}
+                          form="reply"
+                          voiceLevel={0}
+                        />
+                      </div>
+                      {latestAssistantMessage.imageUrl && (
+                        <img
+                          src={latestAssistantMessage.imageUrl}
+                          alt="Visual context"
+                          className="w-10 h-10 rounded-lg border border-white/20 object-cover shrink-0 mt-0.5"
+                          title="Gambar / Screenshot yang dianalisis"
+                        />
+                      )}
+                      <div className="text-[12px] text-white/95 leading-relaxed select-text break-words flex-1 min-w-0 font-normal">
+                        {renderAssistantFormattedText(
+                          animatingMsgId === latestAssistantMessage.id
+                            ? latestAssistantMessage.text.slice(0, revealedChars)
+                            : latestAssistantMessage.text
+                        )}
+                        {animatingMsgId === latestAssistantMessage.id && (
+                          <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-white/70 animate-pulse rounded-xs" />
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Compact PC System Control / Terminal Card */}
+                    {latestAssistantMessage.commandCard &&
+                      animatingMsgId !== latestAssistantMessage.id && (
+                        <div className="pl-7 pt-0.5 animate-[isleFadeIn_180ms_ease-out]">
+                          <div
+                            onClick={() => {
+                              const card = latestAssistantMessage.commandCard;
+                              if (!card) return;
+                              if (card.uri) {
+                                window.location.href = card.uri;
+                              } else if (card.command) {
+                                navigator.clipboard?.writeText(card.command);
+                              }
+                            }}
+                            title={
+                              latestAssistantMessage.commandCard.uri
+                                ? `Buka di Windows (${latestAssistantMessage.commandCard.uri})`
+                                : 'Salin perintah'
+                            }
+                            className="flex flex-col gap-0.5 px-2.5 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.09] border border-white/10 font-mono text-[10px] cursor-pointer transition"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="truncate text-white/80">
+                                <span className="text-white/40 mr-1">$</span>
+                                {latestAssistantMessage.commandCard.command}
+                              </div>
+                              <span className="flex items-center gap-1 text-[#30d158] font-sans font-semibold text-[9.5px] shrink-0">
+                                <CheckTickSvg size={9} />
+                                {latestAssistantMessage.commandCard.purpose}
+                              </span>
+                            </div>
+                            {latestAssistantMessage.commandCard.output && (
+                              <div className="text-[9.5px] text-white/50 truncate">
+                                {latestAssistantMessage.commandCard.output}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                    {/* Found Files Strip */}
+                    {latestAssistantMessage.foundFiles &&
+                      latestAssistantMessage.foundFiles.length > 0 &&
+                      animatingMsgId !== latestAssistantMessage.id && (
+                        <div className="flex items-center gap-1.5 pl-7 pt-0.5 overflow-x-auto no-scrollbar animate-[isleFadeIn_180ms_ease-out]">
+                          {latestAssistantMessage.foundFiles.map((f, idx) => (
+                            <button
+                              key={idx}
+                              onClick={() => {
+                                addFilesToShelf([
+                                  {
+                                    name: f.name,
+                                    size: f.size,
+                                    ext: detectFileExt(f.name),
+                                  },
+                                ]);
+                                closeAssistantAndCollapse();
+                                setIsPinnedOpen(true);
+                                navigateToPage(4, 'right');
+                              }}
+                              title={`${f.path} (${f.size}) · Kirim ke Shelf`}
+                              className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white/[0.06] hover:bg-white/14 border border-white/10 text-[9.5px] text-white/85 whitespace-nowrap transition shrink-0"
+                            >
+                              <FileDocumentBadgeSvg ext={detectFileExt(f.name)} size={12} />
+                              <span className="truncate max-w-[110px]">{f.name}</span>
+                              <span className="text-white/40">{f.size}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                    {/* Subtle Live Web Search Sources Citations */}
+                    {latestAssistantMessage.searchSources &&
+                      latestAssistantMessage.searchSources.length > 0 &&
+                      animatingMsgId !== latestAssistantMessage.id && (
+                        <div className="flex items-center gap-1.5 pl-7 pt-0.5 text-[9.5px] text-white/45 animate-[isleFadeIn_180ms_ease-out]">
+                          <span className="text-white/30">🌐</span>
+                          <span className="font-medium text-white/50">Sumber Web:</span>
+                          {latestAssistantMessage.searchSources.slice(0, 3).map((src, idx) => {
+                            let label = src.title;
+                            try {
+                              label = new URL(src.uri).hostname.replace('www.', '');
+                            } catch {
+                              label = src.title.slice(0, 18);
+                            }
+                            return (
+                              <a
+                                key={idx}
+                                href={src.uri}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-1.5 py-0.5 rounded bg-white/[0.06] hover:bg-white/15 text-white/70 hover:text-white transition"
+                                title={src.title}
+                              >
+                                {label}
+                              </a>
+                            );
+                          })}
+                        </div>
+                      )}
+                  </div>
+                ) : (
+                  <div className="my-auto flex items-start gap-2.5 py-1 pl-0.5 animate-[isleFadeIn_180ms_ease-out]">
+                    <div className="shrink-0 mt-0.5">
+                      <BotCanvas
+                        size={16}
+                        shape={botShape}
+                        color={botColor}
+                        form="reply"
+                        voiceLevel={0}
+                      />
+                    </div>
+                    <div className="text-[12px] text-white/90 font-normal leading-relaxed select-none">
+                      Halo! Mau tanya informasi terkini, ngobrol santai, atau perintahkan laptop kamu?
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Pending Image Attachment Preview Chip */}
+              {pendingImage && (
+                <div className="flex items-center justify-between gap-2 px-2.5 py-1 mb-1.5 rounded-xl bg-white/[0.08] border border-white/15 shrink-0 animate-[isleFadeIn_150ms_ease-out]">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <img
+                      src={pendingImage.dataUrl}
+                      alt={pendingImage.name}
+                      className="w-7 h-7 rounded-lg object-cover border border-white/20 shrink-0"
+                    />
+                    <span className="text-[10px] text-white/90 truncate font-medium">
+                      {pendingImage.name}
+                    </span>
+                    <span className="text-[9px] text-white/50 font-medium shrink-0">
+                      · Vision
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPendingImage(null)}
+                    className="w-4 h-4 rounded-full bg-white/10 hover:bg-white/25 flex items-center justify-center text-white/70 hover:text-white transition shrink-0"
+                    title="Hapus lampiran"
+                  >
+                    <CloseCrossSvg size={8} />
+                  </button>
+                </div>
+              )}
+
+              {/* Minimalist Liquid Glass Capsule Input Bar */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  stopVoiceRecognition();
+                  handleAskGemini(assistantInput);
+                }}
+                className="isle-stagger-3 relative shrink-0 flex items-center"
+              >
+                {/* Hidden File Input for Vision / Image Attachment */}
+                <input
+                  ref={imageInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) attachImageFile(f);
+                    e.target.value = '';
                   }}
-                  className="w-full h-full flex items-center justify-between px-4 py-2 gap-3"
-                >
+                  className="hidden"
+                />
+
+                <div className="w-full flex items-center bg-white/[0.08] hover:bg-white/[0.10] focus-within:bg-white/[0.12] border border-white/15 focus-within:border-white/30 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.35)] rounded-full pl-2 pr-1.5 py-1 gap-1.5 transition duration-200">
+                  {/* Left Interactive Bot Avatar */}
                   <div
                     onClick={() => startBrowserVoiceRecognition()}
                     title={
                       voiceListening
-                        ? 'Isle Assistant aktif · Klik untuk hentikan'
-                        : 'Klik untuk bicara dengan Isle Assistant'
+                        ? 'Mendengarkan suara · Klik untuk hentikan'
+                        : 'Klik untuk bicara dengan suara'
                     }
-                    className="relative shrink-0 cursor-pointer"
+                    className="shrink-0 cursor-pointer p-0.5 hover:scale-105 active:scale-95 transition"
                   >
                     <BotCanvas
-                      size={36}
+                      size={22}
                       shape={botShape}
                       color={botColor}
                       form={voiceListening ? 'listening' : assistantLoading ? 'thinking' : botForm}
@@ -7446,608 +8255,100 @@ export default function App() {
                     />
                   </div>
 
-                  <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[12px] font-semibold text-white tracking-tight">
-                        Isle Assistant
-                      </span>
-                      <span className="text-[10px] text-white/45 font-medium">
-                        {voiceListening
-                          ? 'Mendengarkan...'
-                          : assistantLoading
-                          ? 'Memproses...'
-                          : 'Voice Mode'}
-                      </span>
-                    </div>
-
-                    {assistantLoading ? (
-                      <div className="mt-0.5">
-                        <GeminiThinkingIndicator label="Memproses..." />
-                      </div>
-                    ) : (
-                      <div
-                        onClick={() => setAssistantMode('conversation')}
-                        className="text-[11.5px] text-white/85 line-clamp-2 leading-relaxed cursor-pointer hover:text-white transition"
-                        title="Klik untuk membuka riwayat teks lengkap"
-                      >
-                        {agentTranscript && voiceListening
-                          ? `"${agentTranscript}"`
-                          : agentHeadline ||
-                            (voiceListening
-                              ? 'Silakan berbicara...'
-                              : 'Klik mic untuk mulai berbicara')}
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="flex flex-col items-end justify-between h-full py-0.5 shrink-0 pl-1">
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={() =>
-                          setAssistantModel((m) =>
-                            m === 'agnes-3.0-flash' || m === 'agnes-2.5-flash'
-                              ? 'muse-spark-1.3-contributor'
-                              : 'agnes-3.0-flash'
-                          )
-                        }
-                        className={`px-1.5 py-0.5 rounded-full text-[9px] font-semibold transition flex items-center gap-1 ${
-                          assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                            ? 'bg-amber-400/20 text-amber-300 border border-amber-400/35'
-                            : 'bg-purple-500/20 text-purple-300 border border-purple-400/35'
-                        }`}
-                        title="Klik untuk ganti model AI: Fast (Agnes 3.0 Flash) / Thinking (Muse Spark 1.3)"
-                      >
-                        {assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash' ? (
-                          <FastLightningSvg size={10} />
-                        ) : (
-                          <ThinkingBrainSvg size={10} />
-                        )}
-                        <span>{assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash' ? 'Fast' : 'Thinking'}</span>
-                      </button>
-                      <button
-                        onClick={() => {
-                          const nextLang = voiceLang === 'id-ID' ? 'en-US' : 'id-ID';
-                          setVoiceLang(nextLang);
-                          if (voiceListening) {
-                            setTimeout(() => startBrowserVoiceRecognition(true), 40);
-                          }
-                        }}
-                        className="px-1.5 py-0.5 rounded-full bg-white/[0.08] hover:bg-white/16 text-[9.5px] font-semibold text-white/70 hover:text-white transition"
-                        title="Ganti Bahasa (ID / EN)"
-                      >
-                        {voiceLang === 'id-ID' ? 'ID' : 'EN'}
-                      </button>
-                      <button
-                        onClick={() => {
-                          stopVoiceRecognition();
-                          setDefaultAltQMode('conversation');
-                          setAssistantMode('conversation');
-                        }}
-                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-white/16 text-[9.5px] font-semibold text-white/70 hover:text-white transition"
-                        title="Beralih ke mode Teks (Type)"
-                      >
-                        Type
-                      </button>
-                    </div>
-
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={() => startBrowserVoiceRecognition()}
-                        title={voiceListening ? 'Hentikan Mendengarkan' : 'Mulai Bicara'}
-                        className={`w-6 h-6 rounded-full flex items-center justify-center transition ${
-                          voiceListening
-                            ? 'bg-[#ff453a] text-white shadow-sm shadow-rose-500/40'
-                            : 'bg-white/12 hover:bg-white/20 text-white/85'
-                        }`}
-                      >
-                        <MicSymbolicSvg size={11} />
-                      </button>
-                      <button
-                        onClick={closeAssistantAndCollapse}
-                        title="Tutup (Alt+Q atau Esc)"
-                        className="w-6 h-6 rounded-full bg-white/[0.08] hover:bg-white/16 flex items-center justify-center text-white/60 hover:text-white transition"
-                      >
-                        <CloseCrossSvg size={10} />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                /* STAGE 2: SLEEK SINGLE-ANSWER AI VIEW + MULTIMODAL VISION (Upload, Drag-Drop, Paste & Auto-Screenshot) */
-                <div
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const droppedFiles = Array.from(e.dataTransfer?.files || []) as File[];
-                    const imgFile = droppedFiles.find((f) => f.type.startsWith('image/'));
-                    if (imgFile) {
-                      attachImageFile(imgFile);
-                    }
-                  }}
-                  className="w-full h-full flex flex-col justify-between px-3.5 pt-2 pb-2"
-                >
-                  {/* Slim Minimalist Header */}
-                  <div className="flex items-center justify-between shrink-0 pb-1 border-b border-white/[0.06]">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className="text-[11px] font-semibold text-white tracking-tight">
-                        Isle Assistant
-                      </span>
-                      {messages.filter((m) => m.role === 'assistant').length > 1 && (
-                        <button
-                          onClick={() => setShowAllChatHistory((prev) => !prev)}
-                          className={`px-1.5 py-0.5 rounded text-[9px] font-medium transition ${
-                            showAllChatHistory
-                              ? 'bg-white/15 text-white'
-                              : 'text-white/40 hover:text-white/75'
-                          }`}
-                          title="Toggle history"
-                        >
-                          {showAllChatHistory ? 'Latest only' : 'History'}
-                        </button>
-                      )}
-                      {voiceListening && (
-                        <span className="text-[9.5px] text-[#30d158] font-medium animate-pulse truncate">
-                          · Listening
-                        </span>
-                      )}
-                      {spamNotice && (
-                        <span className="text-[9.5px] text-[#ff9f0a] font-medium truncate">
-                          · {spamNotice}
-                        </span>
-                      )}
-                      {newChatToast && (
-                        <span className="text-[9.5px] text-white/40">· Cleared</span>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-1 shrink-0">
-                      {/* Model Selector Pill: Fast (agnes-3.0-flash) vs Thinking (muse-spark-1.3-contributor) */}
-                      <div className="flex items-center bg-white/[0.08] hover:bg-white/[0.12] border border-white/10 rounded-full p-0.5 text-[9px] transition mr-0.5">
-                        <button
-                          onClick={() => setAssistantModel('agnes-3.0-flash')}
-                          className={`flex items-center gap-1 px-2 py-0.5 rounded-full transition ${
-                            assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                              ? 'bg-amber-400 text-black font-bold shadow-xs'
-                              : 'text-white/60 hover:text-white font-medium'
-                          }`}
-                          title="Mode Cepat: Agnes 3.0 Flash (Respon Kilat via Agnes AI)"
-                        >
-                          <FastLightningSvg size={10} />
-                          <span>Fast</span>
-                        </button>
-                        <button
-                          onClick={() => setAssistantModel('muse-spark-1.3-contributor')}
-                          className={`flex items-center gap-1 px-2 py-0.5 rounded-full transition ${
-                            assistantModel === 'muse-spark-1.3-contributor'
-                              ? 'bg-gradient-to-r from-purple-500 to-indigo-500 text-white font-bold shadow-xs'
-                              : 'text-white/60 hover:text-white font-medium'
-                          }`}
-                          title="Mode Thinking: Muse Spark 1.3 Contributor (Analisis Mendalam via Bynara)"
-                        >
-                          <ThinkingBrainSvg size={10} />
-                          <span>Thinking</span>
-                        </button>
-                      </div>
-
-                      <div className="flex items-center bg-white/[0.07] rounded-full p-0.5 text-[9px] mr-0.5">
-                        <button
-                          onClick={() => {
-                            setDefaultAltQMode('voice-pill');
-                            setAssistantMode('voice-pill');
-                            startBrowserVoiceRecognition(true);
-                          }}
-                          className="px-1.5 py-0.5 rounded-full text-white/60 hover:text-white"
-                          title="Switch to Voice Mode"
-                        >
-                          Voice
-                        </button>
-                        <button
-                          onClick={() => {
-                            stopVoiceRecognition();
-                            setDefaultAltQMode('conversation');
-                            setAssistantMode('conversation');
-                            assistantInputRef.current?.focus();
-                          }}
-                          className="px-1.5 py-0.5 rounded-full bg-white text-black font-semibold"
-                          title="Direct Typing Mode"
-                        >
-                          Type
-                        </button>
-                      </div>
-
-                      <button
-                        onClick={() => {
-                          setMessages([]);
-                          setLatestSearchSources([]);
-                          setPendingImage(null);
-                          setShowAllChatHistory(false);
-                          setAnimatingMsgId(null);
-                          setNewChatToast(true);
-                          setTimeout(() => setNewChatToast(false), 2000);
-                          assistantInputRef.current?.focus();
-                        }}
-                        title="Clear response"
-                        className="w-5 h-5 rounded-full bg-white/[0.08] hover:bg-white/16 flex items-center justify-center text-white/70 hover:text-white transition"
-                      >
-                        <PlusSvg size={10} />
-                      </button>
-                      <button
-                        onClick={closeAssistantAndCollapse}
-                        title="Close (Alt+Q or Esc)"
-                        className="w-5 h-5 rounded-full bg-white/[0.08] hover:bg-white/16 flex items-center justify-center text-white/70 hover:text-white transition"
-                      >
-                        <CloseCrossSvg size={9} />
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Main Response Area */}
-                  <div
-                    ref={chatScrollRef}
-                    className="flex-1 min-h-0 overflow-y-auto no-scrollbar pr-0.5 my-1 flex flex-col"
+                  {/* Image Upload / Attachment Icon */}
+                  <button
+                    type="button"
+                    onClick={() => imageInputRef.current?.click()}
+                    title="Unggah gambar (atau Paste Ctrl+V / ketik 'ambil screenshot')"
+                    className={`w-6 h-6 rounded-full flex items-center justify-center transition shrink-0 ${
+                      pendingImage
+                        ? 'bg-white text-black'
+                        : 'text-white/50 hover:text-white hover:bg-white/10'
+                    }`}
                   >
-                    {assistantLoading ? (
-                      <div className="my-auto flex items-center gap-2.5 py-1 pl-0.5 animate-[ isleFadeIn_180ms_ease-out ]">
-                        <div className="shrink-0">
-                          <BotCanvas
-                            size={18}
-                            shape={botShape}
-                            color={botColor}
-                            form="thinking"
-                            voiceLevelRef={voiceEnergyRef}
-                          />
-                        </div>
-                        <GeminiThinkingIndicator
-                          label={
-                            agentHeadline ||
-                            (assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                              ? 'Agnes sedang merespons...'
-                              : 'Muse Spark sedang berpikir...')
-                          }
-                        />
-                      </div>
-                    ) : showAllChatHistory ? (
-                      <div className="my-auto space-y-2 py-0.5">
-                        {messages
-                          .filter((m) => m.role === 'assistant')
-                          .map((m) => (
-                            <div key={m.id} className="flex items-start gap-2">
-                              <div className="shrink-0 mt-0.5">
-                                <BotCanvas
-                                  size={15}
-                                  shape={botShape}
-                                  color={botColor}
-                                  form="reply"
-                                  voiceLevel={0}
-                                />
-                              </div>
-                              <div className="flex-1 min-w-0">
-                                {m.imageUrl && (
-                                  <img
-                                    src={m.imageUrl}
-                                    alt="Analyzed attachment"
-                                    className="h-9 w-auto rounded border border-white/15 object-cover mb-1"
-                                  />
-                                )}
-                                <div className="text-[11.5px] text-white/90 leading-relaxed select-text break-words">
-                                  {renderAssistantFormattedText(m.text)}
-                                </div>
-                              </div>
-                            </div>
-                          ))}
-                      </div>
-                    ) : latestAssistantMessage ? (
-                      <div
-                        key={latestAssistantMessage.id}
-                        className="my-auto flex flex-col gap-1 py-0.5 animate-[ isleFadeIn_240ms_ease-out ]"
-                      >
-                        <div className="flex items-start gap-2">
-                          <div className="shrink-0 mt-0.5">
-                            <BotCanvas
-                              size={16}
-                              shape={botShape}
-                              color={botColor}
-                              form="reply"
-                              voiceLevel={0}
-                            />
-                          </div>
-                          {latestAssistantMessage.imageUrl && (
-                            <img
-                              src={latestAssistantMessage.imageUrl}
-                              alt="Visual context"
-                              className="w-9 h-9 rounded-md border border-white/20 object-cover shrink-0 mt-0.5"
-                              title="Gambar / Screenshot yang dianalisis AI"
-                            />
-                          )}
-                          <div className="text-[11.5px] text-white/92 leading-relaxed select-text break-words flex-1 min-w-0">
-                            {renderAssistantFormattedText(
-                              animatingMsgId === latestAssistantMessage.id
-                                ? latestAssistantMessage.text.slice(0, revealedChars)
-                                : latestAssistantMessage.text
-                            )}
-                            {animatingMsgId === latestAssistantMessage.id && (
-                              <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-white/70 animate-pulse rounded-xs" />
-                            )}
-                          </div>
-                        </div>
-
-
-
-                        {/* Compact PC System Control / Terminal Card (Bluetooth, Wi-Fi, Terminal stdout) */}
-                        {latestAssistantMessage.commandCard &&
-                          animatingMsgId !== latestAssistantMessage.id && (
-                            <div className="pl-6 pt-0.5 animate-[ isleFadeIn_180ms_ease-out ]">
-                              <div
-                                onClick={() => {
-                                  const card = latestAssistantMessage.commandCard;
-                                  if (!card) return;
-                                  if (card.uri) {
-                                    window.location.href = card.uri;
-                                  } else if (card.command) {
-                                    navigator.clipboard?.writeText(card.command);
-                                  }
-                                }}
-                                title={
-                                  latestAssistantMessage.commandCard.uri
-                                    ? `Click to open Windows Settings (${latestAssistantMessage.commandCard.uri})`
-                                    : 'Click to copy command'
-                                }
-                                className="flex flex-col gap-0.5 px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] font-mono text-[10px] cursor-pointer transition"
-                              >
-                                <div className="flex items-center justify-between gap-2">
-                                  <div className="truncate text-white/75">
-                                    <span className="text-white/35 mr-1">$</span>
-                                    {latestAssistantMessage.commandCard.command}
-                                  </div>
-                                  <span className="flex items-center gap-1 text-[#30d158] font-sans font-semibold text-[9.5px] shrink-0">
-                                    <CheckTickSvg size={9} />
-                                    {latestAssistantMessage.commandCard.purpose}
-                                  </span>
-                                </div>
-                                {latestAssistantMessage.commandCard.output && (
-                                  <div className="text-[9.5px] text-white/50 truncate">
-                                    {latestAssistantMessage.commandCard.output}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          )}
-
-                        {/* Compact Found Files Strip (when user asks AI to find files) */}
-                        {latestAssistantMessage.foundFiles &&
-                          latestAssistantMessage.foundFiles.length > 0 &&
-                          animatingMsgId !== latestAssistantMessage.id && (
-                            <div className="flex items-center gap-1.5 pl-6 pt-0.5 overflow-x-auto no-scrollbar animate-[ isleFadeIn_180ms_ease-out ]">
-                              {latestAssistantMessage.foundFiles.map((f, idx) => (
-                                <button
-                                  key={idx}
-                                  onClick={() => {
-                                    addFilesToShelf([
-                                      {
-                                        name: f.name,
-                                        size: f.size,
-                                        ext: detectFileExt(f.name),
-                                      },
-                                    ]);
-                                    closeAssistantAndCollapse();
-                                    setIsPinnedOpen(true);
-                                    navigateToPage(4, 'right');
-                                  }}
-                                  title={`${f.path} (${f.size}) · Click to send to Shelf`}
-                                  className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white/[0.06] hover:bg-white/14 border border-white/10 text-[9.5px] text-white/85 whitespace-nowrap transition shrink-0"
-                                >
-                                  <FileDocumentBadgeSvg ext={detectFileExt(f.name)} size={12} />
-                                  <span className="truncate max-w-[110px]">{f.name}</span>
-                                  <span className="text-white/40">{f.size}</span>
-                                </button>
-                              ))}
-                            </div>
-                          )}
-
-                        {/* Ultra-Minimalist Subtle Source Citations (Zero AI slop, short domain badge) */}
-                        {latestAssistantMessage.searchSources &&
-                          latestAssistantMessage.searchSources.length > 0 &&
-                          animatingMsgId !== latestAssistantMessage.id && (
-                            <div className="flex items-center gap-1.5 pl-6 pt-0.5 text-[9px] text-white/35 animate-[ isleFadeIn_180ms_ease-out ]">
-                              <span className="text-white/20">•</span>
-                              <span>Sumber:</span>
-                              {latestAssistantMessage.searchSources.slice(0, 2).map((src, idx) => {
-                                let label = src.title;
-                                try {
-                                  label = new URL(src.uri).hostname.replace('www.', '');
-                                } catch {
-                                  label = src.title.slice(0, 16);
-                                }
-                                return (
-                                  <a
-                                    key={idx}
-                                    href={src.uri}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-white/45 hover:text-white/80 underline underline-offset-2 decoration-white/20 hover:decoration-white/60 transition"
-                                    title={src.title}
-                                  >
-                                    {label}
-                                  </a>
-                                );
-                              })}
-                            </div>
-                          )}
-                      </div>
-                    ) : (
-                      <div className="my-auto flex items-center gap-2 py-1 pl-1 animate-[isleFadeIn_180ms_ease-out]">
-                        <div className="shrink-0">
-                          <BotCanvas
-                            size={16}
-                            shape={botShape}
-                            color={botColor}
-                            form="reply"
-                            voiceLevel={0}
-                          />
-                        </div>
-                        <div className="text-[11.5px] text-white/85 font-normal select-none">
-                          Halo, lagi mau ngobrol santai atau minta aku aturin sesuatu di laptop kamu?
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Pending Image Attachment Preview Chip (Upload / Paste / Drag-Drop / Auto-Screenshot) */}
-                  {pendingImage && (
-                    <div className="flex items-center justify-between gap-2 px-2 py-1 mb-1 rounded-lg bg-white/[0.07] border border-white/15 shrink-0 animate-[ isleFadeIn_150ms_ease-out ]">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <img
-                          src={pendingImage.dataUrl}
-                          alt={pendingImage.name}
-                          className="w-6 h-6 rounded object-cover border border-white/20 shrink-0"
-                        />
-                        <span className="text-[10px] text-white/85 truncate font-medium">
-                          {pendingImage.name}
-                        </span>
-                        <span className="text-[9px] text-white/50 font-medium shrink-0">
-                          · Vision
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setPendingImage(null)}
-                        className="w-4 h-4 rounded-full bg-white/10 hover:bg-white/25 flex items-center justify-center text-white/70 hover:text-white transition shrink-0"
-                        title="Hapus lampiran gambar"
-                      >
-                        <CloseCrossSvg size={8} />
-                      </button>
-                    </div>
-                  )}
-
-                  {/* Slim Bottom Auto-Focused Input Field Bar with Multimodal Image Upload + Paste Support */}
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      stopVoiceRecognition();
-                      handleAskGemini(assistantInput);
-                    }}
-                    className="flex items-center gap-1.5 pt-0.5 shrink-0"
-                  >
-                    <div
-                      onClick={() => startBrowserVoiceRecognition()}
-                      title={
-                        voiceListening
-                          ? 'Listening · Click to stop'
-                          : 'Click to speak'
-                      }
-                      className="shrink-0 cursor-pointer"
+                    <svg
+                      width={13}
+                      height={13}
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
                     >
-                      <BotCanvas
-                        size={24}
-                        shape={botShape}
-                        color={botColor}
-                        form={voiceListening ? 'listening' : assistantLoading ? 'thinking' : botForm}
-                        voiceLevelRef={voiceEnergyRef}
-                      />
-                    </div>
+                      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                      <circle cx="8.5" cy="8.5" r="1.5" />
+                      <polyline points="21 15 16 10 5 21" />
+                    </svg>
+                  </button>
 
-                    {/* Hidden File Input for Multimodal Vision Image Upload */}
-                    <input
-                      ref={imageInputRef}
-                      type="file"
-                      accept="image/*"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (f) attachImageFile(f);
-                        e.target.value = '';
-                      }}
-                      className="hidden"
-                    />
-
-                    <div className="flex-1 flex items-center bg-[#18181d] border border-white/12 focus-within:border-white/30 rounded-full pl-2 pr-1 py-0.5 transition gap-1">
-                      {/* Image Upload / Vision Attachment Button */}
-                      <button
-                        type="button"
-                        onClick={() => imageInputRef.current?.click()}
-                        title="Upload gambar (atau Paste Ctrl+V / Drag & Drop / ketik 'ambil screenshot')"
-                        className={`w-5 h-5 rounded-full flex items-center justify-center transition shrink-0 ${
-                          pendingImage
-                            ? 'bg-white text-black'
-                            : 'text-white/50 hover:text-white hover:bg-white/10'
-                        }`}
-                      >
-                        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                          <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                          <circle cx="8.5" cy="8.5" r="1.5" />
-                          <polyline points="21 15 16 10 5 21" />
-                        </svg>
-                      </button>
-
-                      <input
-                        ref={assistantInputRef}
-                        type="text"
-                        autoFocus
-                        maxLength={1000}
-                        value={assistantInput}
-                        onChange={(e) => {
-                          setAssistantInput(e.target.value);
-                          setBotForm(e.target.value ? 'typing' : 'listening');
-                        }}
-                        onPaste={(e) => {
-                          const items = Array.from(e.clipboardData?.items || []) as DataTransferItem[];
-                          const imgItem = items.find((item) => item.type.startsWith('image/'));
-                          if (imgItem) {
-                            const file = imgItem.getAsFile();
-                            if (file) {
-                              e.preventDefault();
-                              attachImageFile(file);
-                            }
-                          }
-                        }}
-                        placeholder={
-                          voiceListening
-                            ? 'Listening...'
-                            : pendingImage
-                            ? 'tanya apa aja tentang gambar ini yaa...'
-                            : assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                            ? 'ngobrol santai sama agnes flash... (Enter)'
-                            : 'ngobrol mendalam sama muse spark... (Enter)'
+                  {/* Clean Text Input */}
+                  <input
+                    ref={assistantInputRef}
+                    type="text"
+                    autoFocus
+                    maxLength={1000}
+                    value={assistantInput}
+                    onChange={(e) => {
+                      setAssistantInput(e.target.value);
+                      setBotForm(e.target.value ? 'typing' : 'listening');
+                    }}
+                    onPaste={(e) => {
+                      const items = Array.from(e.clipboardData?.items || []) as DataTransferItem[];
+                      const imgItem = items.find((item) => item.type.startsWith('image/'));
+                      if (imgItem) {
+                        const file = imgItem.getAsFile();
+                        if (file) {
+                          e.preventDefault();
+                          attachImageFile(file);
                         }
-                        className="flex-1 bg-transparent text-[11.5px] text-white placeholder-white/35 focus:outline-none min-w-0"
-                      />
-                      {assistantLoading ? (
-                        <button
-                          type="button"
-                          onClick={cancelInFlightGemini}
-                          title="Stop response"
-                          className="w-5 h-5 rounded-full bg-white/15 hover:bg-white/25 text-white flex items-center justify-center transition shrink-0"
-                        >
-                          <StopSquareSvg size={8} />
-                        </button>
-                      ) : assistantInput.trim() || pendingImage ? (
-                        <button
-                          type="submit"
-                          className="w-5 h-5 rounded-full bg-white text-black hover:bg-white/90 flex items-center justify-center transition shrink-0"
-                        >
-                          <SendArrowSvg size={11} />
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => startBrowserVoiceRecognition()}
-                          title={voiceListening ? 'Stop voice' : 'Start voice'}
-                          className={`w-5 h-5 rounded-full flex items-center justify-center transition shrink-0 ${
-                            voiceListening
-                              ? 'bg-[#ff453a] text-white animate-pulse'
-                              : 'bg-white/12 hover:bg-white/20 text-white/85'
-                          }`}
-                        >
-                          <MicSymbolicSvg size={11} />
-                        </button>
-                      )}
-                    </div>
-                  </form>
+                      }
+                    }}
+                    placeholder={
+                      voiceListening
+                        ? 'Mendengarkan ucapanmu...'
+                        : pendingImage
+                        ? 'Tanya tentang gambar ini... (Enter)'
+                        : assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
+                        ? 'Tanya info terkini atau perintahkan laptop... (Enter)'
+                        : 'Mulai analisis mendalam bersama Muse Spark... (Enter)'
+                    }
+                    className="flex-1 bg-transparent text-[12px] text-white placeholder-white/40 focus:outline-none min-w-0 font-normal px-1"
+                  />
+
+                  {/* Right Action: Stop / Send / Mic Button */}
+                  {assistantLoading ? (
+                    <button
+                      type="button"
+                      onClick={cancelInFlightGemini}
+                      title="Hentikan respons"
+                      className="w-6 h-6 rounded-full bg-white/20 hover:bg-white/30 text-white flex items-center justify-center transition shrink-0"
+                    >
+                      <StopSquareSvg size={8} />
+                    </button>
+                  ) : assistantInput.trim() || pendingImage ? (
+                    <button
+                      type="submit"
+                      className="w-6 h-6 rounded-full bg-white text-black hover:bg-white/90 flex items-center justify-center transition shrink-0 shadow-sm"
+                    >
+                      <SendArrowSvg size={11} />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => startBrowserVoiceRecognition()}
+                      title={voiceListening ? 'Hentikan rekaman' : 'Mulai bicara'}
+                      className={`w-6 h-6 rounded-full flex items-center justify-center transition shrink-0 ${
+                        voiceListening
+                          ? 'bg-[#ff453a] text-white shadow-[0_0_10px_rgba(255,69,58,0.6)] animate-pulse'
+                          : 'bg-white/12 hover:bg-white/20 text-white/85'
+                      }`}
+                    >
+                      <MicSymbolicSvg size={11} />
+                    </button>
+                  )}
                 </div>
-              )}
+              </form>
             </div>
           )}
 
@@ -8070,7 +8371,10 @@ export default function App() {
             >
               {/* ── Top Header Row on Non-Music Pages (Clean Title / Weather City Search on Left + Battery, Date & Clock on Right) ── */}
               {activePage !== 'music' && (
-                <div className="w-full flex items-center justify-between px-6 pt-2.5 pb-1 z-20 shrink-0 animate-[ isleFadeIn_200ms_ease-out ]">
+                <div
+                  key={`hdr-${activePage}-${isExpanded ? 'open' : 'closed'}`}
+                  className="isle-stagger-1 w-full flex items-center justify-between px-6 pt-2.5 pb-1 z-20 shrink-0"
+                >
                   {/* Left: Page Title OR Interactive Weather City & Manual Search Input */}
                   <div className="flex items-center gap-2 min-w-0">
                     {activePage === 'weather' ? (
@@ -8089,7 +8393,7 @@ export default function App() {
                               fetchWeatherData(trimmed);
                             }
                           }}
-                          className={`absolute left-0 flex items-center gap-1 bg-white/[0.08] border border-white/15 focus-within:border-[#f7d648]/60 rounded-md px-2 py-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] origin-left ${
+                          className={`absolute left-0 flex items-center gap-1 bg-white/[0.08] border border-white/15 focus-within:border-white/40 rounded-md px-2 py-0.5 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] origin-left ${
                             editingWeatherCity
                               ? 'opacity-100 scale-100 translate-x-0 pointer-events-auto w-[148px]'
                               : 'opacity-0 scale-90 -translate-x-1 pointer-events-none w-[95px]'
@@ -8100,11 +8404,11 @@ export default function App() {
                             height={10}
                             viewBox="0 0 24 24"
                             fill="none"
-                            stroke="#f7d648"
-                            strokeWidth={2.4}
+                            stroke="currentColor"
+                            strokeWidth={2.2}
                             strokeLinecap="round"
                             strokeLinejoin="round"
-                            className="shrink-0 opacity-85"
+                            className="shrink-0 text-white/60"
                           >
                             <circle cx={11} cy={11} r={7} />
                             <line x1={21} y1={21} x2={16.65} y2={16.65} />
@@ -8139,7 +8443,7 @@ export default function App() {
                               fetchWeatherData('');
                             }}
                             title="Deteksi lokasi otomatis (GPS/IP)"
-                            className="text-white/45 hover:text-[#f7d648] transition-colors cursor-pointer shrink-0"
+                            className="text-white/45 hover:text-white transition-colors cursor-pointer shrink-0"
                           >
                             <svg
                               width={10}
@@ -8157,7 +8461,7 @@ export default function App() {
                           </button>
                         </form>
 
-                        {/* Clean Minimalist City Trigger (Fluidly morphs into search input on click) */}
+                        {/* Clean Minimalist Monochrome City Trigger */}
                         <button
                           type="button"
                           onClick={() => {
@@ -8175,26 +8479,31 @@ export default function App() {
                             width={11}
                             height={11}
                             viewBox="0 0 24 24"
-                            fill="#f7d648"
-                            className={`shrink-0 transition-transform duration-300 group-hover:scale-110 ${
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth={1.9}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            className={`shrink-0 text-white/75 group-hover:text-white transition-colors duration-200 ${
                               weatherLoading ? 'animate-pulse' : ''
                             }`}
                           >
-                            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 010-5 2.5 2.5 0 010 5z" />
+                            <path d="M12 21s-6-5.2-6-10a6 6 0 1 1 12 0c0 4.8-6 10-6 10z" />
+                            <circle cx={12} cy={11} r={2} />
                           </svg>
-                          <span className="text-[12px] font-bold text-white group-hover:text-[#f7d648] tracking-tight truncate max-w-[125px] transition-colors">
+                          <span className="text-[12px] font-bold text-white/95 group-hover:text-white tracking-tight truncate max-w-[130px] transition-colors">
                             {weatherData.city}
                           </span>
                           <svg
-                            width={10}
-                            height={10}
+                            width={9.5}
+                            height={9.5}
                             viewBox="0 0 24 24"
                             fill="none"
                             stroke="currentColor"
-                            strokeWidth={2.2}
+                            strokeWidth={2}
                             strokeLinecap="round"
                             strokeLinejoin="round"
-                            className="text-white/35 group-hover:text-white/80 transition-colors shrink-0"
+                            className="text-white/35 group-hover:text-white/75 transition-colors shrink-0"
                           >
                             <circle cx={11} cy={11} r={7} />
                             <line x1={21} y1={21} x2={16.65} y2={16.65} />
@@ -8338,7 +8647,7 @@ export default function App() {
                   onClick={(e) => e.stopPropagation()}
                   className="flex-1 flex flex-col justify-center gap-2.5 px-8 py-2 animate-[isleFadeIn_180ms_ease-out]"
                 >
-                  <div className="flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-3 py-2">
+                  <div className="isle-stagger-1 flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-3 py-2">
                     <div className="flex flex-col">
                       <span className="text-[11px] font-semibold text-white tracking-tight">
                         Shortcut Alt + Q
@@ -8372,7 +8681,7 @@ export default function App() {
                   </div>
 
                   {/* Audio & Playback Options (FLAC Lossless + Smart Mood Shuffle + Done) */}
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="isle-stagger-2 flex items-center justify-between gap-2">
                     <div
                       onClick={() => {
                         const nextFlac = !flacEnabled;
@@ -8456,9 +8765,9 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Incoming / Active Page Layer (Unified key without lyricsMode so Music <-> Lyrics morphs in place!) */}
+                  {/* Incoming / Active Page Layer (Triggers staggered entrance when opening island or switching pages!) */}
                   <div
-                    key={`in-${pageIndex}-${slideTick}`}
+                    key={`in-${pageIndex}-${slideTick}-${isExpanded ? 'open' : 'closed'}`}
                     style={
                       prevPageIndex !== null
                         ? {

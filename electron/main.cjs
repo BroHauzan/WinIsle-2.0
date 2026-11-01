@@ -502,7 +502,45 @@ function createOverlayWindow() {
   screen.on('display-added', handleDisplayChange);
   screen.on('display-removed', handleDisplayChange);
 
+  // Windows OLE Drag & Drop DropTarget Support:
+  // When files are dragged from Windows Explorer towards the top center island pill,
+  // Windows OLE checks whether the window under the cursor accepts drops.
+  // When setIgnoreMouseEvents(true) is active, Windows skips the window, displaying the forbidden cursor 🚫.
+  // Polling cursor position at 65ms ensures drop target is enabled when cursor approaches the island notch!
+  let lastCursorInsideIsland = false;
+  const cursorCheckInterval = setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      clearInterval(cursorCheckInterval);
+      return;
+    }
+    try {
+      const cursor = screen.getCursorScreenPoint();
+      const bounds = mainWindow.getBounds();
+      const islandLeft = bounds.x + (bounds.width - 560) / 2;
+      const islandRight = bounds.x + (bounds.width + 560) / 2;
+      const islandBottom = bounds.y + 240;
+
+      const insideIslandRegion =
+        cursor.x >= islandLeft &&
+        cursor.x <= islandRight &&
+        cursor.y >= bounds.y &&
+        cursor.y <= islandBottom;
+
+      if (insideIslandRegion !== lastCursorInsideIsland) {
+        lastCursorInsideIsland = insideIslandRegion;
+        if (insideIslandRegion) {
+          mainWindow.setIgnoreMouseEvents(false);
+        } else {
+          mainWindow.webContents.send('cursor-left-island');
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, 65);
+
   mainWindow.on('closed', () => {
+    clearInterval(cursorCheckInterval);
     mainWindow = null;
   });
 }

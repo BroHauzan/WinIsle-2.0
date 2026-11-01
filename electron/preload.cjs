@@ -40,6 +40,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
   },
   /**
+   * Listen to cursor exiting island region.
+   */
+  onCursorLeftIsland: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const handler = () => callback();
+    ipcRenderer.on('cursor-left-island', handler);
+    return () => {
+      ipcRenderer.removeListener('cursor-left-island', handler);
+    };
+  },
+  /**
    * Trigger native physical memory (Working Set) and V8 GC trimming.
    */
   trimMemory: () => {

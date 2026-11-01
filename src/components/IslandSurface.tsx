@@ -28,6 +28,7 @@ export interface IslandSurfaceProps {
   shoulder: number;
   topInset: number;
   hidden?: boolean;
+  isExpanded?: boolean;
   tintStyle?: 'none' | 'wash' | 'glow' | 'aura';
   tintRgb?: [number, number, number];
   auraColors?: [number, number, number][];
@@ -48,6 +49,7 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
   shoulder,
   topInset,
   hidden = false,
+  isExpanded = false,
   tintStyle = 'none',
   tintRgb = [0.2, 0.5, 0.95],
   auraColors = [
@@ -87,6 +89,14 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     current: tintStyle === 'wash' ? 1 : 0,
     target: tintStyle === 'wash' ? 1 : 0,
   });
+  const expandProgressRef = useRef({
+    current: isExpanded ? 1 : 0,
+    target: isExpanded ? 1 : 0,
+  });
+
+  useEffect(() => {
+    expandProgressRef.current.target = isExpanded ? 1 : 0;
+  }, [isExpanded]);
 
   useEffect(() => {
     if (tintRgb && tintRgb.length === 3) {
@@ -151,10 +161,16 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
       const wa = washAlphaRef.current;
       wa.current += (wa.target - wa.current) * Math.min(1, dt * 7.5);
 
+      const epObj = expandProgressRef.current;
+      epObj.current += (epObj.target - epObj.current) * Math.min(1, dt * 10.0);
+
       const curW = Math.max(0, sp.w.value);
       const curH = Math.max(0, sp.h.value);
       const curR = Math.max(0, sp.r.value);
       const curS = Math.max(0, sp.s.value);
+
+      // Tie glass transparency strictly to physical expansion beyond compact height (32px)
+      const ep = Math.max(0, Math.min(1, (curH - 34) / 68));
 
       setDims((prev) => {
         const nw = Math.ceil(curW);
@@ -234,10 +250,45 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             ctx.lineTo(right, top + sh);
           };
 
-          // Draw pure black notch body
+          // Draw notch body:
+          // When in compact/small form (ep <= 0.02): completely solid pitch black (#000000, 100% opaque, no transparency)
+          // When expanding/expanded: smoothly blends into Liquid Glass (dark gradient at top fading to translucent frosted glass at bottom)
           traceOutline();
-          ctx.fillStyle = '#000000';
-          ctx.fill();
+          if (ep <= 0.02) {
+            ctx.fillStyle = '#000000';
+            ctx.fill();
+          } else {
+            const liquidGlassGrad = ctx.createLinearGradient(0, 0, 0, curH);
+            liquidGlassGrad.addColorStop(0, '#000000');
+            liquidGlassGrad.addColorStop(
+              0.25,
+              `rgba(8, 10, 15, ${(1 - 0.12 * ep).toFixed(3)})`
+            );
+            liquidGlassGrad.addColorStop(
+              0.65,
+              `rgba(12, 15, 23, ${(1 - 0.38 * ep).toFixed(3)})`
+            );
+            liquidGlassGrad.addColorStop(
+              1,
+              `rgba(15, 18, 28, ${(1 - 0.62 * ep).toFixed(3)})`
+            );
+            ctx.fillStyle = liquidGlassGrad;
+            ctx.fill();
+          }
+
+          // Subtle glass frosted noise & diffuse specular reflection (only when expanded)
+          if (ep > 0.02) {
+            ctx.save();
+            traceOutline();
+            ctx.clip();
+            const glassSheen = ctx.createLinearGradient(left, 0, right, curH);
+            glassSheen.addColorStop(0, `rgba(255, 255, 255, ${(0.08 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(0.4, `rgba(255, 255, 255, ${(0.015 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(1, `rgba(255, 255, 255, ${(0.05 * ep).toFixed(3)})`);
+            ctx.fillStyle = glassSheen;
+            ctx.fillRect(0, 0, outerW, outerH);
+            ctx.restore();
+          }
 
           // Dominant Cover Color Wash (smoothly interpolated via wa.current)
           if (wa.current > 0.005 && tintStyle !== 'glow' && tintStyle !== 'aura') {
@@ -347,13 +398,19 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             ctx.restore();
           }
 
-          // Subtle top-inner border highlight (skip top bezel edge)
-          ctx.save();
-          traceSidesAndBottom();
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-          ctx.lineWidth = 1;
-          ctx.stroke();
-          ctx.restore();
+          // Specular liquid glass rim reflection along sides and bottom (only when expanded)
+          if (ep > 0.02) {
+            ctx.save();
+            traceSidesAndBottom();
+            const rimGrad = ctx.createLinearGradient(left, top, right, curH);
+            rimGrad.addColorStop(0, `rgba(255, 255, 255, ${(0.20 * ep).toFixed(3)})`);
+            rimGrad.addColorStop(0.5, `rgba(255, 255, 255, ${(0.12 * ep).toFixed(3)})`);
+            rimGrad.addColorStop(1, `rgba(255, 255, 255, ${(0.24 * ep).toFixed(3)})`);
+            ctx.strokeStyle = rimGrad;
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
+            ctx.restore();
+          }
 
           ctx.restore();
         }
@@ -414,13 +471,19 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         className="pointer-events-none absolute top-0 left-1/2 -translate-x-1/2"
       />
       <div
-        className="relative z-10 overflow-hidden flex flex-col justify-between"
+        className={`relative z-10 overflow-hidden flex flex-col justify-between ${
+          dims.h > 36 ? 'backdrop-blur-2xl backdrop-saturate-[180%]' : ''
+        }`}
         style={{
           width: `${dims.w}px`,
           height: `${dims.h}px`,
           borderBottomLeftRadius: `${dims.r}px`,
           borderBottomRightRadius: `${dims.r}px`,
           clipPath: `inset(0px 0px 0px 0px round 0px 0px ${dims.r}px ${dims.r}px)`,
+          background:
+            dims.h > 36
+              ? 'linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0.01) 40%, rgba(255, 255, 255, 0.02) 100%)'
+              : 'transparent',
         }}
       >
         {children}

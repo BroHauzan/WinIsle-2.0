@@ -20,8 +20,8 @@ function stripAiStudioAssetsPlugin() {
   };
 }
 
-export default defineConfig({
-  base: './',
+export default defineConfig(({ command }) => ({
+  base: command === 'build' ? './' : '/',
   plugins: [react(), tailwindcss(), stripAiStudioAssetsPlugin()],
   build: {
     target: 'esnext',
@@ -32,6 +32,7 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 3000,
     allowedHosts: true,
+    hmr: false,
   },
-});
+}));
 

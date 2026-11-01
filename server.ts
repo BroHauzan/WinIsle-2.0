@@ -319,6 +319,143 @@ function extractJsonObject(raw: string): Record<string, any> | null {
   return null;
 }
 
+interface LaunchAppResult {
+  success: boolean;
+  appName: string;
+  matchedName?: string;
+  error?: string;
+}
+
+// Dynamic Windows Application Resolver & Launcher:
+// Discovers installed applications via:
+// 1. Get-StartApps (PowerShell cmdlet returning Win32 & UWP / Microsoft Store Apps with AppUserModelIDs)
+// 2. Start Menu Programs shortcuts (.lnk files in ProgramData & AppData)
+// 3. Registry App Paths & PATH executables
+// Launches in background via explorer.exe shell:AppsFolder\<AppID> or Start-Process without blocking
+async function launchWindowsAppDynamically(requestedApp: string): Promise<LaunchAppResult> {
+  const cleanQuery = requestedApp
+    .trim()
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .replace(/\b(aplikasi|app|program|software)\b/gi, '')
+    .trim();
+
+  if (!cleanQuery) {
+    return { success: false, appName: requestedApp, error: 'Nama aplikasi tidak valid' };
+  }
+
+  // If running in development container (Linux / non-Windows preview), simulate successful app launch
+  if (process.platform !== 'win32') {
+    return {
+      success: true,
+      appName: cleanQuery,
+      matchedName: cleanQuery,
+    };
+  }
+
+  try {
+    const safeQ = cleanQuery.replace(/"/g, '`"');
+    const psScript = `
+      $ErrorActionPreference = 'SilentlyContinue'
+      $q = "${safeQ}".Trim()
+      $startApps = Get-StartApps
+
+      # 1. Exact Name Match
+      $matched = $startApps | Where-Object { $_.Name -ieq $q } | Select-Object -First 1
+
+      # 2. StartsWith Name Match
+      if (-not $matched) {
+        $matched = $startApps | Where-Object { $_.Name -like "$q*" } | Select-Object -First 1
+      }
+
+      # 3. Contains Name Match
+      if (-not $matched) {
+        $matched = $startApps | Where-Object { $_.Name -like "*$q*" } | Select-Object -First 1
+      }
+
+      # 4. AppID Partial Match (e.g. Spotify, Discord, Chrome, VSCode, Telegram)
+      if (-not $matched) {
+        $matched = $startApps | Where-Object { $_.AppID -like "*$q*" } | Select-Object -First 1
+      }
+
+      if ($matched) {
+        $appId = $matched.AppID
+        if ($appId -match '^[a-zA-Z]:\\\\') {
+          Start-Process -FilePath $appId
+        } else {
+          Start-Process "explorer.exe" -ArgumentList "shell:AppsFolder\\$appId"
+        }
+        [PSCustomObject]@{
+          Found = $true
+          Name = $matched.Name
+          AppId = $appId
+        } | ConvertTo-Json -Compress
+        exit 0
+      }
+
+      # 5. Check Registry App Paths
+      $regPath1 = "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$q.exe"
+      $regPath2 = "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$q.exe"
+      $targetExe = (Get-ItemProperty -Path $regPath1 -Name "(default)" -ErrorAction SilentlyContinue).'(default)'
+      if (-not $targetExe) {
+        $targetExe = (Get-ItemProperty -Path $regPath2 -Name "(default)" -ErrorAction SilentlyContinue).'(default)'
+      }
+      if ($targetExe -and (Test-Path $targetExe)) {
+        Start-Process -FilePath $targetExe
+        [PSCustomObject]@{
+          Found = $true
+          Name = $q
+          AppId = $targetExe
+        } | ConvertTo-Json -Compress
+        exit 0
+      }
+
+      # 6. Try standard Start-Process as executable name in PATH
+      try {
+        Start-Process $q -ErrorAction Stop
+        [PSCustomObject]@{
+          Found = $true
+          Name = $q
+          AppId = $q
+        } | ConvertTo-Json -Compress
+        exit 0
+      } catch {
+        [PSCustomObject]@{
+          Found = $false
+          Name = $q
+        } | ConvertTo-Json -Compress
+      }
+    `;
+
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+    const { stdout } = await execAsync(`powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`, {
+      timeout: 7000,
+    });
+
+    const parsed = extractJsonObject(stdout);
+    if (parsed && parsed.Found) {
+      return {
+        success: true,
+        appName: cleanQuery,
+        matchedName: parsed.Name || cleanQuery,
+      };
+    }
+
+    return {
+      success: false,
+      appName: cleanQuery,
+      error: `Aplikasi "${cleanQuery}" tidak ditemukan di sistem Windows.`,
+    };
+  } catch (err: any) {
+    console.error('Windows app launch error:', err?.message || err);
+    try {
+      exec(`start "" "${cleanQuery}"`);
+      return { success: true, appName: cleanQuery, matchedName: cleanQuery };
+    } catch {
+      return { success: false, appName: cleanQuery, error: err?.message };
+    }
+  }
+}
+
 // Detect desktop island action & PC system control from prompt or model response
 function inferIslandAction(prompt: string, explicitAction?: string, explicitParam?: string): {
   action: string;
@@ -328,6 +465,26 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
     return { action: explicitAction, actionParam: explicitParam };
   }
   const p = prompt.toLowerCase();
+
+  // 0. Dynamic Windows App Launch (e.g., "buka discord", "tolong buka spotify", "open chrome", "jalankan vscode")
+  const appMatch =
+    prompt.match(/\b(?:tolong\s+)?(?:buka(?:kan|in)?|jalankan|run|open|launch|start)\s+(?:aplikasi|app|program|software)?\s*([a-zA-Z0-9_\-\.\s]{2,40})/i);
+  if (appMatch && appMatch[1]) {
+    const rawTarget = appMatch[1].trim();
+    // Exclude internal island page triggers
+    const isInternalTrigger =
+      /\b(terminal|cmd|powershell|cuaca|weather|shelf|notifikasi|notification|tugas|task|todo|kalender|calendar|pomodoro|timer|lirik|lyrics|lagu|musik|bluetooth|wifi|wi-fi|kecerahan|brightness|volume|mini capsule|kapsul mini)\b/i.test(
+        rawTarget
+      );
+    if (!isInternalTrigger) {
+      const cleanAppName = rawTarget
+        .replace(/\b(sekarang|dong|ya|bro|please|plis)\b/gi, '')
+        .trim();
+      if (cleanAppName.length >= 2) {
+        return { action: 'launch_app', actionParam: cleanAppName };
+      }
+    }
+  }
 
   // Bluetooth control
   if (/\b(matiin|matikan|nonaktifkan|turn off|disable)\b.*\bbluetooth\b|\bbluetooth\b.*\b(mati|off)\b/.test(p)) {
@@ -2218,7 +2375,7 @@ if ($null -ne $session) {
   });
 });
 
-// Endpoint 4: Real-Time Weather & Hourly Forecast (Auto IP Location + Manual City Override via Open-Meteo)
+// Endpoint 4: Real-Time Weather & Hourly Forecast via Open-Meteo (https://github.com/open-meteo/open-meteo)
 app.get('/api/weather', async (req, res) => {
   const requestedCity = sanitizeText(req.query.city, 60).trim();
   const reqLat = Number(req.query.lat);
@@ -2234,24 +2391,30 @@ app.get('/api/weather', async (req, res) => {
         fetch(
           `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
             requestedCity
-          )}&count=1&language=id&format=json`
+          )}&count=5&format=json`
         ),
-        3200,
+        3500,
         'weather-geocode'
       );
       if (geoRes.ok) {
         const geoData: any = await geoRes.json();
-        const first = geoData?.results?.[0];
-        if (first && typeof first.latitude === 'number' && typeof first.longitude === 'number') {
-          city = first.name || requestedCity;
-          lat = first.latitude;
-          lon = first.longitude;
+        const results: any[] = Array.isArray(geoData?.results) ? geoData.results : [];
+        if (results.length > 0) {
+          // Prioritize Indonesian result if requested city is in Indonesia, or pick highest population
+          const idMatch = results.find((r) => r.country_code?.toUpperCase() === 'ID');
+          const best =
+            idMatch ||
+            [...results].sort((a, b) => (b.population || 0) - (a.population || 0))[0] ||
+            results[0];
+          city = best.name || requestedCity;
+          lat = typeof best.latitude === 'number' ? best.latitude : lat;
+          lon = typeof best.longitude === 'number' ? best.longitude : lon;
         }
       }
     } else if (!Number.isFinite(reqLat) || reqLat === 0) {
       // Auto-detect city & coordinates via IP geolocation
       try {
-        const ipRes = await withTimeout(fetch('https://ipwho.is/'), 2400, 'ip-geo');
+        const ipRes = await withTimeout(fetch('https://ipwho.is/'), 2500, 'ip-geo');
         if (ipRes.ok) {
           const ipData: any = await ipRes.json();
           if (ipData?.success && typeof ipData.latitude === 'number' && typeof ipData.longitude === 'number') {
@@ -2265,14 +2428,21 @@ app.get('/api/weather', async (req, res) => {
       }
     }
 
-    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code,is_day&hourly=temperature_2m,weather_code&daily=sunrise,sunset&timezone=auto&forecast_days=2`;
-    const wRes = await withTimeout(fetch(weatherUrl), 3800, 'open-meteo');
+    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,sunrise,sunset,precipitation_probability_max,wind_speed_10m_max&timezone=auto&forecast_days=3`;
+    const wRes = await withTimeout(fetch(weatherUrl), 4200, 'open-meteo');
     if (!wRes.ok) throw new Error('Open-Meteo unavailable');
     const wData: any = await wRes.json();
 
     const currentTemp = Math.round(Number(wData?.current?.temperature_2m ?? 28));
+    const apparentTemp = Math.round(Number(wData?.current?.apparent_temperature ?? currentTemp));
+    const humidity = Math.round(Number(wData?.current?.relative_humidity_2m ?? 70));
+    const windSpeed = Math.round(Number(wData?.current?.wind_speed_10m ?? 10));
     const weatherCode = Number(wData?.current?.weather_code ?? 1);
     const isDay = Number(wData?.current?.is_day ?? 1) === 1;
+
+    const tempMax = Math.round(Number(wData?.daily?.temperature_2m_max?.[0] ?? currentTemp + 2));
+    const tempMin = Math.round(Number(wData?.daily?.temperature_2m_min?.[0] ?? currentTemp - 4));
+    const precipitationProb = Math.round(Number(wData?.daily?.precipitation_probability_max?.[0] ?? 0));
 
     const rawSunrise = String(wData?.daily?.sunrise?.[0] || '2026-01-01T05:49');
     const rawSunset = String(wData?.daily?.sunset?.[0] || '2026-01-01T17:52');
@@ -2280,7 +2450,7 @@ app.get('/api/weather', async (req, res) => {
       const part = iso.split('T')[1];
       if (!part) return fallback;
       const [hh, mm] = part.split(':');
-      return `${ parseInt(hh, 10) }:${mm || '00'}`;
+      return `${parseInt(hh, 10)}:${mm || '00'}`;
     };
     const sunrise = fmtClock(rawSunrise, '5:49');
     const sunset = fmtClock(rawSunset, '17:52');
@@ -2292,12 +2462,20 @@ app.get('/api/weather', async (req, res) => {
     const codes: number[] = Array.isArray(wData?.hourly?.weather_code)
       ? wData.hourly.weather_code
       : [];
+    const precipProbs: number[] = Array.isArray(wData?.hourly?.precipitation_probability)
+      ? wData.hourly.precipitation_probability
+      : [];
 
-    const nowHourStr = String(new Date().getHours()).padStart(2, '0') + ':00';
-    let startIdx = times.findIndex((t) => t.endsWith(`T${nowHourStr}`));
-    if (startIdx < 0) startIdx = new Date().getHours();
+    // Precise current hour matching using Open-Meteo's own current timestamp
+    const currentIso = String(wData?.current?.time || '');
+    let startIdx = times.findIndex((t) => currentIso && t.slice(0, 13) === currentIso.slice(0, 13));
+    if (startIdx < 0) {
+      const fallbackHourStr = String(new Date().getHours()).padStart(2, '0') + ':00';
+      startIdx = times.findIndex((t) => t.endsWith(`T${fallbackHourStr}`));
+      if (startIdx < 0) startIdx = 0;
+    }
 
-    const hourly: { time: string; temp: number; code: number }[] = [];
+    const hourly: { time: string; temp: number; code: number; precipitationProb: number }[] = [];
     for (let i = 0; i < 7; i++) {
       const idx = startIdx + i;
       const tIso = times[idx] || '';
@@ -2306,7 +2484,8 @@ app.get('/api/weather', async (req, res) => {
         : `${String((new Date().getHours() + i) % 24).padStart(2, '0')}:00`;
       const tempVal = typeof temps[idx] === 'number' ? Math.round(temps[idx]) : currentTemp;
       const codeVal = typeof codes[idx] === 'number' ? codes[idx] : weatherCode;
-      hourly.push({ time: timeLabel, temp: tempVal, code: codeVal });
+      const pVal = typeof precipProbs[idx] === 'number' ? Math.round(precipProbs[idx]) : 0;
+      hourly.push({ time: timeLabel, temp: tempVal, code: codeVal, precipitationProb: pVal });
     }
 
     return res.json({
@@ -2315,20 +2494,29 @@ app.get('/api/weather', async (req, res) => {
       lat,
       lon,
       currentTemp,
+      apparentTemp,
+      humidity,
+      windSpeed,
       weatherCode,
       isDay,
+      tempMax,
+      tempMin,
+      precipitationProb,
       sunrise,
       sunset,
+      timezone: wData?.timezone || 'Asia/Jakarta',
       utcOffsetSeconds:
         typeof wData?.utc_offset_seconds === 'number' ? wData.utc_offset_seconds : undefined,
       hourly,
     });
-  } catch {
+  } catch (err: any) {
+    console.error('[WEATHER API ERROR]', err?.message || err);
     const baseHour = new Date().getHours();
     const fallbackHourly = Array.from({ length: 7 }, (_, i) => ({
       time: `${String((baseHour + i) % 24).padStart(2, '0')}:00`,
       temp: 28 - (i % 3),
       code: i < 3 ? 2 : 3,
+      precipitationProb: 10,
     }));
     return res.json({
       ok: true,
@@ -2336,10 +2524,17 @@ app.get('/api/weather', async (req, res) => {
       lat,
       lon,
       currentTemp: 28,
+      apparentTemp: 31,
+      humidity: 70,
+      windSpeed: 10,
       weatherCode: 2,
       isDay: baseHour >= 6 && baseHour < 18,
+      tempMax: 32,
+      tempMin: 24,
+      precipitationProb: 20,
       sunrise: '5:49',
       sunset: '17:52',
+      timezone: 'Asia/Jakarta',
       hourly: fallbackHourly,
     });
   }
@@ -2463,26 +2658,20 @@ async function fetchLiveWebSearchData(query: string): Promise<{
     .trim()
     .slice(0, 120);
 
-  if (!cleanQuery || cleanQuery.length < 3) return { snippets, sources };
+  if (!cleanQuery || cleanQuery.length < 2) return { snippets, sources };
 
-  // Extract meaningful keywords (>2 chars, excluding common Indonesian/English filler words)
-  const stopWords = new Set([
-    'apa', 'itu', 'dan', 'yang', 'di', 'ke', 'dari', 'untuk', 'dengan', 'atau', 'kalau', 'kalo',
-    'gimana', 'cara', 'kenapa', 'siapa', 'kapan', 'berapa', 'mana', 'lebih', 'bagus', 'timbang',
-    'daripada', 'biasa', 'nya', 'ini', 'itu', 'what', 'is', 'the', 'and', 'for', 'with', 'how', 'why',
-  ]);
-  const keywords = cleanQuery
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((w) => w.length >= 3 && !stopWords.has(w));
+  // Remove polite / conversational filler prefixes so search query is laser targeted
+  const strippedQuery = cleanQuery
+    .replace(/\b(siapa|apakah|bagaimana|gimana|kenapa|tolong|coba|tahu|kah|dong|ya|bro|plis|info|informasi|berita|kabar|terbaru|terkini|hari ini|saat ini)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-  if (keywords.length === 0) return { snippets, sources };
-
-  const searchPhrase = keywords.slice(0, 5).join(' ');
-  const encoded = encodeURIComponent(searchPhrase);
+  const searchTarget = strippedQuery.length >= 3 ? strippedQuery : cleanQuery;
+  const encoded = encodeURIComponent(searchTarget);
+  const encodedFull = encodeURIComponent(cleanQuery);
 
   await Promise.allSettled([
-    // 1. Live Google News Search RSS
+    // 1. Live Google News RSS (Indonesian)
     withTimeout(
       fetch(`https://news.google.com/rss/search?q=${encoded}&hl=id&gl=ID&ceid=ID:id`, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
@@ -2493,7 +2682,7 @@ async function fetchLiveWebSearchData(query: string): Promise<{
           ...xml.matchAll(
             /<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>(?:[\s\S]*?<pubDate>([\s\S]*?)<\/pubDate>)?[\s\S]*?<\/item>/g
           ),
-        ].slice(0, 3);
+        ].slice(0, 4);
         for (const m of items) {
           const rawTitle = (m[1] || '')
             .replace(/<!\[CDATA\[|\]\]>/g, '')
@@ -2503,27 +2692,53 @@ async function fetchLiveWebSearchData(query: string): Promise<{
             .trim();
           const uri = (m[2] || '').trim();
           const pubDate = (m[3] || '').trim();
-          // Ensure title shares at least one main keyword
-          const lowerTitle = rawTitle.toLowerCase();
-          const isRelevant = keywords.some((kw) => lowerTitle.includes(kw));
-          if (rawTitle && isRelevant && uri.startsWith('http') && !seenUris.has(uri)) {
+          if (rawTitle && uri.startsWith('http') && !seenUris.has(uri)) {
             seenUris.add(uri);
-            // Extract publisher name if formatted like "Headline - Publisher"
             const parts = rawTitle.split(' - ');
             const shortLabel =
               parts.length > 1
-                ? `${parts[parts.length - 1].trim()} · ${parts[0].trim().slice(0, 28)}`
-                : rawTitle.slice(0, 36);
-            sources.push({ title: sanitizeText(shortLabel, 42), uri });
-            snippets.push(`- [Google Search${pubDate ? ` (${pubDate})` : ''}]: ${rawTitle}`);
+                ? `${parts[parts.length - 1].trim()} · ${parts[0].trim().slice(0, 32)}`
+                : rawTitle.slice(0, 40);
+            sources.push({ title: sanitizeText(shortLabel, 48), uri });
+            snippets.push(`- [Berita Terkini${pubDate ? ` (${pubDate.slice(0, 16)})` : ''}]: ${rawTitle}`);
           }
         }
       }),
-      3200,
+      3500,
       'google-news-rss'
     ),
 
-    // 2. Live Wikipedia Search API (only include if title/snippet strongly matches keyword)
+    // 2. DuckDuckGo Instant Answer / Abstract API
+    withTimeout(
+      fetch(`https://api.duckduckgo.com/?q=${encodedFull}&format=json&no_html=1&skip_disambig=1`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      }).then(async (r) => {
+        if (!r.ok) return;
+        const data: any = await r.json();
+        const abstract = String(data?.AbstractText || data?.Abstract || '').trim();
+        const abstractUri = String(data?.AbstractURL || '').trim();
+        const heading = String(data?.Heading || '').trim();
+        if (abstract && (!abstractUri || !seenUris.has(abstractUri))) {
+          if (abstractUri) {
+            seenUris.add(abstractUri);
+            sources.push({ title: `${heading || searchTarget} · Info`, uri: abstractUri });
+          }
+          snippets.push(`- [Ringkasan Web]: ${abstract}`);
+        }
+        // Related Topics
+        if (Array.isArray(data?.RelatedTopics)) {
+          for (const item of data.RelatedTopics.slice(0, 2)) {
+            if (item?.Text && typeof item.Text === 'string') {
+              snippets.push(`- [Fakta Terkait]: ${item.Text.slice(0, 240)}`);
+            }
+          }
+        }
+      }),
+      2500,
+      'duckduckgo-api'
+    ),
+
+    // 3. Live Wikipedia Search API
     withTimeout(
       fetch(
         `https://id.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encoded}&utf8=&format=json&srlimit=2`
@@ -2534,10 +2749,8 @@ async function fetchLiveWebSearchData(query: string): Promise<{
         for (const item of results) {
           const title = String(item?.title || '').trim();
           const cleanSnippet = (item?.snippet || '').replace(/<[^>]+>/g, '').trim();
-          const lowerTitle = title.toLowerCase();
-          const isTitleRelevant = keywords.some((kw) => lowerTitle.includes(kw));
           const uri = `https://id.wikipedia.org/wiki/${encodeURIComponent(title.replace(/\s+/g, '_'))}`;
-          if (title && isTitleRelevant && !seenUris.has(uri)) {
+          if (title && !seenUris.has(uri)) {
             seenUris.add(uri);
             sources.push({ title: `${sanitizeText(title, 28)} · Wiki`, uri });
             if (cleanSnippet) {
@@ -2551,7 +2764,7 @@ async function fetchLiveWebSearchData(query: string): Promise<{
     ),
   ]);
 
-  return { snippets, sources: sources.slice(0, 2) };
+  return { snippets: snippets.slice(0, 5), sources: sources.slice(0, 3) };
 }
 
 // ── GET /api/system/screenshot: Native OS Desktop Screenshot (Win32 PowerShell fallback) ──
@@ -2573,6 +2786,16 @@ app.get('/api/system/screenshot', async (_req, res) => {
     }
   }
   return res.json({ ok: true, captured: false });
+});
+
+// ── POST /api/system/launch-app: Dynamic Windows Application Launcher ──
+app.post('/api/system/launch-app', async (req, res) => {
+  const appName = typeof req.body?.appName === 'string' ? req.body.appName : '';
+  if (!appName) {
+    return res.status(400).json({ success: false, error: 'appName is required' });
+  }
+  const result = await launchWindowsAppDynamically(appName);
+  res.json(result);
 });
 
 // ── POST /api/gemini/assistant: Real Gemini + Multimodal Vision + Google Search Grounding ──
@@ -2598,11 +2821,26 @@ app.post('/api/gemini/assistant', async (req, res) => {
     ? String(rawImage.data).replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '').trim()
     : '';
 
+  // Extract optional audio recording ({ data: base64, mimeType: 'audio/wav' | 'audio/webm' })
+  const rawAudio = req.body?.audio;
+  const hasValidAudio =
+    rawAudio &&
+    typeof rawAudio === 'object' &&
+    typeof rawAudio.data === 'string' &&
+    rawAudio.data.length > 32;
+  const audioMimeType =
+    hasValidAudio && typeof rawAudio.mimeType === 'string' && rawAudio.mimeType.startsWith('audio/')
+      ? rawAudio.mimeType
+      : 'audio/wav';
+  const audioBase64 = hasValidAudio
+    ? String(rawAudio.data).replace(/^data:audio\/[a-zA-Z0-9.+-]+;base64,/, '').trim()
+    : '';
+
   // 1. Validate prompt type & length BEFORE consuming rate limit or calling Gemini
   const rawPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt : '';
-  if (!rawPrompt && !imageBase64) {
+  if (!rawPrompt && !imageBase64 && !audioBase64) {
     return res.status(400).json({
-      error: 'Prompt or image attachment is required.',
+      error: 'Prompt, audio recording, or image attachment is required.',
       code: 'INVALID_PROMPT_TYPE',
     });
   }
@@ -2616,8 +2854,12 @@ app.post('/api/gemini/assistant', async (req, res) => {
 
   const prompt =
     sanitizeText(rawPrompt, 1000) ||
-    (imageBase64 ? 'Tolong analisis dan jelaskan apa yang terlihat pada gambar/layar ini.' : '');
-  if (!prompt) {
+    (audioBase64
+      ? 'Dengarkan pesan suara ini dan jawab langsung sebagai AI Companion & controller PC.'
+      : imageBase64
+      ? 'Tolong analisis dan jelaskan apa yang terlihat pada gambar/layar ini.'
+      : '');
+  if (!prompt && !audioBase64) {
     return res.status(400).json({
       error: 'Prompt cannot be empty or whitespace only.',
       code: 'EMPTY_PROMPT',
@@ -2702,6 +2944,7 @@ Valid action_name values:
 - clear_queue, shuffle_on, shuffle_off
 - set_volume|0_to_100 (set system volume)
 - set_brightness|0_to_10 (set screen brightness 0..10)
+- launch_app|app_name (dynamically find and launch any installed Windows desktop or Store application, e.g. [ACTION:launch_app|Discord], [ACTION:launch_app|Spotify], [ACTION:launch_app|Chrome], [ACTION:launch_app|VS Code], [ACTION:launch_app|Notion], [ACTION:launch_app|WhatsApp])
 - play_music, pause_music, next_track, prev_track, toggle_lyrics, mute_volume, unmute_volume, start_pomodoro, pause_pomodoro, reset_pomodoro, open_tasks, open_shelf, clear_shelf, open_calendar, add_calendar_event|event_title, open_notifications, toggle_dnd, none.
 Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'}, nowPlaying=${sanitizeText(currentState.trackTitle, 80) || 'Idle'}, queueLength=${Number(currentState.queueCount) || 0}, moodShuffle=${currentState.moodShuffleEnabled ? 'ON' : 'OFF'}, volume=${Number(currentState.volume) || 36}%, brightness=${Number(currentState.brightness) ?? 7}/10, battery=${Number(currentState.batteryLevel) || 82}%, bluetooth=${currentState.bluetoothEnabled !== false ? 'ON' : 'OFF'}, pomodoro=${sanitizeText(currentState.pomoRemaining, 10) || '25:00'} (${currentState.pomoRunning ? 'running' : 'paused'}), shelfFiles=${Number(currentState.shelfCount) || 0}.`;
 
@@ -2731,7 +2974,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
   const liveWeb = await liveWebPromise;
   const webContextBlock =
     liveWeb.snippets.length > 0
-      ? `\n\nLive Google Search & Web Data (use this real-time data to answer accurately):\n${liveWeb.snippets.join('\n')}`
+      ? `\n\n[HASIL PENELUSURAN WEB & BERITA TERKINI (REAL-TIME SEARCH GROUNDING)]:\n${liveWeb.snippets.join('\n')}\n(Gunakan data informasi web terbaru di atas untuk menjawab pertanyaan dengan akurat, mutakhir, cerdas, dan percaya diri.)`
       : '';
 
   const buildContentsPayload = (textBlock: string) => {
@@ -2753,8 +2996,44 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
     return textBlock;
   };
 
+  // ROUTE 0: Multimodal Audio Speech Understanding (when voice recording is attached)
+  if (audioBase64 && ai) {
+    try {
+      const audioRes = await withTimeout(
+        ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: audioMimeType,
+                    data: audioBase64,
+                  },
+                },
+                {
+                  text: `${systemPrompt}\n\nUser sent a voice message recorded from their microphone. Transcribe and execute the user's intent or reply naturally in the requested companion style.`,
+                },
+              ],
+            },
+          ],
+        }),
+        12000,
+        'gemini-audio-multimodal'
+      );
+      const audioText = audioRes?.text?.trim();
+      if (audioText) {
+        response = { text: audioText, candidates: [] };
+        usedModel = 'gemini-2.5-flash';
+      }
+    } catch (err: any) {
+      console.warn('[AUDIO ROUTE ERROR]', err?.message);
+    }
+  }
+
   // ROUTE 1: Thinking Mode (`muse-spark-1.3-contributor`) via Bynara Router
-  if (isThinkingModel) {
+  if (!response && isThinkingModel) {
     try {
       const bynaraMessages: Array<{ role: string; content: any }> = [
         { role: 'system', content: systemPrompt },
@@ -2825,7 +3104,16 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
         : ['agnes-3.0-flash', 'agnes-2.5-flash'];
 
     const agnesMessages: Array<{ role: string; content: any }> = [
-      { role: 'system', content: systemPrompt },
+      {
+        role: 'system',
+        content: `${systemPrompt}
+
+PANDUAN KHUSUS MODEL AGNES (FAST AI + LIVE WEB SEARCH BROWSING):
+Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan penelusuran web real-time.
+- Bila ada bagian [HASIL PENELUSURAN WEB & BERITA TERKINI (REAL-TIME SEARCH GROUNDING)] pada pesan pengguna, kamu HARUS memanfaatkannya untuk memberikan jawaban yang up-to-date, tepat sasaran, dan pintar.
+- Jangan pernah mengatakan bahwa kamu tidak memiliki akses internet atau hanya dilatih hingga batas waktu tertentu jika informasinya tersedia di data web.
+- Jawab secara luwes, cerdas, dan mengalir natural dalam bahasa Indonesia santai ("aku" dan "kamu").`,
+      },
     ];
     for (const m of rawHistory.slice(-6)) {
       const text = sanitizeText(m?.text, 300);
@@ -2864,7 +3152,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
               model: agnesModel,
               messages: agnesMessages,
               temperature: 0.7,
-              max_tokens: 260,
+              max_tokens: 1200,
             }),
           }),
           9000,
@@ -3002,6 +3290,19 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
         inferred.actionParam,
         Boolean(currentState?.flacEnabled)
       );
+    } else if (inferred.action === 'launch_app' && inferred.actionParam) {
+      const launchRes = await launchWindowsAppDynamically(inferred.actionParam);
+      if (launchRes.success) {
+        const appName = launchRes.matchedName || inferred.actionParam;
+        replyText = `Membuka ${appName}...`;
+        commandCard = {
+          command: `Start-Process "${appName}"`,
+          purpose: `Aplikasi Diluncurkan`,
+          output: `Berhasil membuka ${appName} di Windows`,
+        };
+      } else {
+        replyText = `Maaf, aplikasi "${inferred.actionParam}" tidak ditemukan di sistem Windows kamu.`;
+      }
     }
 
     // Extract Google Search Grounding URLs from groundingMetadata.groundingChunks + liveWeb.sources
@@ -3011,6 +3312,7 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
 
     // Only attach web search sources if not a purely local hardware command
     const isLocalSystemAction = [
+      'launch_app',
       'bluetooth_off',
       'bluetooth_on',
       'wifi_off',
@@ -3264,16 +3566,36 @@ export async function startServer(customPort?: number) {
     }
   });
 
-  let viteActive = false;
   const isDev =
     process.env.NODE_ENV !== 'production' && process.env.ISLE_ELECTRON_STATIC !== '1';
+
+  // Bind HTTP server to port immediately so container health checks succeed without waiting for Vite bundle scan
+  const listenPromise = new Promise<typeof httpServer>((resolve) => {
+    httpServer.on('error', (err: any) => {
+      if (err?.code === 'EADDRINUSE') {
+        console.log(`Isle Server already active on http://localhost:${listenPort}`);
+        resolve(httpServer);
+      } else {
+        console.error('Isle Server error:', err);
+      }
+    });
+
+    httpServer.listen(listenPort, '0.0.0.0', () => {
+      console.log(
+        `Isle Server (with Gemini 3.8 Flash Search & Gemini 3.8 Live WS) running on http://0.0.0.0:${listenPort}`
+      );
+      resolve(httpServer);
+    });
+  });
+
+  let viteActive = false;
 
   if (isDev) {
     try {
       const vitePkg = 'vite';
       const { createServer: createViteServer } = await import(vitePkg);
       const vite = await createViteServer({
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, hmr: false },
         appType: 'spa',
       });
       app.use(vite.middlewares);
@@ -3353,23 +3675,7 @@ export async function startServer(customPort?: number) {
     });
   }
 
-  return new Promise<typeof httpServer>((resolve) => {
-    httpServer.on('error', (err: any) => {
-      if (err?.code === 'EADDRINUSE') {
-        console.log(`Isle Server already active on http://localhost:${listenPort}`);
-        resolve(httpServer);
-      } else {
-        console.error('Isle Server error:', err);
-      }
-    });
-
-    httpServer.listen(listenPort, '0.0.0.0', () => {
-      console.log(
-        `Isle Server (with Gemini 3.8 Flash Search & Gemini 3.8 Live WS) running on http://localhost:${listenPort}`
-      );
-      resolve(httpServer);
-    });
-  });
+  return listenPromise;
 }
 
 if (process.env.ISLE_MANUAL_START !== '1') {

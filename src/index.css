@@ -176,3 +176,56 @@
   -webkit-text-fill-color: transparent;
   animation: geminiTextShimmer 2.2s linear infinite;
 }
+
+/* Notification Spring Slide-Down Animation for responsive & fluid arrival */
+@keyframes notifSlideDownSpring {
+  0% {
+    opacity: 0;
+    transform: translateY(-18px) scale(0.96);
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(2.5px) scale(1.008);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Fluid Seamless Staggered Entrance Animation for All Menus & Elements */
+@keyframes isleMenuItemIn {
+  0% {
+    opacity: 0;
+    transform: translateY(9px) scale(0.965);
+    filter: blur(3.5px);
+  }
+  68% {
+    opacity: 1;
+    transform: translateY(-0.8px) scale(1.004);
+    filter: blur(0px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0px);
+  }
+}
+
+.isle-stagger-1 {
+  animation: isleMenuItemIn 360ms cubic-bezier(0.22, 1, 0.36, 1) 15ms both;
+}
+
+.isle-stagger-2 {
+  animation: isleMenuItemIn 390ms cubic-bezier(0.22, 1, 0.36, 1) 55ms both;
+}
+
+.isle-stagger-3 {
+  animation: isleMenuItemIn 420ms cubic-bezier(0.22, 1, 0.36, 1) 95ms both;
+}
+
+.isle-stagger-4 {
+  animation: isleMenuItemIn 450ms cubic-bezier(0.22, 1, 0.36, 1) 135ms both;
+}
+
+
