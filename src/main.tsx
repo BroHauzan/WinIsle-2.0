@@ -13,10 +13,23 @@ import {
   getSystemMedia,
   sendSystemMediaCommand,
   getSystemScreenshot,
+  fetchUrlText,
 } from './core/tauri-bridge';
 import { askGeminiAssistant } from './core/gemini';
+import { parseMusicQuery } from './utils/musicQuery';
 
 setupTauriBridgeGlobal();
+
+const DEFAULT_POPULAR_TRACKS = [
+  'Hindia Evaluasi',
+  'Laufey From The Start',
+  'Tulus Hati-Hati di Jalan',
+  'Bernadya Satu Bulan',
+  'Niki Every Summertime',
+  'Juicy Luicy Lantas',
+  'Pamungkas To The Bone',
+  'Mahalini Sial',
+];
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -81,12 +94,38 @@ function cleanExternalSongAndArtist(rawTitle: string, rawArtist: string): { titl
   return { title, artist };
 }
 
+async function resolveFullLengthAudioStreamTauri(title: string, artist: string): Promise<string> {
+  const searchQ = `${title} ${artist}`.trim();
+  if (!searchQ) return '';
+  try {
+    const searchUrl = `https://music-api.gdstudio.xyz/api.php?types=search&source=netease&name=${encodeURIComponent(searchQ)}&count=5&pages=1`;
+    const rawSearch = await fetchUrlText(searchUrl);
+    const list = JSON.parse(rawSearch);
+    if (Array.isArray(list) && list.length > 0) {
+      const firstId = list[0]?.url_id || list[0]?.id;
+      if (firstId) {
+        const streamMetaUrl = `https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=${encodeURIComponent(String(firstId))}&br=320`;
+        const rawStream = await fetchUrlText(streamMetaUrl);
+        const streamData = JSON.parse(rawStream);
+        if (typeof streamData?.url === 'string' && streamData.url.startsWith('http')) {
+          return streamData.url.replace(/^http:\/\//i, 'https://');
+        }
+      }
+    }
+  } catch {
+    // Fallback to iTunes AAC previewUrl if native curl or upstream fails
+  }
+  return '';
+}
+
 async function resolveTauriSong(
   origFetch: typeof window.fetch,
   query: string,
   useFlac = false
 ) {
-  const cleanQ = query
+  const parsed = parseMusicQuery(query);
+  const rawQuery = parsed.searchQuery || query;
+  const cleanQ = rawQuery
     .replace(/\s*(?:-|\|)\s*(?:YouTube Music|YouTube|Google Chrome|Microsoft Edge|Spotify).*$/i, '')
     .replace(/\s*-\s*Topic\b/gi, '')
     .trim();
@@ -94,19 +133,24 @@ async function resolveTauriSong(
   let title = cleanQ;
   let artist = '';
   let coverUrl = '';
+  let previewUrl = '';
   let durationMs = 210000;
 
   try {
     const itRes = await origFetch(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&media=music&entity=song&limit=5`
+      `https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&media=music&entity=song&limit=8`
     );
     if (itRes.ok) {
       const itData = await itRes.json();
-      const first = itData?.results?.[0];
+      const results: any[] = Array.isArray(itData?.results) ? itData.results : [];
+      const first = results.find((r) => typeof r?.previewUrl === 'string' && r.previewUrl.startsWith('http')) || results[0];
       if (first) {
         title = first.trackName || title;
         artist = first.artistName || artist;
         coverUrl = String(first.artworkUrl100 || '').replace('100x100bb', '600x600bb');
+        if (typeof first.previewUrl === 'string' && first.previewUrl.startsWith('http')) {
+          previewUrl = first.previewUrl;
+        }
         if (typeof first.trackTimeMillis === 'number' && first.trackTimeMillis > 45000) {
           durationMs = first.trackTimeMillis;
         }
@@ -115,6 +159,10 @@ async function resolveTauriSong(
   } catch {
     // ignore
   }
+
+  // Resolve full-length 320kbps MP3 stream if available, with guaranteed fallback to iTunes 256kbps AAC previewUrl
+  const fullStreamUrl = await resolveFullLengthAudioStreamTauri(title, artist);
+  const finalAudioUrl = fullStreamUrl || previewUrl;
 
   let lrc = '';
   let provider = 'none';
@@ -136,41 +184,15 @@ async function resolveTauriSong(
     // ignore
   }
 
-  let youtubeVideoId = '';
-  try {
-    const ytmRes = await origFetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        context: {
-          client: { clientName: 'WEB_REMIX', clientVersion: '1.20240717.01.00', hl: 'en', gl: 'ID' },
-        },
-        query: `${title} ${artist}`.trim(),
-        params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
-      }),
-    });
-    if (ytmRes.ok) {
-      const ytmData = await ytmRes.json();
-      const rawJson = JSON.stringify(ytmData);
-      const vidMatch = rawJson.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-      if (vidMatch && vidMatch[1]) {
-        youtubeVideoId = vidMatch[1];
-      }
-    }
-  } catch {
-    // ignore
-  }
-
   return {
     title,
-    artist,
+    artist: artist || 'Various Artists',
     coverUrl,
-    audioUrl: '',
+    audioUrl: finalAudioUrl,
+    previewUrl: previewUrl || finalAudioUrl,
     isFlac: useFlac,
     durationMs,
-    youtubeVideoId,
+    youtubeVideoId: '',
     lrc,
     syncType: 'LINE',
     provider,
@@ -277,8 +299,15 @@ if (typeof window !== 'undefined') {
         return track ? jsonResponse({ found: true, track }) : jsonResponse({ found: false }, 404);
       }
       if (pathname === '/api/music/mood-shuffle') {
-        const artist = params.get('artist') || 'Laufey';
-        const track = await resolveTauriSong(origFetch, `${artist} From The Start`, false);
+        const artist = (params.get('artist') || '').trim();
+        const excludedRaw = (params.get('exclude') || '').toLowerCase();
+        const candidates = artist
+          ? [`${artist}`, ...DEFAULT_POPULAR_TRACKS]
+          : DEFAULT_POPULAR_TRACKS;
+        const picked =
+          candidates.find((c) => !excludedRaw.includes(c.toLowerCase())) ||
+          DEFAULT_POPULAR_TRACKS[Math.floor(Math.random() * DEFAULT_POPULAR_TRACKS.length)];
+        const track = await resolveTauriSong(origFetch, picked, params.get('flac') === 'true');
         return track ? jsonResponse({ found: true, track }) : jsonResponse({ found: false }, 404);
       }
       if (pathname === '/api/music/lyrics') {
@@ -429,8 +458,9 @@ if (typeof window !== 'undefined') {
         });
       }
       if (pathname === '/api/gemini/assistant') {
+        const rawPrompt = String(bodyObj?.prompt || '').trim();
         const res = await askGeminiAssistant({
-          prompt: bodyObj?.prompt || '',
+          prompt: rawPrompt,
           apiKey: bodyObj?.apiKey,
           model: bodyObj?.model,
           image: bodyObj?.image,
@@ -446,9 +476,45 @@ if (typeof window !== 'undefined') {
           detectedParam = actionMatch[2]?.trim() || undefined;
           replyText = replyText.replace(actionMatch[0], '').trim();
         }
+        // Fallback local intent detection for Indonesian/English music prompts ("puter musik", "puter lagu ...", etc.)
+        if (detectedAction === 'none' && rawPrompt) {
+          const songRegexMatch =
+            rawPrompt.match(
+              /\b(?:putar lagu|puter lagu|putarkan lagu|puterin lagu|stel lagu|setel musik|setel lagu|setelin lagu|mainkan lagu|mainin lagu|dengerin lagu|play song|play music|putar musik|puter musik|putarkan musik|puterin musik)\s+(.+)/i
+            ) ||
+            rawPrompt.match(
+              /\b(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play)\s+(?:lagunya|lagu|musik|musiknya|track|song)\s+(.+)/i
+            );
+          if (songRegexMatch && songRegexMatch[1]) {
+            const parsedMusic = parseMusicQuery(songRegexMatch[1].trim());
+            detectedAction = 'play_song';
+            detectedParam = parsedMusic.searchQuery || songRegexMatch[1].trim();
+          } else if (
+            /\b(puter musik|putar musik|puter lagu|putar lagu|setel musik|setel lagu|mainkan musik|mainkan lagu|nyalain musik|nyalakan musik|play music|play song)\b/i.test(
+              rawPrompt
+            )
+          ) {
+            detectedAction = 'play_music';
+          }
+        }
+        // If generic "play_music" is requested while no song is loaded, pick a popular song so real audio plays immediately
+        const currentTrackTitle = String(bodyObj?.currentState?.trackTitle || 'Idle').trim();
+        if (
+          detectedAction === 'play_music' &&
+          (!currentTrackTitle || currentTrackTitle === 'Idle' || currentTrackTitle === 'Media')
+        ) {
+          detectedAction = 'play_song';
+          detectedParam =
+            detectedParam ||
+            DEFAULT_POPULAR_TRACKS[Math.floor(Math.random() * DEFAULT_POPULAR_TRACKS.length)];
+        }
         let trackData: any;
         if ((detectedAction === 'play_song' || detectedAction === 'queue_song') && detectedParam) {
-          trackData = await resolveTauriSong(origFetch, detectedParam, false);
+          trackData = await resolveTauriSong(
+            origFetch,
+            detectedParam,
+            Boolean(bodyObj?.currentState?.flacEnabled)
+          );
         }
         return jsonResponse({
           reply: replyText,

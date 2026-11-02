@@ -241,6 +241,7 @@ pub fn run() {
             media::get_system_media,
             media::send_system_media_command,
             ai::ask_bynara_ai,
+            ai::fetch_url_text,
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {

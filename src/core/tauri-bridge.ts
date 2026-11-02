@@ -447,6 +447,18 @@ export async function askBynaraAiNative(
   throw new Error('Not running in Tauri environment');
 }
 
+/**
+ * Fetches text/JSON from an external HTTPS URL via native Rust curl.exe to bypass WebView2 CORS.
+ */
+export async function fetchUrlText(url: string): Promise<string> {
+  if (!isTauri()) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  }
+  return await invoke<string>('fetch_url_text', { url });
+}
+
 // ── Standard Bridge Export & window.electronAPI Fallback ──
 
 export const tauriBridge = {
@@ -463,6 +475,7 @@ export const tauriBridge = {
   getSystemMedia,
   sendSystemMediaCommand,
   askBynaraAiNative,
+  fetchUrlText,
   onVolumeChanged,
   onToggleAssistant,
   onSystemMediaChanged,

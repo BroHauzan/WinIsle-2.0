@@ -533,7 +533,7 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
 
   // Queue song (e.g., "tolong setelah ini setel lagu X", "habis ini putar X", "masukin antrian lagu X", "play next X")
   const queueMatch = prompt.match(
-    /\b(?:setelah ini|habis ini|habis lagu ini|abis ini|abis lagu ini|selanjutnya|nanti)\s+(?:tolong\s+)?(?:putar lagu|stel lagu|setel musik|setel lagu|mainkan lagu|putar musik|setel|putar|play|stel)\s+(.+)/i
+    /\b(?:setelah ini|habis ini|habis lagu ini|abis ini|abis lagu ini|selanjutnya|nanti)\s+(?:tolong\s+)?(?:putar lagu|puter lagu|stel lagu|setel musik|setel lagu|mainkan lagu|putar musik|puter musik|setel|putar|puter|play|stel)\s+(.+)/i
   ) || prompt.match(
     /\b(?:masukin ke antrian|masukkan ke antrian|tambah ke antrian|tambahin ke antrian|antriin lagu|antrikan lagu|antri lagu|add to queue|queue song|queue track|play next)\s+(?:lagu\s+)?(.+)/i
   );
@@ -561,10 +561,19 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
     return { action: 'shuffle_on' };
   }
 
-  // Play specific song query
-  const songMatch = prompt.match(/\b(?:putar lagu|stel lagu|setel musik|setel lagu|mainkan lagu|play song|play music|putar musik)\s+(.+)/i);
+  // Play specific song query (including "puter lagu", "puter musik", "puterin", "putarkan", "setelin", "mainin")
+  const songMatch = prompt.match(
+    /\b(?:putar lagu|puter lagu|putarkan lagu|puterin lagu|stel lagu|setel musik|setel lagu|setelin lagu|mainkan lagu|mainin lagu|dengerin lagu|play song|play music|putar musik|puter musik|putarkan musik|puterin musik)\s+(.+)/i
+  ) || prompt.match(
+    /\b(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play)\s+(?:lagunya|lagu|musik|musiknya|track|song)\s+(.+)/i
+  );
   if (songMatch && songMatch[1]) {
-    return { action: 'play_song', actionParam: songMatch[1].trim() };
+    const cleanedSong = songMatch[1]
+      .replace(/\b(dong|ya|sekarang|please|plis|di\s+dynamic\s+island)\b/gi, '')
+      .trim();
+    if (cleanedSong) {
+      return { action: 'play_song', actionParam: cleanedSong };
+    }
   }
 
   // Volume & Brightness numeric control
@@ -664,8 +673,8 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
     return { action: 'brightness_down' };
   }
 
-  if (/\b(play music|putar lagu|nyalain musik|play song)\b/.test(p)) return { action: 'play_music' };
-  if (/\b(pause music|jeda musik|matikan musik|stop musik)\b/.test(p)) return { action: 'pause_music' };
+  if (/\b(play music|putar musik|puter musik|putar lagu|puter lagu|setel musik|setel lagu|mainkan musik|mainkan lagu|nyalain musik|nyalakan musik|play song)\b/.test(p)) return { action: 'play_music' };
+  if (/\b(pause music|jeda musik|matikan musik|matiin musik|stop musik)\b/.test(p)) return { action: 'pause_music' };
   if (/\b(next track|lagu selanjutnya|skip lagu)\b/.test(p)) return { action: 'next_track' };
   if (/\b(prev track|previous track|lagu sebelumnya)\b/.test(p)) return { action: 'prev_track' };
   if (/\b(lirik|lyrics)\b/.test(p)) return { action: 'toggle_lyrics' };
@@ -1444,37 +1453,112 @@ async function resolveMonochromeFlacStream(
   return null;
 }
 
-async function resolveDirectYoutubeAudioStream(videoId: string): Promise<string> {
-  if (!videoId) return '';
-  const pipedInstances = [
-    'https://pipedapi.kavin.rocks',
-    'https://api.piped.private.coffee',
-    'https://pipedapi.tokhmi.xyz',
-  ];
-  for (const base of pipedInstances) {
+async function resolveDirectFullSongStream(
+  title: string,
+  artist: string,
+  videoId: string
+): Promise<string> {
+  // 1. Primary Full-Length 320kbps MP3 Resolver (GDStudio NetEase Cloud Music CDN with CORS *)
+  const searchQuery = `${title} ${artist}`.trim();
+  if (searchQuery) {
     try {
-      const res = await withTimeout(
-        fetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
-          headers: { Accept: 'application/json', 'User-Agent': 'WinIsle-Audio/2.0' },
-        }),
-        2000,
-        'piped-stream'
+      const searchRes = await withTimeout(
+        fetch(
+          `https://music-api.gdstudio.xyz/api.php?types=search&source=netease&name=${encodeURIComponent(
+            searchQuery
+          )}&count=5&pages=1`,
+          {
+            headers: {
+              Accept: 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) WinIsle-Audio/2.0',
+            },
+          }
+        ),
+        2800,
+        'gdstudio-search'
       );
-      if (!res.ok) continue;
-      const data: any = await res.json();
-      const streams: any[] = Array.isArray(data?.audioStreams) ? data.audioStreams : [];
-      if (streams.length === 0) continue;
-      const m4aStreams = streams
-        .filter((s) => s?.url && (String(s.mimeType || '').includes('mp4') || String(s.format || '').includes('M4A')))
-        .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
-      const bestStream = m4aStreams[0] || streams.find((s) => s?.url);
-      if (bestStream?.url && String(bestStream.url).startsWith('http')) {
-        return String(bestStream.url);
+      if (searchRes.ok) {
+        const list: any = await searchRes.json();
+        if (Array.isArray(list) && list.length > 0) {
+          const firstId = list[0]?.url_id || list[0]?.id;
+          if (firstId) {
+            const urlRes = await withTimeout(
+              fetch(
+                `https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=${encodeURIComponent(
+                  String(firstId)
+                )}&br=320`,
+                {
+                  headers: {
+                    Accept: 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) WinIsle-Audio/2.0',
+                  },
+                }
+              ),
+              2800,
+              'gdstudio-url'
+            );
+            if (urlRes.ok) {
+              const urlData: any = await urlRes.json();
+              if (typeof urlData?.url === 'string' && urlData.url.startsWith('http')) {
+                return urlData.url.replace(/^http:\/\//i, 'https://');
+              }
+            }
+          }
+        }
       }
     } catch {
-      // try next instance
+      // Fall through to InnerTube / Piped
     }
   }
+
+  if (!videoId) return '';
+
+  // 2. Secondary YouTube InnerTube ANDROID_VR Direct Audio Stream (itag 140 m4a)
+  try {
+    const ytPlayerRes = await withTimeout(
+      fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12; Quest 2) gzip',
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: 'ANDROID_VR',
+              clientVersion: '1.56.21',
+              androidSdkVersion: 32,
+              hl: 'en',
+              gl: 'ID',
+            },
+          },
+          videoId,
+        }),
+      }),
+      2500,
+      'yt-android-vr'
+    );
+    if (ytPlayerRes.ok) {
+      const playerData: any = await ytPlayerRes.json();
+      const formats: any[] = Array.isArray(playerData?.streamingData?.adaptiveFormats)
+        ? playerData.streamingData.adaptiveFormats
+        : [];
+      const audioFormats = formats
+        .filter((f) => typeof f?.url === 'string' && String(f.mimeType || '').startsWith('audio/'))
+        .sort((a, b) => {
+          const aMp4 = String(a.mimeType || '').includes('mp4') ? 1 : 0;
+          const bMp4 = String(b.mimeType || '').includes('mp4') ? 1 : 0;
+          if (aMp4 !== bMp4) return bMp4 - aMp4;
+          return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
+        });
+      if (audioFormats[0]?.url) {
+        return String(audioFormats[0].url);
+      }
+    }
+  } catch {
+    // Fall through
+  }
+
   return '';
 }
 
@@ -1662,11 +1746,13 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
     coverUrl = `https://img.youtube.com/vi/${youtubeVideoId}/hqdefault.jpg`;
   }
 
-  // 2b. If audioUrl is still empty, attempt fast direct YouTube audio stream resolution
-  if (!audioUrl && youtubeVideoId) {
-    const directStream = await resolveDirectYoutubeAudioStream(youtubeVideoId);
+  // 2b. Resolve direct full-length audio stream (320kbps MP3 or m4a), with guaranteed fallback to iTunes 256kbps AAC previewUrl
+  if (!audioUrl) {
+    const directStream = await resolveDirectFullSongStream(title, artist, youtubeVideoId);
     if (directStream) {
       audioUrl = directStream;
+    } else if (previewUrl) {
+      audioUrl = previewUrl;
     }
   }
 
@@ -1702,8 +1788,8 @@ async function resolveSongWithMultiSource(query: string, useFlac = false) {
     title,
     artist: artist || 'Various Artists',
     coverUrl,
-    audioUrl,
-    previewUrl,
+    audioUrl: audioUrl || previewUrl,
+    previewUrl: previewUrl || audioUrl,
     isFlac,
     durationMs,
     youtubeVideoId,
@@ -3331,6 +3417,26 @@ Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan 
         purpose: 'Terminal Output',
         output: termRes.output,
       };
+    } else if (inferred.action === 'play_music') {
+      const currentTrackTitle = String(currentState?.trackTitle || 'Idle').trim();
+      if (!currentTrackTitle || currentTrackTitle === 'Idle' || currentTrackTitle === 'Media') {
+        const defaultSongs = [
+          'Hindia Evaluasi',
+          'Laufey From The Start',
+          'Tulus Hati-Hati di Jalan',
+          'Bernadya Satu Bulan',
+          'Niki Every Summertime',
+        ];
+        const pickedSong =
+          inferred.actionParam ||
+          defaultSongs[Math.floor(Math.random() * defaultSongs.length)];
+        inferred.action = 'play_song';
+        inferred.actionParam = pickedSong;
+        trackData = await resolveSongWithMultiSource(
+          pickedSong,
+          Boolean(currentState?.flacEnabled)
+        );
+      }
     } else if ((inferred.action === 'play_song' || inferred.action === 'queue_song') && inferred.actionParam) {
       trackData = await resolveSongWithMultiSource(
         inferred.actionParam,

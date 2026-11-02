@@ -74,3 +74,48 @@ pub async fn ask_bynara_ai(
     .await
     .map_err(|e| format!("Task join error: {}", e))?
 }
+
+#[tauri::command]
+pub async fn fetch_url_text(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let trimmed = url.trim();
+        if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
+            return Err("Invalid URL protocol".to_string());
+        }
+
+        let mut cmd = std::process::Command::new("curl.exe");
+        cmd.args([
+            "-s",
+            "-S",
+            "-L",
+            "--max-time",
+            "8",
+            "-H",
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) WinIsle/2.0",
+            trimmed,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to execute curl.exe: {}", e))?;
+
+        if !output.status.success() {
+            let err_str = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("curl error: {}", err_str));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+

@@ -2171,19 +2171,12 @@ export default function App() {
         ytFallbackTimerRef.current = null;
       }
       const isExternal = trackInfo.sourceType === 'external';
-      const isTauriEnv =
-        typeof window !== 'undefined' &&
-        (Boolean((window as any).__TAURI_INTERNALS__) ||
-          window.location.hostname.includes('tauri'));
-
       const rawAudioUrl = (trackInfo.audioUrl || '').trim();
       const rawPreviewUrl = (trackInfo.previewUrl || '').trim();
 
-      // In Tauri Windows WebView2 (or when no YouTube videoId is available), immediately use direct audioUrl or previewUrl
-      // so audio plays natively through HTML5 <audio> without YouTube localhost embed restrictions!
-      const effectiveAudioUrl =
-        rawAudioUrl ||
-        ((isTauriEnv || !trackInfo.youtubeVideoId) && rawPreviewUrl ? rawPreviewUrl : '');
+      // Always prefer direct HTTP/HTTPS/Blob audioUrl or previewUrl so audio plays natively through HTML5 <audio>
+      // on Windows CoreAudio (Tauri WebView2, Electron, and Browser) without YouTube localhost embed restrictions.
+      const effectiveAudioUrl = rawAudioUrl || rawPreviewUrl;
 
       const useHtmlAudio =
         !isExternal &&
@@ -2235,8 +2228,10 @@ export default function App() {
         audioElRef.current.pause();
         audioElRef.current.currentTime = 0;
         if (useHtmlAudio && nextTrack.audioUrl) {
+          audioElRef.current.muted = Boolean(muted);
+          audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0.15, volume / 100));
           audioElRef.current.src = nextTrack.audioUrl;
-          audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0, volume / 100));
+          audioElRef.current.load();
           audioElRef.current
             .play()
             .then(() => setIsPlaying(true))
@@ -2244,12 +2239,16 @@ export default function App() {
               // If primary direct stream fails, try previewUrl or fall back to YouTube iframe
               if (rawPreviewUrl && nextTrack.audioUrl !== rawPreviewUrl && audioElRef.current) {
                 audioElRef.current.src = rawPreviewUrl;
+                audioElRef.current.load();
                 audioElRef.current
                   .play()
                   .then(() => {
-                    setActiveTrack((prev) =>
-                      prev ? { ...prev, audioUrl: rawPreviewUrl } : prev
-                    );
+                    const fallbackTrack: RealMediaTrack = {
+                      ...nextTrack,
+                      audioUrl: rawPreviewUrl,
+                    };
+                    activeTrackRef.current = fallbackTrack;
+                    setActiveTrack(fallbackTrack);
                     setIsPlaying(true);
                   })
                   .catch(() => {
@@ -2281,8 +2280,10 @@ export default function App() {
                 activeTrackRef.current = updated;
                 setActiveTrack(updated);
                 if (audioElRef.current) {
+                  audioElRef.current.muted = Boolean(muted);
+                  audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0.15, volume / 100));
                   audioElRef.current.src = rawPreviewUrl;
-                  audioElRef.current.volume = muted ? 0 : Math.min(1, Math.max(0, volume / 100));
+                  audioElRef.current.load();
                   audioElRef.current.play().catch(() => {});
                 }
               }
@@ -2976,20 +2977,18 @@ export default function App() {
         return;
       }
 
-      // 1. If HTML5 <audio> is actively playing a local blob or HTTP FLAC stream, read its exact hardware currentTime
+      // 1. If HTML5 <audio> is backed by a direct stream URL, read its exact hardware currentTime
       const audioEl = audioElRef.current;
-      if (audioEl && activeTrack.audioUrl && !audioEl.paused && audioEl.currentTime > 0) {
-        const nextPos = Math.round(audioEl.currentTime * 1000);
-        positionMsRef.current = nextPos;
+      if (audioEl && activeTrack.audioUrl && activeTrack.sourceType !== 'external') {
+        if (!audioEl.paused && audioEl.currentTime > 0) {
+          const nextPos = Math.round(audioEl.currentTime * 1000);
+          positionMsRef.current = nextPos;
 
-        // Context-aware React state throttle:
-        // - lyricsMode: 80ms (karaoke word sync)
-        // - expanded: 250ms (fluid progress bar + clock)
-        // - collapsed notch: 1000ms (1 render/sec)
-        const syncThreshold = lyricsMode ? 80 : isExpanded ? 250 : 1000;
-        if (nowWallMs - lastReactSync >= syncThreshold) {
-          lastReactSync = nowWallMs;
-          setPositionMs(nextPos);
+          const syncThreshold = lyricsMode ? 80 : isExpanded ? 250 : 1000;
+          if (nowWallMs - lastReactSync >= syncThreshold) {
+            lastReactSync = nowWallMs;
+            setPositionMs(nextPos);
+          }
         }
         return;
       }
@@ -4273,7 +4272,7 @@ export default function App() {
 
       const queueSongMatch =
         raw.match(
-          /\b(?:setelah ini|habis ini|habis lagu ini|abis ini|abis lagu ini|selanjutnya|nanti)\s+(?:tolong\s+)?(?:putar lagu|stel lagu|setel musik|setel lagu|mainkan lagu|putar musik|setel|putar|play|stel)\s+(.+)/i
+          /\b(?:setelah ini|habis ini|habis lagu ini|abis ini|abis lagu ini|selanjutnya|nanti)\s+(?:tolong\s+)?(?:putar lagu|puter lagu|stel lagu|setel musik|setel lagu|mainkan lagu|putar musik|puter musik|setel|putar|puter|play|stel)\s+(.+)/i
         ) ||
         raw.match(
           /\b(?:masukin ke antrian|masukkan ke antrian|tambah ke antrian|tambahin ke antrian|antriin lagu|antrikan lagu|antri lagu|add to queue|queue song|queue track|play next)\s+(?:lagu\s+)?(.+)/i
@@ -4356,22 +4355,40 @@ export default function App() {
         };
       }
 
-      const playSongMatch = raw.match(
-        /\b(?:putar lagu|stel lagu|setel musik|setel lagu|mainkan lagu|play song|play music|putar musik)\s+(.+)/i
-      );
+      const playSongMatch =
+        raw.match(
+          /\b(?:putar lagu|puter lagu|putarkan lagu|puterin lagu|stel lagu|setel musik|setel lagu|setelin lagu|mainkan lagu|mainin lagu|dengerin lagu|play song|play music|putar musik|puter musik|putarkan musik|puterin musik)\s+(.+)/i
+        ) ||
+        raw.match(
+          /\b(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play)\s+(?:lagunya|lagu|musik|musiknya|track|song)\s+(.+)/i
+        );
       if (playSongMatch && playSongMatch[1]) {
-        const songQuery = playSongMatch[1].trim();
-        handleSearchAndPlayMedia(songQuery);
-        navigateToPage(0);
-        triggerActionConfirmation('Memutar Lagu', songQuery, 'PLAY', 'music', 0);
-        return { handled: true, reply: `Mencari dan memutar "${songQuery}" di Dynamic Island.` };
+        const songQuery = playSongMatch[1]
+          .replace(/\b(dong|ya|sekarang|please|plis|di\s+dynamic\s+island)\b/gi, '')
+          .trim();
+        if (songQuery) {
+          handleSearchAndPlayMedia(songQuery);
+          navigateToPage(0);
+          triggerActionConfirmation('Memutar Lagu', songQuery, 'PLAY', 'music', 0);
+          return { handled: true, reply: `Mencari dan memutar "${songQuery}" di Dynamic Island.` };
+        }
       }
-      if (/\b(jeda musik|pause musik|stop musik|pause lagu|hentikan musik)\b/.test(p)) {
+      if (/\b(jeda musik|pause musik|stop musik|pause lagu|hentikan musik|matiin musik|matikan musik)\b/.test(p)) {
         if (isPlaying) handleTogglePlay();
         triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PAUSED', 'music', 0);
         return { handled: true, reply: 'Musik dijeda.' };
       }
-      if (/\b(putar musik|lanjutkan musik|play music|lanjut musik|play lagu)\b/.test(p)) {
+      if (
+        /\b(putar musik|puter musik|putar lagu|puter lagu|lanjutkan musik|play music|lanjut musik|play lagu|nyalain musik|nyalakan musik|setel musik|mainkan musik)\b/.test(
+          p
+        )
+      ) {
+        if (!activeTrackRef.current) {
+          triggerSmartMoodShuffle(null);
+          navigateToPage(0);
+          triggerActionConfirmation('Memutar Musik', 'Smart Mood Mix', 'PLAY', 'music', 0);
+          return { handled: true, reply: 'Memutar musik untukmu sekarang.' };
+        }
         if (!isPlaying) handleTogglePlay();
         navigateToPage(0);
         triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PLAYING', 'music', 0);
@@ -5223,18 +5240,26 @@ export default function App() {
       setBotForm(res.ok ? 'reply' : 'error');
 
       // Execute island & laptop actions if returned by Gemini
-      if (data.action === 'play_song' && data.trackData) {
-        const queryTitle = (data.trackData.title || '').toLowerCase();
-        const recentlyPlayed =
-          Date.now() - lastPlayedSongTimeRef.current < 6000 &&
-          (queryTitle.includes(lastPlayedSongQueryRef.current) ||
-            lastPlayedSongQueryRef.current.includes(queryTitle));
-        if (!recentlyPlayed) {
-          if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
-            setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+      if (data.action === 'play_song') {
+        if (data.trackData) {
+          const queryTitle = (data.trackData.title || '').toLowerCase();
+          const recentlyPlayed =
+            Date.now() - lastPlayedSongTimeRef.current < 6000 &&
+            (queryTitle.includes(lastPlayedSongQueryRef.current) ||
+              lastPlayedSongQueryRef.current.includes(queryTitle));
+          if (!recentlyPlayed) {
+            if (activeTrackRef.current && activeTrackRef.current.sourceType !== 'external') {
+              setMusicHistory((prev) => [activeTrackRef.current!, ...prev.slice(0, 19)]);
+            }
+            shuffleBufferRef.current = null;
+            loadAndPlayRealTrack({ ...data.trackData, sourceType: 'internal' });
+            navigateToPage(0);
           }
-          shuffleBufferRef.current = null;
-          loadAndPlayRealTrack({ ...data.trackData, sourceType: 'internal' });
+        } else if (data.actionParam) {
+          handleSearchAndPlayMedia(data.actionParam);
+          navigateToPage(0);
+        } else if (!activeTrackRef.current) {
+          triggerSmartMoodShuffle(null);
           navigateToPage(0);
         }
       } else if (data.action === 'queue_song') {
@@ -5284,9 +5309,13 @@ export default function App() {
         const b = Math.min(10, Math.max(0, Number(data.actionParam) || 7));
         setBrightness(b);
       } else if (data.action === 'play_music') {
-        if (activeTrack) {
+        if (data.trackData) {
+          loadAndPlayRealTrack({ ...data.trackData, sourceType: 'internal' });
+        } else if (activeTrackRef.current) {
           audioElRef.current?.play().catch(() => {});
           setIsPlaying(true);
+        } else {
+          triggerSmartMoodShuffle(null);
         }
         navigateToPage(0);
       } else if (data.action === 'pause_music') {
@@ -9825,7 +9854,9 @@ export default function App() {
         onTimeUpdate={(e) => {
           if (!activeTrack?.audioUrl) return;
           const el = e.currentTarget;
-          setPositionMs(Math.floor(el.currentTime * 1000));
+          const nextMs = Math.floor(el.currentTime * 1000);
+          positionMsRef.current = nextMs;
+          setPositionMs(nextMs);
         }}
         onLoadedMetadata={(e) => {
           if (!activeTrack?.audioUrl) return;
@@ -9834,6 +9865,19 @@ export default function App() {
           if (Number.isFinite(el.duration) && el.duration > 60) {
             const durMs = Math.floor(el.duration * 1000);
             setActiveTrack((prev) => (prev ? { ...prev, durationMs: durMs } : prev));
+          }
+        }}
+        onError={(e) => {
+          const curr = activeTrackRef.current;
+          if (!curr || curr.sourceType === 'external') return;
+          if (curr.previewUrl && curr.audioUrl !== curr.previewUrl) {
+            const el = e.currentTarget;
+            const fallbackTrack: RealMediaTrack = { ...curr, audioUrl: curr.previewUrl };
+            activeTrackRef.current = fallbackTrack;
+            setActiveTrack(fallbackTrack);
+            el.src = curr.previewUrl;
+            el.load();
+            el.play().catch(() => {});
           }
         }}
         onEnded={() => {
