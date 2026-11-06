@@ -47,16 +47,23 @@ app.commandLine.appendSwitch('disable-domain-reliability');
 app.commandLine.appendSwitch('disable-sync');
 app.commandLine.appendSwitch(
   'disable-features',
-  'Translate,CalculateNativeWinOcclusion,AutofillServerCommunication,SpareRendererForSitePerProcess,BackForwardCache,MediaRouter'
+  'Translate,CalculateNativeWinOcclusion,AutofillServerCommunication,SpareRendererForSitePerProcess,BackForwardCache,MediaRouter,OptimizationHints,AudioServiceOutOfProcess'
 );
 app.commandLine.appendSwitch('enable-features', 'MemoryReducer');
+app.commandLine.appendSwitch('enable-low-end-device-mode');
+app.commandLine.appendSwitch('force-gpu-mem-available-mb', '16');
+app.commandLine.appendSwitch('gpu-program-cache-size-kb', '256');
+app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 app.commandLine.appendSwitch('renderer-process-limit', '1');
+app.commandLine.appendSwitch('process-per-site');
 app.commandLine.appendSwitch('disable-site-isolation-trials');
 app.commandLine.appendSwitch('disable-background-networking');
 app.commandLine.appendSwitch('disable-gpu-memory-buffer-video-frames');
 app.commandLine.appendSwitch('disable-software-rasterizer');
 app.commandLine.appendSwitch('no-zygote');
-app.commandLine.appendSwitch('js-flags', '--expose-gc --max-old-space-size=64 --optimize_for_size');
+app.commandLine.appendSwitch('disk-cache-size', '524288');
+app.commandLine.appendSwitch('media-cache-size', '524288');
+app.commandLine.appendSwitch('js-flags', '--expose-gc --max-old-space-size=24 --max-semi-space-size=1 --optimize_for_size');
 
 /**
  * Check if WinIsle local server on targetPort is responding with valid identity handshake
@@ -332,6 +339,15 @@ function createSystemTray() {
           }
         },
       },
+      {
+        label: 'Jalankan saat Startup Windows',
+        type: 'checkbox',
+        checked: isStartupEnabled(),
+        click: (menuItem) => {
+          registerWindowsStartup(menuItem.checked);
+          updateContextMenu();
+        },
+      },
       { type: 'separator' },
       {
         label: 'Optimalkan RAM Sekarang',
@@ -415,10 +431,11 @@ function trimMemory() {
       .catch(() => {});
   }
 
-  // 3. Flush unreferenced working set pages to drop RAM usage under 60-90MB
+  // 3. Flush unreferenced working set pages to drop RAM usage under 50MB
   const trimExe = locateTrimMemExe();
   if (trimExe) {
     execFile(trimExe, ['WinIsle'], { windowsHide: true }, () => {});
+    execFile(trimExe, ['msedgewebview2'], { windowsHide: true }, () => {});
   }
 }
 
@@ -677,6 +694,181 @@ ipcMain.on('trim-memory', () => {
   trimMemory();
 });
 
+let startupEnabledCache = true;
+
+function isStartupEnabled() {
+  if (process.platform !== 'win32') return startupEnabledCache;
+  try {
+    const settings = app.getLoginItemSettings();
+    return Boolean(settings.openAtLogin);
+  } catch {
+    return startupEnabledCache;
+  }
+}
+
+function registerWindowsStartup(enabled = true) {
+  startupEnabledCache = Boolean(enabled);
+  if (process.platform !== 'win32') return;
+
+  const targetPath = process.execPath;
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: Boolean(enabled),
+      openAsHidden: false,
+      path: targetPath,
+    });
+  } catch (err) {
+    console.warn('[WinIsle] app.setLoginItemSettings error:', err?.message);
+  }
+
+  // Double-assurance: directly configure registry and Start Menu Startup shortcut via PowerShell
+  try {
+    const safeTarget = targetPath.replace(/'/g, "''");
+    if (enabled) {
+      const ps = `
+        $ErrorActionPreference = 'SilentlyContinue'
+        $target = '${safeTarget}'
+        $targetDir = [System.IO.Path]::GetDirectoryName($target)
+        Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'WinIsle' -Value ('"' + $target + '"')
+        Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'IsleDynamicIsland' -Value ('"' + $target + '"')
+        $startupFolder = [System.Environment]::GetFolderPath('Startup')
+        if (Test-Path $startupFolder) {
+          $wsh = New-Object -ComObject WScript.Shell
+          $sc = $wsh.CreateShortcut((Join-Path $startupFolder 'WinIsle.lnk'))
+          $sc.TargetPath = $target
+          if ($targetDir) { $sc.WorkingDirectory = $targetDir }
+          $sc.Description = 'WinIsle Dynamic Island'
+          $sc.Save()
+        }
+      `;
+      const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true }, () => {});
+    } else {
+      const ps = `
+        $ErrorActionPreference = 'SilentlyContinue'
+        Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'WinIsle' -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'IsleDynamicIsland' -ErrorAction SilentlyContinue
+        $startupFolder = [System.Environment]::GetFolderPath('Startup')
+        if (Test-Path $startupFolder) {
+          Remove-Item (Join-Path $startupFolder 'WinIsle.lnk') -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $startupFolder 'IsleDynamicIsland.lnk') -Force -ErrorAction SilentlyContinue
+        }
+      `;
+      const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true }, () => {});
+    }
+  } catch (err) {
+    console.warn('[WinIsle] Direct registry startup configuration error:', err?.message);
+  }
+}
+
+// IPC handlers for Windows Startup management
+ipcMain.handle('get-startup-status', async () => {
+  return { enabled: isStartupEnabled(), path: process.execPath };
+});
+
+ipcMain.handle('set-startup-status', async (_event, enable) => {
+  registerWindowsStartup(Boolean(enable));
+  return { success: true, enabled: Boolean(enable) };
+});
+
+// IPC handler for launching any Windows application natively from Electron main process
+ipcMain.handle('launch-app', async (_event, appName) => {
+  const clean = String(appName || '')
+    .trim()
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .replace(/\b(aplikasi|app|program|software)\b/gi, '')
+    .trim();
+  if (!clean) return { success: false, appName: '', error: 'Empty appName' };
+
+  if (process.platform !== 'win32') {
+    return { success: true, appName: clean, matchedName: clean };
+  }
+
+  return new Promise((resolve) => {
+    const safeQ = clean.replace(/'/g, "''");
+    const ps = `
+      $ErrorActionPreference = 'SilentlyContinue'
+      $q = '${safeQ}'.Trim()
+      $aliasMap = @{
+        'chrome' = 'chrome.exe'; 'google chrome' = 'chrome.exe';
+        'edge' = 'msedge.exe'; 'microsoft edge' = 'msedge.exe';
+        'brave' = 'brave.exe'; 'firefox' = 'firefox.exe';
+        'notepad' = 'notepad.exe';
+        'calculator' = 'calc.exe'; 'kalkulator' = 'calc.exe'; 'calc' = 'calc.exe';
+        'explorer' = 'explorer.exe'; 'file explorer' = 'explorer.exe';
+        'settings' = 'ms-settings:'; 'pengaturan' = 'ms-settings:'; 'setting' = 'ms-settings:';
+        'task manager' = 'taskmgr.exe'; 'taskmgr' = 'taskmgr.exe';
+        'control panel' = 'control.exe';
+        'paint' = 'mspaint.exe'; 'mspaint' = 'mspaint.exe';
+        'cmd' = 'cmd.exe'; 'command prompt' = 'cmd.exe';
+        'powershell' = 'powershell.exe'; 'terminal' = 'wt.exe'; 'windows terminal' = 'wt.exe';
+        'snipping tool' = 'SnippingTool.exe';
+        'word' = 'winword.exe'; 'microsoft word' = 'winword.exe';
+        'excel' = 'excel.exe'; 'microsoft excel' = 'excel.exe';
+        'powerpoint' = 'powerpnt.exe'; 'ppt' = 'powerpnt.exe';
+        'vscode' = 'code'; 'vs code' = 'code'; 'visual studio code' = 'code';
+        'spotify' = 'spotify:'; 'discord' = 'discord:'; 'whatsapp' = 'whatsapp:'; 'wa' = 'whatsapp:';
+        'telegram' = 'tg:'; 'steam' = 'steam:'
+      }
+      $lowerQ = $q.ToLower()
+      $startApps = Get-StartApps
+      $matched = $startApps | Where-Object { $_.Name -ieq $q } | Select-Object -First 1
+      if (-not $matched) { $matched = $startApps | Where-Object { $_.Name -like "$q*" } | Select-Object -First 1 }
+      if (-not $matched) { $matched = $startApps | Where-Object { $_.Name -like "*$q*" } | Select-Object -First 1 }
+      if (-not $matched) { $matched = $startApps | Where-Object { $_.AppID -like "*$q*" } | Select-Object -First 1 }
+      if ($matched) {
+        $appId = $matched.AppID
+        try {
+          $shell = New-Object -ComObject Shell.Application
+          $shell.NameSpace('shell:AppsFolder').ParseName($appId).InvokeVerb('open')
+        } catch {
+          Start-Process "shell:AppsFolder\\$appId"
+        }
+        Write-Output $matched.Name
+        exit 0
+      }
+      $shortcutDirs = @(
+        "$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+        "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs",
+        "$env:USERPROFILE\\Desktop"
+      )
+      foreach ($dir in $shortcutDirs) {
+        if (Test-Path $dir) {
+          $lnk = Get-ChildItem -Path $dir -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -like "*$q*" } | Select-Object -First 1
+          if ($lnk) {
+            Start-Process -FilePath $lnk.FullName
+            Write-Output $lnk.BaseName
+            exit 0
+          }
+        }
+      }
+      if ($aliasMap.ContainsKey($lowerQ)) {
+        Start-Process $aliasMap[$lowerQ]
+        Write-Output $q
+        exit 0
+      }
+      Start-Process $q -ErrorAction Stop
+      Write-Output $q
+    `;
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { windowsHide: true, timeout: 7000 },
+      (err, stdout) => {
+        const out = String(stdout || '').trim();
+        if (!err && out) {
+          resolve({ success: true, appName: clean, matchedName: out });
+        } else {
+          resolve({ success: false, appName: clean, error: err?.message || 'Not found' });
+        }
+      }
+    );
+  });
+});
+
 app.whenReady().then(async () => {
   // Spoof Referer & Origin for YouTube embed requests so YouTube never blocks music videos on http://127.0.0.1 (Error 150/153)
   try {
@@ -698,16 +890,9 @@ app.whenReady().then(async () => {
     // ignore
   }
 
-  // Configure automatic launch at Windows startup when packaged
-  if (app.isPackaged && process.platform === 'win32') {
-    try {
-      app.setLoginItemSettings({
-        openAtLogin: true,
-        path: process.execPath,
-      });
-    } catch {
-      // ignore
-    }
+  // Ensure WinIsle is registered in Windows Startup on launch
+  if (process.platform === 'win32') {
+    registerWindowsStartup(true);
   }
 
   // Initialize System Tray immediately so user always sees WinIsle in Notification Area ("Show hidden icons")
@@ -716,8 +901,8 @@ app.whenReady().then(async () => {
   await ensureLocalBackendRunning();
   createOverlayWindow();
 
-  // Periodic idle memory trimming: flushes unreferenced buffers every 45s to ensure RAM remains strictly <100MB
-  setInterval(trimMemory, 45000);
+  // Periodic idle memory trimming: flushes unreferenced buffers every 8s to ensure RAM remains strictly <50MB
+  setInterval(trimMemory, 8000);
 
   // Register global Alt+Q shortcut so user can summon Isle Assistant even over fullscreen games/apps
   try {

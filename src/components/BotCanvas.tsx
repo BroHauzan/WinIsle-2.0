@@ -52,6 +52,7 @@ export const BotCanvas: React.FC<BotCanvasProps> = ({
   }, [gestureTrigger]);
 
   useEffect(() => {
+    if (form === 'reply') return;
     const handleMove = (e: MouseEvent) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -64,22 +65,18 @@ export const BotCanvas: React.FC<BotCanvasProps> = ({
     };
     window.addEventListener('mousemove', handleMove, { passive: true });
     return () => window.removeEventListener('mousemove', handleMove);
-  }, []);
+  }, [form]);
 
   useEffect(() => {
     let rafId = 0;
     const start = performance.now();
+    let lastDraw = 0;
 
-    const render = (now: number) => {
-      if (document.hidden) {
-        rafId = requestAnimationFrame(render);
-        return;
-      }
+    const drawFrame = (now: number) => {
       const canvas = canvasRef.current;
       const bot = botRef.current;
       if (canvas && bot) {
-        const dpr = window.devicePixelRatio || 1;
-        const targetW = Math.round(size * dpr);
+        const targetW = Math.max(1, Math.round(size));
         if (canvas.width !== targetW || canvas.height !== targetW) {
           canvas.width = targetW;
           canvas.height = targetW;
@@ -88,7 +85,6 @@ export const BotCanvas: React.FC<BotCanvasProps> = ({
         if (ctx) {
           ctx.save();
           ctx.clearRect(0, 0, targetW, targetW);
-          ctx.scale(dpr, dpr);
           const elapsed = (now - start) / 1000;
           const currentLevel = voiceLevelRef?.current ?? levelRef.current;
           bot.step(elapsed, pointerRef.current, currentLevel);
@@ -96,12 +92,29 @@ export const BotCanvas: React.FC<BotCanvasProps> = ({
           ctx.restore();
         }
       }
+    };
+
+    // Static reply avatar only needs a single paint (0% ongoing GPU/CPU usage)
+    if (form === 'reply' && !gestureTrigger) {
+      drawFrame(start);
+      return;
+    }
+
+    const render = (now: number) => {
+      if (document.hidden) {
+        rafId = requestAnimationFrame(render);
+        return;
+      }
+      if (now - lastDraw >= 48) {
+        lastDraw = now;
+        drawFrame(now);
+      }
       rafId = requestAnimationFrame(render);
     };
 
     rafId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(rafId);
-  }, [size]);
+  }, [size, form, shape, color, glowMode, gestureTrigger, voiceLevelRef]);
 
   return (
     <canvas

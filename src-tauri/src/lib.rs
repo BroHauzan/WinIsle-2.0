@@ -6,6 +6,7 @@ pub mod audio;
 pub mod cursor;
 pub mod hardware;
 pub mod media;
+pub mod memory;
 pub mod screenshot;
 pub mod tray;
 
@@ -214,9 +215,15 @@ pub mod window_decorations {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "windows")]
-    unsafe {
-        // Prevent Windows from ghosting the frameless overlay and showing "(Not Responding)" title bar
-        windows::Win32::UI::WindowsAndMessaging::DisableProcessWindowsGhosting();
+    {
+        // Enforce ultra-low WebView2 RAM & GPU footprint (<50MB total across WebView2 Manager, GPU, and Renderer)
+        const WEBVIEW2_LOW_MEM_ARGS: &str = "--autoplay-policy=no-user-gesture-required --enable-low-end-device-mode --force-gpu-mem-available-mb=16 --gpu-program-cache-size-kb=256 --disable-gpu-shader-disk-cache --disable-gpu-memory-buffer-video-frames --renderer-process-limit=1 --process-per-site --disable-site-isolation-trials --no-zygote --disable-breakpad --disable-crash-reporter --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-spell-checking --disk-cache-size=524288 --media-cache-size=524288 --enable-features=MemoryReducer --disable-features=SpareRendererForSitePerProcess,BackForwardCache,Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion,AutofillServerCommunication,InterestFeedContentSuggestions,Prerender2,SpeculativeServiceWorkerWarmUp,AudioServiceOutOfProcess --js-flags=\"--max-old-space-size=24 --max-semi-space-size=1 --optimize-for-size --expose-gc\"";
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", WEBVIEW2_LOW_MEM_ARGS);
+
+        unsafe {
+            // Prevent Windows from ghosting the frameless overlay and showing "(Not Responding)" title bar
+            windows::Win32::UI::WindowsAndMessaging::DisableProcessWindowsGhosting();
+        }
     }
 
     let cursor_state = Arc::new(cursor::CursorMonitorState::new());
@@ -236,6 +243,9 @@ pub fn run() {
             hardware::get_brightness,
             hardware::set_brightness,
             hardware::get_battery_status,
+            hardware::launch_windows_app,
+            hardware::set_startup_status,
+            memory::trim_webview_memory,
             screenshot::get_system_screenshot,
             screenshot::get_island_backdrop,
             media::get_system_media,
@@ -286,6 +296,9 @@ pub fn run() {
 
             // Start the native Windows GSMTC media listener
             media::spawn_media_monitor(app.handle().clone());
+
+            // Start the native Win32 WebView2 working-set memory trimmer (<50MB target)
+            memory::spawn_memory_trimmer();
 
             // Initialize system tray icon, context menu, and Alt+Q hotkey
             let _ = tray::setup_tray(app.handle());

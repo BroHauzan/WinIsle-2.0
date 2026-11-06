@@ -459,6 +459,255 @@ export async function fetchUrlText(url: string): Promise<string> {
   return await invoke<string>('fetch_url_text', { url });
 }
 
+export interface StartupStatusResponse {
+  enabled: boolean;
+  registeredPath?: string;
+  source?: string;
+  platform?: string;
+  message?: string;
+}
+
+/**
+ * Checks if WinIsle is registered in Windows Startup.
+ */
+export async function getWindowsStartupStatus(): Promise<StartupStatusResponse> {
+  if (typeof window !== 'undefined') {
+    const winAny = window as any;
+    if (typeof winAny.electronAPI?.getStartupStatus === 'function') {
+      try {
+        const res = await winAny.electronAPI.getStartupStatus();
+        if (res && typeof res.enabled === 'boolean') return res;
+      } catch (e) {
+        console.warn('[Bridge] electronAPI.getStartupStatus error:', e);
+      }
+    }
+  }
+
+  try {
+    const res = await fetch('/api/system/startup');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('[Bridge] fetch /api/system/startup error:', err);
+  }
+
+  return { enabled: true, platform: 'unknown' };
+}
+
+/**
+ * Toggles WinIsle registration in Windows Startup.
+ */
+export async function setWindowsStartupStatus(enabled: boolean): Promise<StartupStatusResponse> {
+  if (isTauri()) {
+    try {
+      await invoke('set_startup_status', { enabled: Boolean(enabled) });
+      return {
+        enabled: Boolean(enabled),
+        platform: 'win32',
+        message: 'Status startup Windows berhasil diperbarui',
+      };
+    } catch (e) {
+      console.warn('[Bridge] Tauri set_startup_status error:', e);
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    const winAny = window as any;
+    if (winAny.electronAPI?.isElectron && typeof winAny.electronAPI?.setStartupStatus === 'function') {
+      try {
+        const res = await winAny.electronAPI.setStartupStatus(enabled);
+        if (res) return res;
+      } catch (e) {
+        console.warn('[Bridge] electronAPI.setStartupStatus error:', e);
+      }
+    }
+  }
+
+  try {
+    const res = await fetch('/api/system/startup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('[Bridge] POST /api/system/startup error:', err);
+  }
+
+  return { enabled, message: 'Status startup berhasil disimpan' };
+}
+
+export interface LaunchWindowsAppResponse {
+  success: boolean;
+  appName: string;
+  matchedName?: string;
+  protocolUri?: string;
+  platform?: string;
+  error?: string;
+}
+
+const WINDOWS_BROWSER_PROTOCOL_MAP: Record<string, string> = {
+  spotify: 'spotify:',
+  discord: 'discord:',
+  vscode: 'vscode:',
+  'vs code': 'vscode:',
+  'visual studio code': 'vscode:',
+  whatsapp: 'whatsapp:',
+  wa: 'whatsapp:',
+  telegram: 'tg:',
+  steam: 'steam:',
+  calculator: 'ms-calculator:',
+  kalkulator: 'ms-calculator:',
+  calc: 'ms-calculator:',
+  settings: 'ms-settings:',
+  pengaturan: 'ms-settings:',
+  setting: 'ms-settings:',
+  paint: 'ms-paint:',
+  mspaint: 'ms-paint:',
+  photos: 'ms-photos:',
+  foto: 'ms-photos:',
+  clock: 'ms-clock:',
+  alarm: 'ms-clock:',
+  todo: 'ms-todo:',
+  weather: 'msnweather:',
+  cuaca: 'msnweather:',
+  store: 'ms-windows-store:',
+  'microsoft store': 'ms-windows-store:',
+  edge: 'microsoft-edge:',
+  'microsoft edge': 'microsoft-edge:',
+  figma: 'figma:',
+  notion: 'notion:',
+  slack: 'slack:',
+  zoom: 'zoommtg:',
+  postman: 'postman:',
+  bluetooth: 'ms-settings:bluetooth',
+  wifi: 'ms-settings:network-wifi',
+  'wi-fi': 'ms-settings:network-wifi',
+};
+
+function triggerBrowserProtocolUri(uri: string): void {
+  if (typeof document === 'undefined' || !uri) return;
+  try {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = uri;
+    document.body.appendChild(iframe);
+    window.setTimeout(() => {
+      try {
+        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+      } catch {
+        // ignore
+      }
+    }, 3000);
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Launches a Windows application across Tauri, Electron, Local Windows Server, or Browser URI Protocol.
+ */
+export async function launchWindowsApp(appName: string): Promise<LaunchWindowsAppResponse> {
+  const clean = String(appName || '')
+    .trim()
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .replace(/\b(aplikasi|app|program|software)\b/gi, '')
+    .trim();
+
+  if (!clean) {
+    return { success: false, appName: '', error: 'Nama aplikasi kosong' };
+  }
+
+  // 1. Native Tauri 2.0 Rust Command
+  if (isTauri()) {
+    try {
+      const matched = await invoke<string>('launch_windows_app', { appName: clean });
+      return {
+        success: true,
+        appName: clean,
+        matchedName: matched || clean,
+        platform: 'win32',
+      };
+    } catch (e: any) {
+      console.warn('[Bridge] Tauri launch_windows_app error:', e);
+    }
+  }
+
+  // 2. Native Electron IPC Main Process Handler
+  if (typeof window !== 'undefined') {
+    const winAny = window as any;
+    if (winAny.electronAPI?.isElectron && typeof winAny.electronAPI?.launchApp === 'function') {
+      try {
+        const res = await winAny.electronAPI.launchApp(clean);
+        if (res && res.success) return res;
+      } catch (e) {
+        console.warn('[Bridge] electronAPI.launchApp error:', e);
+      }
+    }
+  }
+
+  // 3. Backend Server Endpoint (/api/system/launch-app)
+  const lowerKey = clean.toLowerCase();
+  const knownProtocol = WINDOWS_BROWSER_PROTOCOL_MAP[lowerKey];
+
+  try {
+    const res = await fetch('/api/system/launch-app', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appName: clean }),
+    });
+    if (res.ok) {
+      const data: LaunchWindowsAppResponse = await res.json();
+      // If backend is running in cloud preview (non-win32), also trigger client-side Windows URI protocol if available
+      if (data.platform !== 'win32') {
+        const uriToOpen = data.protocolUri || knownProtocol;
+        if (uriToOpen) {
+          triggerBrowserProtocolUri(uriToOpen);
+        }
+      }
+      return data;
+    }
+  } catch (err) {
+    console.warn('[Bridge] POST /api/system/launch-app error:', err);
+  }
+
+  // 4. Fallback client-side URI protocol trigger
+  if (knownProtocol) {
+    triggerBrowserProtocolUri(knownProtocol);
+    return { success: true, appName: clean, matchedName: clean, protocolUri: knownProtocol };
+  }
+
+  return { success: false, appName: clean, error: 'Gagal membuka aplikasi' };
+}
+
+/**
+ * Triggers V8 garbage collection and native Win32 working-set trimming across
+ * WinIsle and all WebView2 processes (WebView2 Manager, GPU Process, Renderer).
+ */
+export async function trimWebViewMemory(): Promise<void> {
+  if (typeof window !== 'undefined') {
+    try {
+      const winAny = window as any;
+      if (typeof winAny.gc === 'function') {
+        winAny.gc();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (isTauri()) {
+    try {
+      await invoke('trim_webview_memory');
+    } catch {
+      // ignore
+    }
+  }
+}
+
 // ── Standard Bridge Export & window.electronAPI Fallback ──
 
 export const tauriBridge = {
@@ -476,6 +725,10 @@ export const tauriBridge = {
   sendSystemMediaCommand,
   askBynaraAiNative,
   fetchUrlText,
+  getWindowsStartupStatus,
+  setWindowsStartupStatus,
+  launchWindowsApp,
+  trimWebViewMemory,
   onVolumeChanged,
   onToggleAssistant,
   onSystemMediaChanged,
@@ -510,13 +763,18 @@ export function setupTauriBridgeGlobal(): void {
       void setInteractiveLock(locked);
     },
     getSystemScreenshot: () => getSystemScreenshot(),
-    trimMemory: () => {},
+    trimMemory: () => {
+      void trimWebViewMemory();
+    },
+    getStartupStatus: () => getWindowsStartupStatus(),
+    setStartupStatus: (enable: boolean) => setWindowsStartupStatus(enable),
+    launchApp: (appName: string) => launchWindowsApp(appName),
     getServerUrl: () => '',
   };
 
   if (!(window as any).electronAPI) {
     (window as any).electronAPI = bridgeObj;
-  } else {
+  } else if (!(window as any).electronAPI.isElectron) {
     Object.assign((window as any).electronAPI, bridgeObj);
   }
 }

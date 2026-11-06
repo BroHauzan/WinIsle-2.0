@@ -141,6 +141,76 @@
   }
 }
 
+/* Staged Shelf File Icons Wiggle & Float when Dragging New Files Over Island */
+@keyframes shelfFileDragOverFloat {
+  0%, 100% {
+    transform: translate3d(0, -3px, 0) scale(1.06) rotate(-2.5deg);
+  }
+  50% {
+    transform: translate3d(0, -6.5px, 0) scale(1.09) rotate(2.5deg);
+  }
+}
+
+/* Incoming Ghost Drop-Target Slot Breathing Animation */
+@keyframes shelfGhostSlotPulse {
+  0%, 100% {
+    transform: translate3d(0, -1px, 0) scale(0.98);
+    opacity: 0.85;
+  }
+  50% {
+    transform: translate3d(0, -4.5px, 0) scale(1.05);
+    opacity: 1;
+  }
+}
+
+/* Fanned File Stack Animation for Drag-Over Ready Feedback */
+@keyframes shelfDropFanLeft {
+  0%, 100% {
+    transform: translate3d(-15px, 2px, 0) rotate(-13deg) scale(0.92);
+  }
+  50% {
+    transform: translate3d(-19px, -2.5px, 0) rotate(-17deg) scale(0.96);
+  }
+}
+
+@keyframes shelfDropFanCenter {
+  0%, 100% {
+    transform: translate3d(0, -3px, 0) rotate(0deg) scale(1.04);
+  }
+  50% {
+    transform: translate3d(0, -7.5px, 0) rotate(0deg) scale(1.1);
+  }
+}
+
+@keyframes shelfDropFanRight {
+  0%, 100% {
+    transform: translate3d(15px, 2px, 0) rotate(13deg) scale(0.92);
+  }
+  50% {
+    transform: translate3d(19px, -2.5px, 0) rotate(17deg) scale(0.96);
+  }
+}
+
+@keyframes shelfDropBadgeFloat {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(0, -2.5px, 0) scale(1.12);
+  }
+}
+
+@keyframes shelfDropRingExpand {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.65;
+  }
+  100% {
+    transform: scale(1.38);
+    opacity: 0;
+  }
+}
+
 @keyframes geminiDotBounce {
   0%, 80%, 100% {
     transform: translateY(0) scale(0.85);
@@ -209,27 +279,22 @@
 
 .isle-stagger-1 {
   animation: isleMenuItemIn 320ms cubic-bezier(0.22, 1, 0.36, 1) 10ms both;
-  will-change: transform, opacity;
 }
 
 .isle-stagger-2 {
   animation: isleMenuItemIn 350ms cubic-bezier(0.22, 1, 0.36, 1) 45ms both;
-  will-change: transform, opacity;
 }
 
 .isle-stagger-3 {
   animation: isleMenuItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1) 80ms both;
-  will-change: transform, opacity;
 }
 
 .isle-stagger-4 {
   animation: isleMenuItemIn 410ms cubic-bezier(0.22, 1, 0.36, 1) 115ms both;
-  will-change: transform, opacity;
 }
 
 .isle-outgoing-page,
 .isle-carousel-page {
-  will-change: transform, opacity;
   backface-visibility: hidden;
 }
 
@@ -237,4 +302,117 @@
 .isle-outgoing-page * {
   animation: none !important;
 }
+
+/* Fluid Spring Item Entrance (Tasks, Notifications, Alarms, Events) */
+@keyframes isleItemSpringIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.95);
+  }
+  66% {
+    opacity: 1;
+    transform: translate3d(0, -1px, 0) scale(1.008);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+/* Directional Sub-Tab Switch Morph (Events <-> Alarms, Clipboard <-> Files) */
+@keyframes isleSubTabInRight {
+  0% {
+    opacity: 0;
+    transform: translate3d(16px, 0, 0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes isleSubTabInLeft {
+  0% {
+    opacity: 0;
+    transform: translate3d(-16px, 0, 0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+/* Zero-Allocation CSS Grid Height-Collapse + Spring Morph Wrapper */
+.isle-collapse-row {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  transition:
+    grid-template-rows 230ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 230ms cubic-bezier(0.22, 1, 0.36, 1),
+    margin 230ms cubic-bezier(0.22, 1, 0.36, 1),
+    padding 230ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.isle-collapse-row.is-exiting {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translate3d(14px, 0, 0) scale(0.93);
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  pointer-events: none;
+}
+
+.isle-collapse-row > .isle-collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Smooth Collapsible Composer Drawer (Add Task Bar) */
+.isle-composer-drawer {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translate3d(0, 6px, 0) scale(0.97);
+  pointer-events: none;
+  transition:
+    grid-template-rows 250ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 210ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 250ms cubic-bezier(0.22, 1, 0.36, 1),
+    margin-top 250ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.isle-composer-drawer.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  pointer-events: auto;
+  margin-top: 6px;
+}
+
+.isle-composer-drawer > .isle-composer-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Clean Minimalist Time Input inside Unified Capsule */
+.isle-capsule-time::-webkit-calendar-picker-indicator {
+  opacity: 0.45;
+  cursor: pointer;
+  filter: invert(1);
+  width: 11px;
+  height: 11px;
+  margin-left: 1px;
+  transition: opacity 150ms ease;
+}
+
+.isle-capsule-time:hover::-webkit-calendar-picker-indicator,
+.isle-capsule-time:focus::-webkit-calendar-picker-indicator {
+  opacity: 0.9;
+}
+
 

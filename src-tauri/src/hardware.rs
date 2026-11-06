@@ -284,6 +284,182 @@ pub fn set_brightness(level: u32) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+pub async fn launch_windows_app(app_name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let clean = app_name
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”')
+            .replace("'", "''");
+        if clean.is_empty() {
+            return Err("Empty app name".to_string());
+        }
+
+        let ps_script = format!(
+            r#"
+            $ErrorActionPreference = 'SilentlyContinue'
+            $q = '{clean}'.Trim()
+
+            $aliasMap = @{{
+                'chrome' = 'chrome.exe'; 'google chrome' = 'chrome.exe';
+                'edge' = 'msedge.exe'; 'microsoft edge' = 'msedge.exe';
+                'brave' = 'brave.exe'; 'firefox' = 'firefox.exe';
+                'notepad' = 'notepad.exe';
+                'calculator' = 'calc.exe'; 'kalkulator' = 'calc.exe'; 'calc' = 'calc.exe';
+                'explorer' = 'explorer.exe'; 'file explorer' = 'explorer.exe';
+                'settings' = 'ms-settings:'; 'pengaturan' = 'ms-settings:'; 'setting' = 'ms-settings:';
+                'task manager' = 'taskmgr.exe'; 'taskmgr' = 'taskmgr.exe';
+                'control panel' = 'control.exe';
+                'paint' = 'mspaint.exe'; 'mspaint' = 'mspaint.exe';
+                'cmd' = 'cmd.exe'; 'command prompt' = 'cmd.exe';
+                'powershell' = 'powershell.exe'; 'terminal' = 'wt.exe'; 'windows terminal' = 'wt.exe';
+                'snipping tool' = 'SnippingTool.exe';
+                'word' = 'winword.exe'; 'microsoft word' = 'winword.exe';
+                'excel' = 'excel.exe'; 'microsoft excel' = 'excel.exe';
+                'powerpoint' = 'powerpnt.exe'; 'ppt' = 'powerpnt.exe';
+                'vscode' = 'code'; 'vs code' = 'code'; 'visual studio code' = 'code';
+                'spotify' = 'spotify:'; 'discord' = 'discord:'; 'whatsapp' = 'whatsapp:'; 'wa' = 'whatsapp:';
+                'telegram' = 'tg:'; 'steam' = 'steam:'
+            }}
+
+            $lowerQ = $q.ToLower()
+
+            # 1. Search Get-StartApps first for exact/prefix/contains match
+            $startApps = Get-StartApps
+            $matched = $startApps | Where-Object {{ $_.Name -ieq $q }} | Select-Object -First 1
+            if (-not $matched) {{
+                $matched = $startApps | Where-Object {{ $_.Name -like "$q*" }} | Select-Object -First 1
+            }}
+            if (-not $matched) {{
+                $matched = $startApps | Where-Object {{ $_.Name -like "*$q*" }} | Select-Object -First 1
+            }}
+            if (-not $matched) {{
+                $matched = $startApps | Where-Object {{ $_.AppID -like "*$q*" }} | Select-Object -First 1
+            }}
+
+            if ($matched) {{
+                $appId = $matched.AppID
+                try {{
+                    $shell = New-Object -ComObject Shell.Application
+                    $shell.NameSpace('shell:AppsFolder').ParseName($appId).InvokeVerb('open')
+                    Write-Output $matched.Name
+                    exit 0
+                }} catch {{
+                    Start-Process "shell:AppsFolder\$appId"
+                    Write-Output $matched.Name
+                    exit 0
+                }}
+            }}
+
+            # 2. Search Start Menu & Desktop .lnk shortcuts
+            $shortcutDirs = @(
+                "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+                "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+                "$env:USERPROFILE\Desktop"
+            )
+            foreach ($dir in $shortcutDirs) {{
+                if (Test-Path $dir) {{
+                    $lnk = Get-ChildItem -Path $dir -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object {{ $_.BaseName -like "*$q*" }} | Select-Object -First 1
+                    if ($lnk) {{
+                        Start-Process -FilePath $lnk.FullName
+                        Write-Output $lnk.BaseName
+                        exit 0
+                    }}
+                }}
+            }}
+
+            # 3. Known alias / protocol / executable fallback
+            if ($aliasMap.ContainsKey($lowerQ)) {{
+                $target = $aliasMap[$lowerQ]
+                Start-Process $target
+                Write-Output $q
+                exit 0
+            }}
+
+            # 4. Direct Start-Process
+            Start-Process $q -ErrorAction Stop
+            Write-Output $q
+            "#
+        );
+
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_script]);
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output().map_err(|e| e.to_string())?;
+        let out_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !out_str.is_empty() {
+            Ok(out_str)
+        } else {
+            Ok(clean)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_startup_status(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let exe_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .replace("'", "''");
+            let script = if enabled {
+                format!(
+                    r#"
+                    $ErrorActionPreference = 'SilentlyContinue'
+                    $exe = '{exe_path}'
+                    $dir = [System.IO.Path]::GetDirectoryName($exe)
+                    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+                    Set-ItemProperty -Path $runKey -Name 'WinIsle' -Value ('"' + $exe + '"')
+                    Set-ItemProperty -Path $runKey -Name 'IsleDynamicIsland' -Value ('"' + $exe + '"')
+                    $startup = [System.Environment]::GetFolderPath('Startup')
+                    if (Test-Path $startup) {{
+                        $wsh = New-Object -ComObject WScript.Shell
+                        $sc = $wsh.CreateShortcut((Join-Path $startup 'WinIsle.lnk'))
+                        $sc.TargetPath = $exe
+                        if ($dir) {{ $sc.WorkingDirectory = $dir }}
+                        $sc.Save()
+                    }}
+                    "#
+                )
+            } else {
+                r#"
+                $ErrorActionPreference = 'SilentlyContinue'
+                $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+                Remove-ItemProperty -Path $runKey -Name 'WinIsle' -ErrorAction SilentlyContinue
+                Remove-ItemProperty -Path $runKey -Name 'IsleDynamicIsland' -ErrorAction SilentlyContinue
+                $startup = [System.Environment]::GetFolderPath('Startup')
+                if (Test-Path $startup) {
+                    Remove-Item (Join-Path $startup 'WinIsle.lnk') -Force -ErrorAction SilentlyContinue
+                }
+                "#
+                .to_string()
+            };
+
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW);
+            let _ = cmd.output();
+        }
+        Ok(enabled)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

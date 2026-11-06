@@ -92,4 +92,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
   trimMemory: () => {
     ipcRenderer.send('trim-memory');
   },
+  /**
+   * Get Windows Startup auto-launch status.
+   */
+  getStartupStatus: () => {
+    return ipcRenderer.invoke('get-startup-status');
+  },
+  /**
+   * Toggle Windows Startup auto-launch registration.
+   */
+  setStartupStatus: (enable) => {
+    return ipcRenderer.invoke('set-startup-status', Boolean(enable));
+  },
+  /**
+   * Launch a native Windows application via Electron Main Process.
+   */
+  launchApp: (appName) => {
+    return ipcRenderer.invoke('launch-app', String(appName || ''));
+  },
 });

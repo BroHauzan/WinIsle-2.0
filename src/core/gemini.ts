@@ -1,5 +1,5 @@
 /**
- * Bynara Router OpenAI-Compatible AI Client (`muse-spark-1.3-contributor`) for WinIsle Dynamic Island.
+ * Bynara Router OpenAI-Compatible AI Client (`laguna-s-2.1`) for WinIsle Dynamic Island.
  * Supports Chat History, Desktop Context, Multimodal Vision, and Action Intent Detection.
  */
 
@@ -19,13 +19,19 @@ export const DEFAULT_AGNES_KEY =
   (import.meta.env.VITE_AGNES_API_KEY as string)?.trim() ||
   'sk-MqH1SO7S1v9a34UPe4iWtE3r088xPK2h8KLCp738tsbmGucj';
 
+export const DEFAULT_GEMINI_THINKING_BASE_URL =
+  (import.meta.env.VITE_GEMINI_THINKING_BASE_URL as string)?.trim() ||
+  'https://generativelanguage.googleapis.com/v1beta/openai';
+
+export const DEFAULT_GEMINI_THINKING_KEY =
+  (import.meta.env.VITE_GEMINI_THINKING_API_KEY as string)?.trim() || '';
+
 export const DEFAULT_GEMINI_MODEL =
-  (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'agnes-3.0-flash';
+  (import.meta.env.VITE_GEMINI_MODEL as string)?.trim() || 'gemini-3.8-flash';
 
 export const SUPPORTED_GEMINI_MODELS = [
-  'agnes-3.0-flash',
-  'agnes-2.5-flash',
-  'muse-spark-1.3-contributor',
+  'gemini-3.8-flash',
+  'gemini-3.8-flash-thinking',
 ];
 
 export interface GeminiAssistantParams {
@@ -67,8 +73,11 @@ Follow this natural Indonesian conversational companion style ("conversational-c
   - Jangan membuka dengan template robot "Halo! Ada yang bisa aku bantu?" dan jangan menutup dengan "Ada lagi yang bisa kubantu?".
 
 3. KENDALI LAPTOP & DYNAMIC ISLAND ACTION TAG:
-Whenever the user asks to perform an action on their PC or Dynamic Island, respond naturally in the style above AND append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
+Whenever the user explicitly commands to perform an action on their PC or Dynamic Island, respond naturally in the style above AND append a single tag at the very end of your reply in the exact format: [ACTION:action_name|optional_param]
+IMPORTANT: If the user is asking a general knowledge question or chatting (e.g., "lu tau Open Design yang open-source itu ga?", "apa itu...", "pernah denger..."), DO NOT trigger any action tag (use [ACTION:none] or omit the tag).
 Valid action_name values:
+- launch_app|app_name (open/launch any Windows app when explicitly requested, e.g. [ACTION:launch_app|Spotify], [ACTION:launch_app|Discord], [ACTION:launch_app|Chrome], [ACTION:launch_app|VS Code])
+- enable_startup, disable_startup (register/unregister WinIsle in Windows Startup)
 - add_todo|task_title|HH:mm (e.g. [ACTION:add_todo|Olahraga Pagi|05:00] or [ACTION:add_todo|Tugas Besok|09:00])
 - set_timer|minutes (e.g. [ACTION:set_timer|15])
 - set_alarm_and_reminder|prompt_text
@@ -168,55 +177,40 @@ export async function askGeminiAssistant(
   });
 
   const requestedModel = params.model?.trim() || DEFAULT_GEMINI_MODEL;
-  const isThinkingModel = requestedModel === 'muse-spark-1.3-contributor';
+  const isThinkingModel = requestedModel.includes('thinking');
 
-  // Build ordered routing targets: Fast -> Agnes AI first, Thinking -> Bynara Muse Spark first (with cross-provider fallback)
+  // Build ordered routing targets with dedicated Gemini Thinking API Key in Thinking mode
   const routeTargets: Array<{
     model: string;
     baseUrl: string;
     apiKey: string;
     maxTokens: number;
-  }> = isThinkingModel
-    ? [
-        {
-          model: 'muse-spark-1.3-contributor',
-          baseUrl: DEFAULT_BYNARA_BASE_URL,
-          apiKey: resolveEffectiveBynaraKey(params.apiKey),
-          maxTokens: 3500, // High ceiling so internal thinking tokens never truncate visible content
-        },
-        {
-          model: 'agnes-3.0-flash',
-          baseUrl: DEFAULT_AGNES_BASE_URL,
-          apiKey: DEFAULT_AGNES_KEY,
-          maxTokens: 260,
-        },
-        {
-          model: 'agnes-2.5-flash',
-          baseUrl: DEFAULT_AGNES_BASE_URL,
-          apiKey: DEFAULT_AGNES_KEY,
-          maxTokens: 260,
-        },
-      ]
-    : [
-        {
-          model: requestedModel === 'agnes-2.5-flash' ? 'agnes-2.5-flash' : 'agnes-3.0-flash',
-          baseUrl: DEFAULT_AGNES_BASE_URL,
-          apiKey: DEFAULT_AGNES_KEY,
-          maxTokens: 260,
-        },
-        {
-          model: requestedModel === 'agnes-2.5-flash' ? 'agnes-3.0-flash' : 'agnes-2.5-flash',
-          baseUrl: DEFAULT_AGNES_BASE_URL,
-          apiKey: DEFAULT_AGNES_KEY,
-          maxTokens: 260,
-        },
-        {
-          model: 'muse-spark-1.3-contributor',
-          baseUrl: DEFAULT_BYNARA_BASE_URL,
-          apiKey: resolveEffectiveBynaraKey(params.apiKey),
-          maxTokens: 3500,
-        },
-      ];
+    reasoningEffort?: 'low' | 'medium' | 'high';
+  }> = [
+    ...(isThinkingModel
+      ? [
+          {
+            model: 'gemini-3-flash-preview',
+            baseUrl: DEFAULT_GEMINI_THINKING_BASE_URL,
+            apiKey: params.apiKey?.trim() || DEFAULT_GEMINI_THINKING_KEY,
+            maxTokens: 1024,
+            reasoningEffort: 'low' as const,
+          },
+        ]
+      : []),
+    {
+      model: 'agnes-3.0-flash',
+      baseUrl: DEFAULT_AGNES_BASE_URL,
+      apiKey: DEFAULT_AGNES_KEY,
+      maxTokens: isThinkingModel ? 2048 : 380,
+    },
+    {
+      model: 'agnes-2.5-flash',
+      baseUrl: DEFAULT_AGNES_BASE_URL,
+      apiKey: DEFAULT_AGNES_KEY,
+      maxTokens: isThinkingModel ? 2048 : 380,
+    },
+  ];
 
   let lastError = '';
 
@@ -233,6 +227,7 @@ export async function askGeminiAssistant(
       messages,
       temperature: 0.7,
       max_tokens: target.maxTokens,
+      ...(target.reasoningEffort ? { reasoning_effort: target.reasoningEffort } : {}),
     });
 
     try {

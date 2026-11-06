@@ -48,6 +48,12 @@ import { BotColorName, BotForm, BotShapeName, paletteFor } from './core/bot';
 import { parseLrc, SAMPLE_TRACKS } from './core/lrc';
 import { getWsBaseUrl } from './utils/apiBase';
 import {
+  getWindowsStartupStatus,
+  setWindowsStartupStatus,
+  launchWindowsApp,
+  trimWebViewMemory,
+} from './core/tauri-bridge';
+import {
   initNotificationPruning,
   pruneStaleNotifications,
 } from './utils/notificationCleaner';
@@ -76,6 +82,8 @@ interface ToDoItem {
   title: string;
   time?: string;
   done: boolean;
+  linkedEventId?: number;
+  dateKey?: string;
 }
 
 export type ShelfFileExt = 'pdf' | 'docx' | 'msi' | 'img' | 'other';
@@ -159,6 +167,8 @@ interface CalendarEventItem {
   title: string;
   time: string;
   color: string;
+  linkedTaskId?: number;
+  isTaskSync?: boolean;
 }
 
 type SystemAlertType =
@@ -454,6 +464,8 @@ declare global {
       onToggleMiniCapsule?: (callback: () => void) => () => void;
       onCursorEnteredIsland?: (callback: () => void) => () => void;
       onCursorLeftIsland?: (callback: () => void) => () => void;
+      getStartupStatus?: () => Promise<{ enabled: boolean; path?: string }>;
+      setStartupStatus?: (enable: boolean) => Promise<{ success: boolean; enabled: boolean }>;
     };
   }
 }
@@ -617,6 +629,8 @@ export default function App() {
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [assistantMode, setAssistantMode] = useState<'voice-pill' | 'conversation'>(defaultAltQMode);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [startupEnabled, setStartupEnabled] = useState<boolean>(true);
+  const [startupPending, setStartupPending] = useState<boolean>(false);
   const [nudgeCount, setNudgeCount] = useState(0);
   const hoverLeaveTimerRef = useRef<number | null>(null);
 
@@ -673,16 +687,18 @@ export default function App() {
   const [hasServerKey, setHasServerKey] = useState(true);
   const [serverMaskedKey, setServerMaskedKey] = useState<string>('sk-nry••••ByRY');
 
-  // AI Model Selection: 'agnes-3.0-flash' (Fast / Kilat via Agnes AI) vs 'muse-spark-1.3-contributor' (Thinking / Mendalam via Bynara)
+  // AI Model Selection: 'gemini-3.8-flash' (Fast) vs 'gemini-3.8-flash-thinking' (Thinking)
   const [assistantModel, setAssistantModel] = useState<string>(() => {
     try {
       const saved = window.localStorage.getItem('isle_ai_model');
-      if (saved === 'agnes-3.0-flash' || saved === 'agnes-2.5-flash' || saved === 'muse-spark-1.3-contributor') return saved;
-      if (saved === 'gemini-3.1-flash-lite' || saved === 'stepfun-3.7-flash') return 'agnes-3.0-flash';
+      if (saved === 'gemini-3.8-flash' || saved === 'gemini-3.8-flash-thinking') return saved;
+      if (saved?.includes('thinking') || saved === 'laguna-s-2.1' || saved === 'muse-spark-1.3-contributor') {
+        return 'gemini-3.8-flash-thinking';
+      }
     } catch {
       // ignore
     }
-    return 'agnes-3.0-flash';
+    return 'gemini-3.8-flash';
   });
 
   useEffect(() => {
@@ -982,6 +998,46 @@ export default function App() {
     [triggerAlert]
   );
 
+  // Check and sync Windows Startup (Auto-launch) registration
+  useEffect(() => {
+    let isMounted = true;
+    getWindowsStartupStatus()
+      .then((status) => {
+        if (isMounted && typeof status?.enabled === 'boolean') {
+          setStartupEnabled(status.enabled);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleToggleStartup = useCallback(
+    async (targetVal?: boolean) => {
+      const nextVal = targetVal !== undefined ? targetVal : !startupEnabled;
+      setStartupPending(true);
+      try {
+        const res = await setWindowsStartupStatus(nextVal);
+        const resolvedEnabled = typeof res?.enabled === 'boolean' ? res.enabled : nextVal;
+        setStartupEnabled(resolvedEnabled);
+        triggerActionConfirmation(
+          'Startup Windows',
+          resolvedEnabled
+            ? 'WinIsle otomatis aktif saat Windows menyala'
+            : 'WinIsle dinonaktifkan dari Startup Windows',
+          resolvedEnabled ? 'AUTO' : 'OFF',
+          'system'
+        );
+      } catch {
+        setStartupEnabled(nextVal);
+      } finally {
+        setStartupPending(false);
+      }
+    },
+    [startupEnabled, triggerActionConfirmation]
+  );
+
   // Real Windows / System Hardware Status Detection (Volume, Brightness, Battery Level & Charging)
   useEffect(() => {
     // 1. Poll system hardware status from backend OS probe (syncs Windows Master Volume when running on Windows)
@@ -1126,11 +1182,40 @@ export default function App() {
   });
   const [copiedShelfId, setCopiedShelfId] = useState<number | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [incomingDragExts, setIncomingDragExts] = useState<ShelfFileExt[]>([]);
+  const [incomingDragCount, setIncomingDragCount] = useState<number>(1);
   const [shelfToast, setShelfToast] = useState<string | null>(null);
   const shelfFileInputRef = useRef<HTMLInputElement | null>(null);
   const lastDropTimeRef = useRef<number>(0);
   const dragLeaveTimerRef = useRef<number | null>(null);
   const isInternalShelfDragRef = useRef<boolean>(false);
+
+  const inspectDragEventFiles = useCallback((dt?: DataTransfer | null) => {
+    if (!dt) return;
+    const exts: ShelfFileExt[] = [];
+    const items = Array.from(dt.items || []);
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const mime = (item.type || '').toLowerCase();
+        if (mime.includes('pdf')) exts.push('pdf');
+        else if (mime.includes('word') || mime.includes('document')) exts.push('docx');
+        else if (mime.startsWith('image/')) exts.push('img');
+        else if (mime.includes('zip') || mime.includes('compressed') || mime.includes('executable')) exts.push('msi');
+        else exts.push('other');
+      }
+    }
+    if (exts.length === 0 && dt.files && dt.files.length > 0) {
+      for (const f of Array.from(dt.files)) {
+        exts.push(detectFileExt(f.name, f.type));
+      }
+    }
+    if (exts.length > 0) {
+      setIncomingDragCount(Math.min(8, exts.length));
+      setIncomingDragExts(exts.slice(0, 3));
+    } else {
+      setIncomingDragCount((prev) => (prev > 0 ? prev : 1));
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -1146,7 +1231,8 @@ export default function App() {
       assistantOpen) &&
     !activeAlert;
 
-  // Trigger lightweight native memory trimming and reset carousel slide tick whenever the island collapses back to compact notch
+  // Trigger lightweight native WebView2 & V8 memory trimming on both open and collapse
+  // so WebView2 Manager + GPU Process stays strictly under 50MB even while Dynamic Island is open
   useEffect(() => {
     if (!isExpanded) {
       if (pageTransTimerRef.current) {
@@ -1155,12 +1241,20 @@ export default function App() {
       }
       setPrevPageIndex(null);
       setSlideTick(0);
-      const timer = window.setTimeout(() => {
-        (window as any).electronAPI?.trimMemory?.();
-      }, 400);
-      return () => window.clearTimeout(timer);
     }
-  }, [isExpanded]);
+    const t1 = window.setTimeout(() => {
+      void trimWebViewMemory();
+      (window as any).electronAPI?.trimMemory?.();
+    }, 340);
+    const t2 = window.setTimeout(() => {
+      void trimWebViewMemory();
+      (window as any).electronAPI?.trimMemory?.();
+    }, 1400);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [isExpanded, pageIndex, lyricsMode, assistantOpen]);
 
   // Helper to safely add files to Shelf (max 8 files, real image thumbnails, zero fake placeholders)
   const addFilesToShelf = useCallback(
@@ -1444,12 +1538,15 @@ export default function App() {
       isInternalShelfDragRef.current = false;
       setIsDragOver(false);
       setDragAutoOpened(false);
+      setIncomingDragExts([]);
+      setIncomingDragCount(1);
     };
 
     const handleWindowDragEnter = (e: DragEvent) => {
       if (!hasDragPayload(e)) return;
       e.preventDefault();
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      inspectDragEventFiles(e.dataTransfer);
       expandIslandForFileDrag();
     };
 
@@ -1457,6 +1554,7 @@ export default function App() {
       if (!hasDragPayload(e)) return;
       e.preventDefault();
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      inspectDragEventFiles(e.dataTransfer);
       expandIslandForFileDrag();
     };
 
@@ -1472,6 +1570,8 @@ export default function App() {
         dragLeaveTimerRef.current = window.setTimeout(() => {
           setIsDragOver(false);
           setDragAutoOpened(false);
+          setIncomingDragExts([]);
+          setIncomingDragCount(1);
           dragLeaveTimerRef.current = null;
         }, 180);
       }
@@ -1555,7 +1655,16 @@ export default function App() {
     const winAny = window as any;
     const tauriListen = winAny.__TAURI__?.event?.listen;
     if (typeof tauriListen === 'function') {
-      tauriListen('tauri://drag-enter', () => {
+      tauriListen('tauri://drag-enter', (ev: any) => {
+        const paths: string[] = Array.isArray(ev?.payload?.paths)
+          ? ev.payload.paths
+          : Array.isArray(ev?.payload)
+          ? ev.payload
+          : [];
+        if (paths.length > 0) {
+          setIncomingDragCount(Math.min(8, paths.length));
+          setIncomingDragExts(paths.slice(0, 3).map((p) => detectFileExt(String(p))));
+        }
         expandIslandForFileDrag();
       })
         .then((un: () => void) => unlisteners.push(un))
@@ -1572,6 +1681,8 @@ export default function App() {
         dragLeaveTimerRef.current = window.setTimeout(() => {
           setIsDragOver(false);
           setDragAutoOpened(false);
+          setIncomingDragExts([]);
+          setIncomingDragCount(1);
           dragLeaveTimerRef.current = null;
         }, 180);
       })
@@ -1634,6 +1745,7 @@ export default function App() {
     addFilesToShelf,
     dragAutoOpened,
     expandIslandForFileDrag,
+    inspectDragEventFiles,
     isDragOver,
     isExpanded,
     navigateToPage,
@@ -2236,8 +2348,45 @@ export default function App() {
             .play()
             .then(() => setIsPlaying(true))
             .catch(() => {
-              // If primary direct stream fails, try previewUrl or fall back to YouTube iframe
-              if (rawPreviewUrl && nextTrack.audioUrl !== rawPreviewUrl && audioElRef.current) {
+              // If primary direct stream fails, try proxy stream or previewUrl
+              if (
+                nextTrack.audioUrl &&
+                !nextTrack.audioUrl.includes('/api/music/proxy-stream') &&
+                audioElRef.current
+              ) {
+                const proxyUrl = `/api/music/proxy-stream?url=${encodeURIComponent(nextTrack.audioUrl)}`;
+                audioElRef.current.src = proxyUrl;
+                audioElRef.current.load();
+                audioElRef.current
+                  .play()
+                  .then(() => {
+                    const proxiedTrack: RealMediaTrack = { ...nextTrack, audioUrl: proxyUrl };
+                    activeTrackRef.current = proxiedTrack;
+                    setActiveTrack(proxiedTrack);
+                    setIsPlaying(true);
+                  })
+                  .catch(() => {
+                    if (rawPreviewUrl && audioElRef.current) {
+                      audioElRef.current.src = rawPreviewUrl;
+                      audioElRef.current.load();
+                      audioElRef.current
+                        .play()
+                        .then(() => {
+                          const fallbackTrack: RealMediaTrack = {
+                            ...nextTrack,
+                            audioUrl: rawPreviewUrl,
+                          };
+                          activeTrackRef.current = fallbackTrack;
+                          setActiveTrack(fallbackTrack);
+                          setIsPlaying(true);
+                        })
+                        .catch(() => {
+                          setActiveTrack((prev) => (prev ? { ...prev, audioUrl: '' } : prev));
+                          setIsPlaying(true);
+                        });
+                    }
+                  });
+              } else if (rawPreviewUrl && nextTrack.audioUrl !== rawPreviewUrl && audioElRef.current) {
                 audioElRef.current.src = rawPreviewUrl;
                 audioElRef.current.load();
                 audioElRef.current
@@ -3348,6 +3497,137 @@ export default function App() {
     [calMonth, calYear, currentDateKey, pushRealNotification, selectedDay, timeStr]
   );
 
+  // ── Automated Bidirectional Sync: Tasks <-> Calendar Events ──
+  const [editingCalEventId, setEditingCalEventId] = useState<number | null>(null);
+
+  const syncTaskToCalendar = useCallback(
+    (taskId: number, taskTitle: string, taskTime?: string, isDone = false, targetDateKey?: string) => {
+      const dKey = targetDateKey || `${nowDate.getFullYear()}-${nowDate.getMonth()}-${nowDate.getDate()}`;
+      setEventsByDate((prev) => {
+        const next = { ...prev };
+        let foundExisting = false;
+
+        for (const [key, evList] of Object.entries(next)) {
+          const matchIdx = evList.findIndex(
+            (ev) => ev.linkedTaskId === taskId || (ev.title === taskTitle && ev.isTaskSync)
+          );
+          if (matchIdx !== -1) {
+            foundExisting = true;
+            if (!taskTime) {
+              const updatedList = evList.filter((_, idx) => idx !== matchIdx);
+              if (updatedList.length === 0) delete next[key];
+              else next[key] = updatedList;
+            } else {
+              const updatedList = [...evList];
+              updatedList[matchIdx] = {
+                ...updatedList[matchIdx],
+                title: taskTitle,
+                time: taskTime,
+                color: isDone ? '#8e8e93' : '#30d158',
+                linkedTaskId: taskId,
+                isTaskSync: true,
+              };
+              next[key] = updatedList;
+            }
+            break;
+          }
+        }
+
+        if (!foundExisting && taskTime) {
+          const existing = next[dKey] || [];
+          next[dKey] = [
+            ...existing,
+            {
+              id: Date.now() + Math.floor(Math.random() * 1000),
+              title: taskTitle,
+              time: taskTime,
+              color: isDone ? '#8e8e93' : '#30d158',
+              linkedTaskId: taskId,
+              isTaskSync: true,
+            },
+          ];
+        }
+
+        return next;
+      });
+    },
+    [nowDate]
+  );
+
+  const removeTaskFromCalendar = useCallback((taskId: number) => {
+    setEventsByDate((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const [key, evList] of Object.entries(next)) {
+        const filtered = evList.filter((ev) => ev.linkedTaskId !== taskId);
+        if (filtered.length !== evList.length) {
+          changed = true;
+          if (filtered.length === 0) delete next[key];
+          else next[key] = filtered;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
+  // Updating a calendar event's time also automatically updates the corresponding task!
+  const handleUpdateCalendarEventTime = useCallback(
+    (dKey: string, eventId: number, nextTime: string) => {
+      const cleanTime = nextTime.trim();
+      if (!cleanTime) return;
+
+      let linkedId: number | undefined;
+      let eventTitle = '';
+
+      setEventsByDate((prev) => {
+        const list = prev[dKey] || [];
+        const target = list.find((e) => e.id === eventId);
+        if (!target) return prev;
+        linkedId = target.linkedTaskId;
+        eventTitle = target.title;
+        return {
+          ...prev,
+          [dKey]: list.map((e) => (e.id === eventId ? { ...e, time: cleanTime } : e)),
+        };
+      });
+
+      // Synchronize back to the corresponding task in Tasks list
+      setTasks((prev) => {
+        let matched = false;
+        const updated = prev.map((t) => {
+          if (
+            (linkedId && t.id === linkedId) ||
+            t.linkedEventId === eventId ||
+            t.title.trim().toLowerCase() === eventTitle.trim().toLowerCase()
+          ) {
+            matched = true;
+            return { ...t, time: cleanTime, linkedEventId: eventId };
+          }
+          return t;
+        });
+        if (matched) {
+          pushRealNotification(
+            'Task & Kalender Disinkronkan',
+            `Waktu "${eventTitle}" diperbarui ke ${cleanTime}`,
+            'calendar'
+          );
+        }
+        return updated;
+      });
+    },
+    [pushRealNotification]
+  );
+
+  // Auto-sync initial tasks with assigned time to calendar events on mount
+  useEffect(() => {
+    const todayKey = `${nowDate.getFullYear()}-${nowDate.getMonth()}-${nowDate.getDate()}`;
+    tasks.forEach((t) => {
+      if (t.time) {
+        syncTaskToCalendar(t.id, t.title, t.time, t.done, t.dateKey || todayKey);
+      }
+    });
+  }, []);
+
   // ── Smart Alarms (Persisted in localStorage & triggered via Island notch) ──
   const [smartAlarms, setSmartAlarms] = useState<SmartAlarm[]>(() => {
     try {
@@ -3368,9 +3648,128 @@ export default function App() {
   });
 
   const [calendarSubTab, setCalendarSubTab] = useState<'events' | 'alarms'>('events');
+  const [calendarTabDir, setCalendarTabDir] = useState<'left' | 'right'>('right');
+  const [shelfTabDir, setShelfTabDir] = useState<'left' | 'right'>('right');
   const [newAlarmTime, setNewAlarmTime] = useState('09:30');
   const [newAlarmTitle, setNewAlarmTitle] = useState('');
+  const [newEventTime, setNewEventTime] = useState('09:00');
   const lastTriggeredMinuteRef = useRef<string>('');
+
+  // ── Fluid UI Exit Morph & Height-Collapse Tracking Sets (Zero-Allocation CSS Grid Transitions) ──
+  const [exitingNotifIds, setExitingNotifIds] = useState<Set<number>>(() => new Set());
+  const [exitingTaskIds, setExitingTaskIds] = useState<Set<number>>(() => new Set());
+  const [exitingEventIds, setExitingEventIds] = useState<Set<number>>(() => new Set());
+  const [exitingAlarmIds, setExitingAlarmIds] = useState<Set<string>>(() => new Set());
+
+  const handleSwitchCalendarSubTab = useCallback(
+    (nextTab: 'events' | 'alarms') => {
+      if (nextTab === calendarSubTab) return;
+      setCalendarTabDir(nextTab === 'alarms' ? 'right' : 'left');
+      setCalendarSubTab(nextTab);
+    },
+    [calendarSubTab]
+  );
+
+  const handleSwitchShelfSubTab = useCallback(
+    (nextTab: 'clipboard' | 'files') => {
+      if (nextTab === shelfSubTab) return;
+      setShelfTabDir(nextTab === 'files' ? 'right' : 'left');
+      setShelfSubTab(nextTab);
+    },
+    [shelfSubTab]
+  );
+
+  const handleDismissNotification = useCallback((id: number) => {
+    setExitingNotifIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    window.setTimeout(() => {
+      setNotifications((prev) => prev.filter((item) => item.id !== id));
+      setExitingNotifIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }, 220);
+  }, []);
+
+  const handleClearAllNotifications = useCallback(() => {
+    if (notifications.length === 0) return;
+    const allIds = notifications.map((n) => n.id);
+    setExitingNotifIds(new Set(allIds));
+    window.setTimeout(() => {
+      setNotifications([]);
+      setExitingNotifIds(new Set());
+    }, 230);
+  }, [notifications]);
+
+  const handleRemoveTask = useCallback(
+    (taskId: number) => {
+      setExitingTaskIds((prev) => {
+        const next = new Set(prev);
+        next.add(taskId);
+        return next;
+      });
+      window.setTimeout(() => {
+        setTasks((prev) => prev.filter((t) => t.id !== taskId));
+        removeTaskFromCalendar(taskId);
+        setExitingTaskIds((prev) => {
+          const next = new Set(prev);
+          next.delete(taskId);
+          return next;
+        });
+      }, 220);
+    },
+    [removeTaskFromCalendar]
+  );
+
+  const handleClearDoneTasks = useCallback(() => {
+    const doneIds = tasks.filter((t) => t.done).map((t) => t.id);
+    if (doneIds.length === 0) return;
+    setExitingTaskIds((prev) => {
+      const next = new Set(prev);
+      doneIds.forEach((id) => next.add(id));
+      return next;
+    });
+    window.setTimeout(() => {
+      setTasks((prev) => prev.filter((t) => !t.done));
+      doneIds.forEach((id) => removeTaskFromCalendar(id));
+      setExitingTaskIds((prev) => {
+        const next = new Set(prev);
+        doneIds.forEach((id) => next.delete(id));
+        return next;
+      });
+    }, 230);
+  }, [tasks, removeTaskFromCalendar]);
+
+  const handleRemoveCalendarEvent = useCallback(
+    (dateKey: string, ev: CalendarEventItem) => {
+      setExitingEventIds((prev) => {
+        const next = new Set(prev);
+        next.add(ev.id);
+        return next;
+      });
+      window.setTimeout(() => {
+        if (ev.linkedTaskId) {
+          setTasks((prev) =>
+            prev.map((t) => (t.id === ev.linkedTaskId ? { ...t, time: undefined } : t))
+          );
+        }
+        setEventsByDate((prev) => ({
+          ...prev,
+          [dateKey]: (prev[dateKey] || []).filter((item) => item.id !== ev.id),
+        }));
+        setExitingEventIds((prev) => {
+          const next = new Set(prev);
+          next.delete(ev.id);
+          return next;
+        });
+      }, 220);
+    },
+    []
+  );
 
   useEffect(() => {
     try {
@@ -3425,7 +3824,19 @@ export default function App() {
   }, []);
 
   const handleDeleteAlarm = useCallback((id: string) => {
-    setSmartAlarms((prev) => prev.filter((a) => a.id !== id));
+    setExitingAlarmIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    window.setTimeout(() => {
+      setSmartAlarms((prev) => prev.filter((a) => a.id !== id));
+      setExitingAlarmIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }, 220);
   }, []);
 
   const handleAddSmartAlarm = useCallback(
@@ -3844,8 +4255,23 @@ export default function App() {
   // ── Unified Command Executor for Voice & Chat AI (Tasks, Timers, Smart Alarms, Weather, Lyrics Seek, Volume, Brightness, Music) ──
   const executeIslandCommand = useCallback(
     (raw: string): { handled: boolean; reply?: string } => {
-      const p = raw.trim().toLowerCase();
+      const trimmedRaw = raw.trim();
+      const p = trimmedRaw.toLowerCase();
       if (!p) return { handled: false };
+
+      // Guard: Never intercept conversational/knowledge questions (e.g., "bro lu tau Open Design yang open-source itu ga?", "apa itu...", "pernah denger...")
+      const isConversationalQuestion =
+        /\?$/.test(trimmedRaw) ||
+        /\b(apa\s+itu|apakah|siapa|kenapa|mengapa|gimana|bagaimana|kapan|dimana|di\s+mana|berapa|tau\s+ga|tau\s+gak|tahu\s+ga|tahu\s+gak|tau\s+nggak|lu\s+tau|kamu\s+tau|pernah\s+denger|pernah\s+tau|jelasin|jelaskan|ceritain|artinya|maksudnya|bedanya|menurutmu|menurut\s+lu|itu\s+apa|itu\s+ga|itu\s+gak|open-source|open\s+source)\b/i.test(
+          trimmedRaw
+        );
+      const hasExplicitImperativePrefix =
+        /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|coba\s+)?(?:buka\s+aplikasi|jalankan\s+aplikasi|putar\s+lagu|puter\s+lagu|setel\s+lagu|ingetin|ingatkan|pasang\s+alarm|set\s+timer)\b/i.test(
+          trimmedRaw
+        );
+      if (isConversationalQuestion && !hasExplicitImperativePrefix) {
+        return { handled: false };
+      }
 
       const INDO_NUMS: Record<string, number> = {
         satu: 1, se: 1, dua: 2, tiga: 3, empat: 4, lima: 5, enam: 6,
@@ -3860,39 +4286,32 @@ export default function App() {
         return Number.isFinite(n) ? n : 1;
       };
 
-      // 0. Dynamic Windows App Launch ("buka discord", "tolong buka spotify", "open chrome", "jalankan whatsapp")
-      const appLaunchMatch = raw.match(
-        /\b(?:tolong\s+)?(?:buka(?:kan|in)?|jalankan|run|open|launch|start)\s+(?:aplikasi|app|program|software)?\s*([a-zA-Z0-9_\-\.\s]{2,40})/i
+      // 0. Dynamic Windows App Launch (Strictly anchored at command start: "buka discord", "tolong buka spotify", "open chrome", "jalankan whatsapp")
+      const appLaunchMatch = trimmedRaw.match(
+        /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|coba\s+|ayo\s+)?(?:buka(?:kan|in)?|jalankan|run|open|launch|start)\s+(?:aplikasi\s+|app\s+|program\s+|software\s+)?([a-zA-Z0-9_\-\.\s]{2,32})$/i
       );
       if (appLaunchMatch && appLaunchMatch[1]) {
         const rawTarget = appLaunchMatch[1].trim();
-        const isInternalTrigger =
-          /\b(terminal|cmd|powershell|cuaca|weather|shelf|notifikasi|notification|tugas|task|todo|kalender|calendar|pomodoro|timer|lirik|lyrics|lagu|musik|bluetooth|wifi|wi-fi|kecerahan|brightness|volume|mini capsule|kapsul mini)\b/i.test(
+        const isInternalOrConversational =
+          /\b(terminal|cmd|powershell|cuaca|weather|shelf|notifikasi|notification|tugas|task|todo|kalender|calendar|pomodoro|timer|lirik|lyrics|lagu|musik|bluetooth|wifi|wi-fi|kecerahan|brightness|volume|mini capsule|kapsul mini|yang|itu|ini|ga|gak|nggak|enggak|apa|apakah|siapa|kenapa|gimana|open-source|open source|source|design|puasa|suara|hati|pikiran|mata|pintu|halaman|akun|rekening|kesempatan|diskusi|obrolan|topik)\b/i.test(
             rawTarget
           );
-        if (!isInternalTrigger) {
+        if (!isInternalOrConversational) {
           const cleanAppName = rawTarget
-            .replace(/\b(sekarang|dong|ya|bro|please|plis)\b/gi, '')
+            .replace(/\b(sekarang|dong|ya|bro|please|plis|di\s+windows|di\s+laptop|di\s+pc)\b/gi, '')
             .trim();
-          if (cleanAppName.length >= 2) {
-            fetch('/api/system/launch-app', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ appName: cleanAppName }),
-            })
-              .then((r) => r.json())
-              .then((res) => {
-                if (res?.success) {
-                  const resolvedName = res.matchedName || cleanAppName;
-                  triggerActionConfirmation(
-                    `Membuka ${resolvedName}`,
-                    `“Buka ${resolvedName}”`,
-                    'OPEN',
-                    'system'
-                  );
-                }
-              })
-              .catch(() => {});
+          if (cleanAppName.length >= 2 && cleanAppName.split(/\s+/).length <= 4) {
+            void launchWindowsApp(cleanAppName).then((res) => {
+              if (res?.success) {
+                const resolvedName = res.matchedName || cleanAppName;
+                triggerActionConfirmation(
+                  `Membuka ${resolvedName}`,
+                  `“Buka ${resolvedName}”`,
+                  'OPEN',
+                  'system'
+                );
+              }
+            });
 
             triggerActionConfirmation(
               `Membuka ${cleanAppName}`,
@@ -4355,31 +4774,9 @@ export default function App() {
         };
       }
 
-      const playSongMatch =
-        raw.match(
-          /\b(?:putar lagu|puter lagu|putarkan lagu|puterin lagu|stel lagu|setel musik|setel lagu|setelin lagu|mainkan lagu|mainin lagu|dengerin lagu|play song|play music|putar musik|puter musik|putarkan musik|puterin musik)\s+(.+)/i
-        ) ||
-        raw.match(
-          /\b(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play)\s+(?:lagunya|lagu|musik|musiknya|track|song)\s+(.+)/i
-        );
-      if (playSongMatch && playSongMatch[1]) {
-        const songQuery = playSongMatch[1]
-          .replace(/\b(dong|ya|sekarang|please|plis|di\s+dynamic\s+island)\b/gi, '')
-          .trim();
-        if (songQuery) {
-          handleSearchAndPlayMedia(songQuery);
-          navigateToPage(0);
-          triggerActionConfirmation('Memutar Lagu', songQuery, 'PLAY', 'music', 0);
-          return { handled: true, reply: `Mencari dan memutar "${songQuery}" di Dynamic Island.` };
-        }
-      }
-      if (/\b(jeda musik|pause musik|stop musik|pause lagu|hentikan musik|matiin musik|matikan musik)\b/.test(p)) {
-        if (isPlaying) handleTogglePlay();
-        triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PAUSED', 'music', 0);
-        return { handled: true, reply: 'Musik dijeda.' };
-      }
+      // General play command ("putar musik", "play music", "setel musik", "dengerin lagu", "nyalain musik", etc.)
       if (
-        /\b(putar musik|puter musik|putar lagu|puter lagu|lanjutkan musik|play music|lanjut musik|play lagu|nyalain musik|nyalakan musik|setel musik|mainkan musik)\b/.test(
+        /^(?:tolong\s+|bisa\s+|mau\s+|coba\s+)?(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play|nyalain|nyalakan|dengerin|dengarkan)\s+(?:musik|lagu|musiknya|lagunya|track|song)(?:\s+(?:dong|ya|bro|please|plis))?$/i.test(
           p
         )
       ) {
@@ -4393,6 +4790,32 @@ export default function App() {
         navigateToPage(0);
         triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PLAYING', 'music', 0);
         return { handled: true, reply: 'Musik diputar.' };
+      }
+
+      // Play specific song or artist (Strictly anchored at command start: "puter coldplay", "puterin queen", "setel tulus", "dengerin bruno mars", "play viva la vida")
+      const playSongMatch = trimmedRaw.match(
+        /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|mau\s+|coba\s+|ayo\s+)?(?:putar(?:kan|in)?|puter(?:kan|in)?|setel(?:kan|in)?|stel(?:kan|in)?|mainkan|mainin|dengerin|dengarkan|play|listen\s+to)\s+(?:lagu(?:nya)?|musik(?:nya)?|track|song)?\s*(.+)/i
+      );
+
+      if (playSongMatch && playSongMatch[1]) {
+        const rawCandidate = playSongMatch[1]
+          .replace(/\b(dong|ya|sekarang|please|plis|di\s+dynamic\s+island|nih|bro|aja)\b/gi, '')
+          .replace(/[?!.]+$/, '')
+          .trim();
+        const isControlOrSystem = /^(?:pause|jeda|stop|matiin|matikan|selanjutnya|next|prev|volume|kecerahan|brightness|timer|pomodoro|alarm|jadwal|task|tugas|cuaca|weather|shelf|startup)\b/i.test(
+          rawCandidate
+        );
+        if (rawCandidate && !isControlOrSystem) {
+          handleSearchAndPlayMedia(rawCandidate);
+          navigateToPage(0);
+          triggerActionConfirmation('Memutar Lagu', rawCandidate, 'PLAY', 'music', 0);
+          return { handled: true, reply: `Mencari dan memutar "${rawCandidate}" di Dynamic Island.` };
+        }
+      }
+      if (/\b(jeda musik|pause musik|stop musik|pause lagu|hentikan musik|matiin musik|matikan musik)\b/.test(p)) {
+        if (isPlaying) handleTogglePlay();
+        triggerActionConfirmation('Kontrol Musik', activeTrack?.title || 'Media', 'PAUSED', 'music', 0);
+        return { handled: true, reply: 'Musik dijeda.' };
       }
       if (/\b(skip lagu|lagu selanjutnya|next track|next song)\b/.test(p)) {
         handleNextTrack();
@@ -5311,6 +5734,8 @@ export default function App() {
       } else if (data.action === 'play_music') {
         if (data.trackData) {
           loadAndPlayRealTrack({ ...data.trackData, sourceType: 'internal' });
+        } else if (data.actionParam) {
+          handleSearchAndPlayMedia(data.actionParam);
         } else if (activeTrackRef.current) {
           audioElRef.current?.play().catch(() => {});
           setIsPlaying(true);
@@ -5432,6 +5857,10 @@ export default function App() {
           nextDnd ? 'ON' : 'OFF',
           'system'
         );
+      } else if (data.action === 'enable_startup') {
+        handleToggleStartup(true);
+      } else if (data.action === 'disable_startup') {
+        handleToggleStartup(false);
       } else if (data.action === 'add_todo' && data.actionParam) {
         const parts = data.actionParam.split('|');
         const rawTitle = (parts[0] || data.actionParam).trim().slice(0, 80);
@@ -5457,15 +5886,19 @@ export default function App() {
           }
         }
 
+        const newTaskId = Date.now();
         setTasks((prev) => [
           ...prev.slice(-29),
           {
-            id: Date.now(),
+            id: newTaskId,
             title: finalTitle,
             time: finalTime,
             done: false,
           },
         ]);
+        if (finalTime) {
+          syncTaskToCalendar(newTaskId, finalTitle, finalTime, false);
+        }
         pushRealNotification('Task Dijadwalkan', `${finalTitle} · ${finalTime}`, 'calendar');
         triggerActionConfirmation('Task Dijadwalkan', finalTitle, finalTime, 'task', 3);
       } else if (data.action === 'set_alarm_and_reminder' && data.actionParam) {
@@ -5491,22 +5924,15 @@ export default function App() {
         });
       } else if (data.action === 'launch_app' && data.actionParam) {
         const appTarget = data.actionParam.trim();
-        fetch('/api/system/launch-app', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ appName: appTarget }),
-        })
-          .then((r) => r.json())
-          .then((res) => {
-            const resolved = res?.matchedName || appTarget;
-            triggerActionConfirmation(
-              `Membuka ${resolved}`,
-              `“Buka ${resolved}”`,
-              'OPEN',
-              'system'
-            );
-          })
-          .catch(() => {});
+        void launchWindowsApp(appTarget).then((res) => {
+          const resolved = res?.matchedName || appTarget;
+          triggerActionConfirmation(
+            `Membuka ${resolved}`,
+            `“Buka ${resolved}”`,
+            'OPEN',
+            'system'
+          );
+        });
         triggerActionConfirmation(
           `Membuka ${appTarget}`,
           `“Buka ${appTarget}”`,
@@ -6456,8 +6882,8 @@ export default function App() {
                 isOutgoing
                   ? 'opacity-0 pointer-events-none max-h-[24px] mb-[2px]'
                   : lyricsMode
-                  ? 'max-h-0 opacity-0 -translate-y-2 scale-95 blur-[3px] mb-0 pointer-events-none overflow-hidden'
-                  : 'max-h-[24px] opacity-100 translate-y-0 scale-100 blur-0 mb-[2px]'
+                  ? 'max-h-0 opacity-0 -translate-y-2 scale-95 mb-0 pointer-events-none overflow-hidden'
+                  : 'max-h-[24px] opacity-100 translate-y-0 scale-100 mb-[2px]'
               }`}
             >
               {renderBatteryRing(20, 2.5)}
@@ -6472,8 +6898,8 @@ export default function App() {
               <div
                 className={`isle-stagger-1 absolute top-[13px] right-[26px] flex items-center gap-1.5 z-10 transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                   lyricsMode
-                    ? 'opacity-0 scale-90 blur-[2px] pointer-events-none'
-                    : 'opacity-100 scale-100 blur-0'
+                    ? 'opacity-0 scale-90 pointer-events-none'
+                    : 'opacity-100 scale-100'
                 }`}
               >
                 {musicQueue.length > 0 && (
@@ -6808,27 +7234,31 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right Column: Divider + Synced Lyrics Panel (Smoothly slides, scales & unblurs on toggle) */}
+              {/* Right Column: Divider + Synced Lyrics Panel (Zero hidden GPU blur surface when collapsed) */}
               <div
                 className={`flex items-center h-full transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                   lyricsMode
-                    ? 'flex-1 opacity-100 translate-x-0 scale-100 blur-0 ml-[18px] pointer-events-auto'
-                    : 'w-0 opacity-0 translate-x-7 scale-95 blur-[6px] ml-0 pointer-events-none overflow-hidden'
+                    ? 'flex-1 opacity-100 translate-x-0 scale-100 ml-[18px] pointer-events-auto'
+                    : 'w-0 opacity-0 translate-x-7 scale-95 ml-0 pointer-events-none overflow-hidden'
                 }`}
               >
                 <div className="w-[1px] h-[86%] bg-white/15 shrink-0 mr-[18px]" />
 
                 <div
                   ref={lyricsContainerRef}
-                  style={{
-                    WebkitMaskImage:
-                      'linear-gradient(to bottom, transparent 0%, black 16%, black 84%, transparent 100%)',
-                    maskImage:
-                      'linear-gradient(to bottom, transparent 0%, black 16%, black 84%, transparent 100%)',
-                  }}
+                  style={
+                    lyricsMode
+                      ? {
+                          WebkitMaskImage:
+                            'linear-gradient(to bottom, transparent 0%, black 16%, black 84%, transparent 100%)',
+                          maskImage:
+                            'linear-gradient(to bottom, transparent 0%, black 16%, black 84%, transparent 100%)',
+                        }
+                      : undefined
+                  }
                   className="flex-1 h-[146px] overflow-y-auto no-scrollbar scroll-smooth space-y-3 pr-1 py-8 flex flex-col justify-start min-w-[215px]"
                 >
-                  {mediaLoading ? (
+                  {!lyricsMode ? null : mediaLoading ? (
                     <div className="text-white/55 text-[13px] font-medium my-auto text-center animate-pulse">
                       Memuat lirik...
                     </div>
@@ -6937,30 +7367,41 @@ export default function App() {
           >
             {/* Clean Reference Header Row: "Notifications" on Left + Bell DND Toggle & "Clear" Pill on Right */}
             <div className="isle-stagger-1 flex items-center justify-between shrink-0 mb-1">
-              <span className="text-[12.5px] font-medium text-[#8e8e93] tracking-tight">
-                Notifications
-              </span>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[12px] font-semibold text-white/85 tracking-tight">
+                  Notifications
+                </span>
+                {notifications.length > 0 && (
+                  <span className="text-[11px] text-white/35 tabular-nums">
+                    · {notifications.length}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => setDndEnabled((d) => !d)}
-                  title={dndEnabled ? 'Do Not Disturb: ON (Klik untuk matikan)' : 'Do Not Disturb: OFF (Klik untuk aktifkan)'}
-                  className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition cursor-pointer ${
+                  title={
                     dndEnabled
-                      ? 'bg-[#5e5ce6] text-white'
-                      : 'text-white/80 hover:text-white hover:bg-white/[0.08]'
+                      ? 'Do Not Disturb: ON (Klik untuk matikan)'
+                      : 'Do Not Disturb: OFF (Klik untuk aktifkan)'
+                  }
+                  className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition-all duration-200 active:scale-90 cursor-pointer ${
+                    dndEnabled
+                      ? 'bg-[#5e5ce6] text-white shadow-sm'
+                      : 'text-white/70 hover:text-white hover:bg-white/[0.08]'
                   }`}
                 >
-                  {dndEnabled ? <MoonFilledSvg size={12} /> : <BellOutlineSvg size={12} />}
+                  {dndEnabled ? <MoonFilledSvg size={11} /> : <BellOutlineSvg size={11} />}
                 </button>
                 <button
                   type="button"
-                  onClick={() => setNotifications([])}
+                  onClick={handleClearAllNotifications}
                   disabled={notifications.length === 0}
-                  className={`px-3 py-0.5 rounded-full text-[11px] font-semibold shrink-0 transition cursor-pointer ${
+                  className={`px-2.5 py-0.5 rounded-full text-[10.5px] font-medium shrink-0 transition-all duration-200 active:scale-95 cursor-pointer ${
                     notifications.length > 0
-                      ? 'bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white'
-                      : 'bg-white/[0.06] text-white/35 cursor-default'
+                      ? 'bg-white/[0.08] hover:bg-white/[0.15] text-white/90'
+                      : 'bg-white/[0.03] text-white/25 cursor-default'
                   }`}
                 >
                   Clear
@@ -6969,14 +7410,14 @@ export default function App() {
             </div>
 
             {notifications.length === 0 ? (
-              <div className="isle-stagger-2 flex-1 min-h-0 flex items-center justify-center gap-2 text-white/40 text-[11.5px]">
+              <div className="isle-stagger-2 flex-1 min-h-0 flex items-center justify-center gap-2 text-white/35 text-[11.5px] animate-[isleFadeIn_200ms_ease-out]">
                 <BellOutlineSvg size={13} />
                 <span className="truncate">
                   {dndEnabled ? 'Do Not Disturb aktif · ' : ''}Tidak ada notifikasi baru
                 </span>
               </div>
             ) : (
-              <div className="isle-stagger-2 flex-1 min-h-0 flex flex-col justify-start space-y-1.5 overflow-y-auto no-scrollbar pt-0.5">
+              <div className="isle-stagger-2 flex-1 min-h-0 flex flex-col justify-start overflow-y-auto no-scrollbar pt-0.5">
                 {notifications.map((n, idx) => {
                   const diffSec = Math.max(0, Math.floor((Date.now() - (n.createdAt || 0)) / 1000));
                   const displayTime =
@@ -6985,57 +7426,62 @@ export default function App() {
                       : diffSec < 3600
                       ? `${Math.floor(diffSec / 60)}m`
                       : n.timeAgo;
+                  const isExiting = exitingNotifIds.has(n.id);
 
                   return (
                     <div
                       key={n.id}
-                      style={{
-                        animation: 'isleMenuItemIn 360ms cubic-bezier(0.22, 1, 0.36, 1) both',
-                        animationDelay: `${Math.min(220, 30 + idx * 40)}ms`,
-                      }}
-                      className="group flex items-center justify-between gap-2.5 px-3 py-[7px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.04] transition shrink-0"
+                      className={`isle-collapse-row mb-1.5 shrink-0 ${isExiting ? 'is-exiting' : ''}`}
                     >
-                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                        {/* Left Colored Squircle App Icon Badge matching reference screenshot */}
+                      <div className="isle-collapse-inner">
                         <div
-                          className={`w-[22px] h-[22px] rounded-[6px] text-white flex items-center justify-center shrink-0 shadow-sm ${
-                            n.iconType === 'calendar'
-                              ? 'bg-gradient-to-b from-[#ff7b54] to-[#ff453a]'
-                              : n.iconType === 'download'
-                              ? 'bg-gradient-to-b from-[#38bdf8] to-[#0284c7]'
-                              : 'bg-gradient-to-b from-[#6e6aff] to-[#4f46e5]'
-                          }`}
+                          style={{
+                            animation: 'isleItemSpringIn 320ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                            animationDelay: `${Math.min(180, idx * 32)}ms`,
+                          }}
+                          className="group flex items-center justify-between gap-2.5 px-3 py-[6.5px] rounded-xl bg-white/[0.04] hover:bg-white/[0.075] border border-white/[0.05] transition-colors duration-200"
                         >
-                          {n.iconType === 'calendar' && <CalendarGridSvg size={11} />}
-                          {n.iconType === 'download' && <ShelfTraySvg size={11} />}
-                          {n.iconType === 'message' && <MessageBubbleSvg size={11} />}
-                        </div>
+                          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                            {/* Left Minimalist Squircle App Icon Badge */}
+                            <div
+                              className={`w-[21px] h-[21px] rounded-[6px] text-white flex items-center justify-center shrink-0 shadow-xs ${
+                                n.iconType === 'calendar'
+                                  ? 'bg-gradient-to-b from-[#ff7b54] to-[#ff453a]'
+                                  : n.iconType === 'download'
+                                  ? 'bg-gradient-to-b from-[#38bdf8] to-[#0284c7]'
+                                  : 'bg-gradient-to-b from-[#6e6aff] to-[#4f46e5]'
+                              }`}
+                            >
+                              {n.iconType === 'calendar' && <CalendarGridSvg size={10.5} />}
+                              {n.iconType === 'download' && <ShelfTraySvg size={10.5} />}
+                              {n.iconType === 'message' && <MessageBubbleSvg size={10.5} />}
+                            </div>
 
-                        {/* Inline Title + Subtitle */}
-                        <div className="flex items-baseline gap-2 min-w-0 flex-1">
-                          <span className="text-[12px] font-bold text-white shrink-0 tracking-[-0.1px]">
-                            {n.title}
-                          </span>
-                          <span className="text-[11.5px] font-normal text-[#8e8e93] truncate flex-1">
-                            {n.subtitle}
-                          </span>
-                        </div>
-                      </div>
+                            {/* Inline Title + Subtitle */}
+                            <div className="flex items-baseline gap-2 min-w-0 flex-1">
+                              <span className="text-[11.5px] font-semibold text-white shrink-0 tracking-[-0.01em]">
+                                {n.title}
+                              </span>
+                              <span className="text-[11px] font-normal text-white/50 truncate flex-1">
+                                {n.subtitle}
+                              </span>
+                            </div>
+                          </div>
 
-                      <div className="shrink-0 flex items-center gap-1.5">
-                        <span className="text-[11px] font-normal text-[#8e8e93] tabular-nums">
-                          {displayTime}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setNotifications((prev) => prev.filter((item) => item.id !== n.id))
-                          }
-                          className="opacity-0 group-hover:opacity-100 p-0.5 text-white/45 hover:text-white transition cursor-pointer"
-                          title="Dismiss notification"
-                        >
-                          <CloseCrossSvg size={9} />
-                        </button>
+                          <div className="shrink-0 flex items-center gap-1.5">
+                            <span className="text-[10.5px] font-normal text-white/40 tabular-nums">
+                              {displayTime}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleDismissNotification(n.id)}
+                              className="opacity-0 group-hover:opacity-100 w-4 h-4 rounded-full hover:bg-white/15 flex items-center justify-center text-white/45 hover:text-white transition-all duration-150 active:scale-90 cursor-pointer"
+                              title="Dismiss notification"
+                            >
+                              <CloseCrossSvg size={8.5} />
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   );
@@ -7081,13 +7527,13 @@ export default function App() {
                     <RotateResetSvg size={17} />
                   </button>
                 </div>
-                <div className="flex items-center gap-2 mt-1">
+                <div className="flex items-center gap-1.5 mt-1">
                   <span className="text-[12px] text-white/50 font-normal">
                     {isFocus ? 'Focus time' : 'Break time'}
                   </span>
                   {pomoSessionsCompleted > 0 && (
-                    <span className="text-[10.5px] px-2 py-0.5 rounded-full bg-white/10 text-white/70">
-                      Sesi: {pomoSessionsCompleted}
+                    <span className="text-[11px] text-white/40 tabular-nums">
+                      · Sesi {pomoSessionsCompleted}
                     </span>
                   )}
                 </div>
@@ -7146,12 +7592,14 @@ export default function App() {
         return (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full h-full flex items-center justify-between px-10 py-1 gap-5"
+            className="w-full h-full flex items-center justify-between px-9 py-1 gap-4"
           >
-            <div className="isle-stagger-1 flex flex-col justify-between h-full py-1">
+            {/* Left Summary & Minimalist Action Triggers */}
+            <div className="isle-stagger-1 flex flex-col justify-between h-full py-1 shrink-0">
               <div>
                 <div className="text-[28px] font-bold tracking-tight text-white leading-none tabular-nums">
-                  {completedCount}/{tasks.length}
+                  {completedCount}
+                  <span className="text-white/30 font-medium">/{tasks.length}</span>
                 </div>
                 <div className="text-[11px] text-white/45 font-medium mt-1">
                   Tasks Completed
@@ -7160,6 +7608,7 @@ export default function App() {
 
               <div className="flex items-center gap-1.5">
                 <button
+                  type="button"
                   onClick={() => {
                     if (!addingTask) {
                       const next30 = new Date(Date.now() + 30 * 60 * 1000);
@@ -7171,15 +7620,26 @@ export default function App() {
                     }
                     setAddingTask((a) => !a);
                   }}
-                  className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/12 hover:bg-white/20 text-white text-[11px] font-medium transition"
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[10.5px] font-semibold transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap ${
+                    addingTask
+                      ? 'bg-white text-black shadow-xs'
+                      : 'bg-white/[0.09] hover:bg-white/[0.16] text-white'
+                  }`}
                 >
-                  <PlusSvg size={11} />
-                  Add Task
+                  <span
+                    className={`transition-transform duration-200 ${
+                      addingTask ? 'rotate-45' : 'rotate-0'
+                    }`}
+                  >
+                    <PlusSvg size={10} />
+                  </span>
+                  <span>{addingTask ? 'Close' : 'New Task'}</span>
                 </button>
                 {tasks.some((t) => t.done) && (
                   <button
-                    onClick={() => setTasks((prev) => prev.filter((t) => !t.done))}
-                    className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-white/10 hover:bg-white/18 text-white/80 text-[11px] font-medium transition"
+                    type="button"
+                    onClick={handleClearDoneTasks}
+                    className="px-2.5 py-1 rounded-full bg-white/[0.06] hover:bg-white/[0.13] text-white/70 hover:text-white text-[10.5px] font-medium transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap animate-[isleFadeIn_160ms_ease-out]"
                   >
                     Clear Done
                   </button>
@@ -7187,160 +7647,218 @@ export default function App() {
               </div>
             </div>
 
-            <div className="isle-stagger-2 w-[260px] h-[104px] rounded-2xl bg-white/[0.04] backdrop-blur-md border border-white/[0.08] p-2.5 overflow-y-auto no-scrollbar flex flex-col justify-between">
-              <div className="space-y-1.5">
+            {/* Right Minimalist Task Surface + Seamless Unified Capsule Composer */}
+            <div className="isle-stagger-2 w-[274px] h-[106px] rounded-2xl bg-white/[0.035] border border-white/[0.06] px-3 py-2 flex flex-col justify-between overflow-hidden">
+              <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar pr-0.5">
                 {tasks.length === 0 && !addingTask ? (
-                  <div className="text-[11px] text-white/40 py-2 text-center">
-                    Belum ada task · Klik + Add Task untuk atur pengingat
+                  <div
+                    onClick={() => setAddingTask(true)}
+                    className="h-full flex flex-col items-center justify-center text-center cursor-pointer group animate-[isleFadeIn_180ms_ease-out]"
+                  >
+                    <span className="text-[11px] text-white/40 group-hover:text-white/70 transition-colors">
+                      Belum ada task terjadwal
+                    </span>
+                    <span className="text-[9.5px] text-white/25 group-hover:text-white/45 transition-colors mt-0.5">
+                      Klik + New Task untuk membuat pengingat
+                    </span>
                   </div>
                 ) : (
-                  tasks.map((task) => (
-                    <div
-                      key={task.id}
-                      onClick={() =>
-                        setTasks((prev) =>
-                          prev.map((t) => (t.id === task.id ? { ...t, done: !t.done } : t))
-                        )
-                      }
-                      className="flex items-center justify-between gap-2 cursor-pointer group"
-                    >
-                      <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                        <div
-                          className={`mt-0.5 w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 transition ${
-                            task.done
-                              ? 'bg-white border-white text-black'
-                              : 'border-white/40 group-hover:border-white/75'
-                          }`}
-                        >
-                          {task.done && <CheckTickSvg size={9} />}
-                        </div>
-                        <div className="flex-1 min-w-0">
+                  tasks.map((task) => {
+                    const isExiting = exitingTaskIds.has(task.id);
+                    return (
+                      <div
+                        key={task.id}
+                        className={`isle-collapse-row mb-1.5 last:mb-0 ${
+                          isExiting ? 'is-exiting' : ''
+                        }`}
+                      >
+                        <div className="isle-collapse-inner">
                           <div
-                            className={`text-[12px] font-semibold leading-tight truncate ${
-                              task.done ? 'line-through text-white/35' : 'text-white'
-                            }`}
+                            onClick={() => {
+                              const nextDone = !task.done;
+                              setTasks((prev) =>
+                                prev.map((t) =>
+                                  t.id === task.id ? { ...t, done: nextDone } : t
+                                )
+                              );
+                              if (task.time) {
+                                syncTaskToCalendar(
+                                  task.id,
+                                  task.title,
+                                  task.time,
+                                  nextDone,
+                                  task.dateKey
+                                );
+                              }
+                            }}
+                            style={{
+                              animation:
+                                'isleItemSpringIn 280ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                            }}
+                            className="flex items-center justify-between gap-2 py-0.5 cursor-pointer group"
                           >
-                            {task.title}
-                          </div>
-                          {editingTaskTimeId === task.id ? (
-                            <div
-                              onClick={(ev) => ev.stopPropagation()}
-                              className="mt-0.5 flex items-center gap-1"
-                            >
-                              <input
-                                type="time"
-                                autoFocus
-                                value={task.time || '09:00'}
-                                onChange={(ev) => {
-                                  const nextTime = ev.target.value;
-                                  setTasks((prev) =>
-                                    prev.map((t) =>
-                                      t.id === task.id ? { ...t, time: nextTime } : t
-                                    )
-                                  );
-                                }}
-                                onBlur={() => setEditingTaskTimeId(null)}
-                                onKeyDown={(ev) => {
-                                  if (ev.key === 'Enter' || ev.key === 'Escape') {
-                                    setEditingTaskTimeId(null);
-                                  }
-                                }}
-                                style={{ colorScheme: 'dark' }}
-                                className="bg-white/12 border border-white/20 rounded px-1 py-0.2 text-[10px] text-white tabular-nums focus:outline-none"
-                              />
+                            <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                              <div
+                                className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 transition-all duration-200 ${
+                                  task.done
+                                    ? 'bg-white border-white text-black scale-95'
+                                    : 'border-white/35 group-hover:border-white/75'
+                                }`}
+                              >
+                                {task.done && <CheckTickSvg size={8.5} />}
+                              </div>
+                              <div className="flex-1 min-w-0 flex items-baseline justify-between gap-2">
+                                <span
+                                  className={`text-[11.5px] font-medium leading-tight truncate transition-colors duration-200 ${
+                                    task.done ? 'line-through text-white/30' : 'text-white/95'
+                                  }`}
+                                >
+                                  {task.title}
+                                </span>
+
+                                {editingTaskTimeId === task.id ? (
+                                  <div
+                                    onClick={(ev) => ev.stopPropagation()}
+                                    className="shrink-0"
+                                  >
+                                    <input
+                                      type="time"
+                                      autoFocus
+                                      value={task.time || '09:00'}
+                                      onChange={(ev) => {
+                                        const nextTime = ev.target.value;
+                                        setTasks((prev) =>
+                                          prev.map((t) =>
+                                            t.id === task.id ? { ...t, time: nextTime } : t
+                                          )
+                                        );
+                                        syncTaskToCalendar(
+                                          task.id,
+                                          task.title,
+                                          nextTime,
+                                          task.done,
+                                          task.dateKey
+                                        );
+                                      }}
+                                      onBlur={() => setEditingTaskTimeId(null)}
+                                      onKeyDown={(ev) => {
+                                        if (ev.key === 'Enter' || ev.key === 'Escape') {
+                                          setEditingTaskTimeId(null);
+                                        }
+                                      }}
+                                      style={{ colorScheme: 'dark' }}
+                                      className="isle-capsule-time bg-white/10 rounded-md px-1 py-0.2 text-[9.5px] font-mono text-white tabular-nums focus:outline-none"
+                                    />
+                                  </div>
+                                ) : (
+                                  <span
+                                    onClick={(ev) => {
+                                      ev.stopPropagation();
+                                      setEditingTaskTimeId(task.id);
+                                    }}
+                                    title="Klik untuk ubah jam pengingat (sinkron otomatis ke Kalender)"
+                                    className="text-[10px] font-mono text-white/40 hover:text-white/85 tabular-nums shrink-0 transition-colors"
+                                  >
+                                    {task.time || 'Set time'}
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                          ) : (
-                            <div
+
+                            <button
+                              type="button"
                               onClick={(ev) => {
                                 ev.stopPropagation();
-                                setEditingTaskTimeId(task.id);
+                                handleRemoveTask(task.id);
                               }}
-                              title="Klik untuk ubah jam pengingat task ini"
-                              className="text-[10px] text-white/45 hover:text-white/80 font-medium mt-0.5 tabular-nums inline-flex items-center gap-1 transition"
+                              className="opacity-0 group-hover:opacity-100 w-4 h-4 rounded-full hover:bg-white/12 flex items-center justify-center text-white/40 hover:text-white transition-all duration-150 active:scale-90 shrink-0 cursor-pointer"
+                              title="Hapus task"
                             >
-                              <span>{task.time || 'Atur jam'}</span>
-                              {!task.done && task.time && (
-                                <span className="text-[8.5px] text-white/30">· Pengingat aktif</span>
-                              )}
-                            </div>
-                          )}
+                              <CloseCrossSvg size={8.5} />
+                            </button>
+                          </div>
                         </div>
                       </div>
-                      <button
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          setTasks((prev) => prev.filter((t) => t.id !== task.id));
-                        }}
-                        className="opacity-0 group-hover:opacity-100 p-0.5 text-white/40 hover:text-white transition"
-                        title="Delete task"
-                      >
-                        <CloseCrossSvg size={10} />
-                      </button>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
 
-              {addingTask && (
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    const raw = newTaskInput.trim().slice(0, 80);
-                    if (!raw) return;
-                    // Support inline time typing (e.g. "Meeting klien 19:30") OR the explicit time picker value
-                    const inlineTimeMatch = raw.match(/^(.*?)\s+(?:jam|pukul|at)?\s*(\d{1,2}[:.]\d{2})$/i);
-                    let finalTitle = raw;
-                    let finalTime = newTaskTime.trim();
-                    if (inlineTimeMatch && inlineTimeMatch[1].trim()) {
-                      finalTitle = inlineTimeMatch[1].trim();
-                      const parts = inlineTimeMatch[2].replace('.', ':').split(':');
-                      finalTime = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
-                    }
-                    setTasks((prev) => [
-                      ...prev.slice(-29),
-                      {
-                        id: Date.now(),
-                        title: finalTitle,
-                        time: finalTime,
-                        done: false,
-                      },
-                    ]);
-                    if (finalTime) {
-                      pushRealNotification(
-                        `Task Dijadwalkan: ${finalTitle}`,
-                        `Dynamic Island akan mengingatkan pukul ${finalTime}`,
-                        'calendar'
+              {/* Seamless Unified Capsule Composer (Smoothly morphs open/closed via CSS Grid Drawer) */}
+              <div className={`isle-composer-drawer shrink-0 ${addingTask ? 'is-open' : ''}`}>
+                <div className="isle-composer-inner">
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      const raw = newTaskInput.trim().slice(0, 80);
+                      if (!raw) return;
+                      const inlineTimeMatch = raw.match(
+                        /^(.*?)\s+(?:jam|pukul|at)?\s*(\d{1,2}[:.]\d{2})$/i
                       );
-                    }
-                    setNewTaskInput('');
-                    setAddingTask(false);
-                  }}
-                  className="mt-1 flex items-center gap-1"
-                >
-                  <input
-                    type="text"
-                    autoFocus
-                    value={newTaskInput}
-                    onChange={(e) => setNewTaskInput(e.target.value)}
-                    placeholder="Nama task..."
-                    className="flex-1 min-w-0 bg-white/10 rounded px-2 py-0.5 text-[11px] text-white placeholder-white/35 focus:outline-none"
-                  />
-                  <input
-                    type="time"
-                    value={newTaskTime}
-                    onChange={(e) => setNewTaskTime(e.target.value)}
-                    title="Atur jam pengingat di Dynamic Island"
-                    style={{ colorScheme: 'dark' }}
-                    className="w-[68px] shrink-0 bg-white/10 border border-white/15 rounded px-1 py-0.5 text-[10px] text-white tabular-nums focus:outline-none focus:border-white/40"
-                  />
-                  <button
-                    type="submit"
-                    className="px-2 py-0.5 rounded bg-white text-black text-[10px] font-semibold shrink-0"
+                      let finalTitle = raw;
+                      let finalTime = newTaskTime.trim();
+                      if (inlineTimeMatch && inlineTimeMatch[1].trim()) {
+                        finalTitle = inlineTimeMatch[1].trim();
+                        const parts = inlineTimeMatch[2].replace('.', ':').split(':');
+                        finalTime = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+                      }
+                      const newTaskId = Date.now();
+                      setTasks((prev) => [
+                        ...prev.slice(-29),
+                        {
+                          id: newTaskId,
+                          title: finalTitle,
+                          time: finalTime,
+                          done: false,
+                        },
+                      ]);
+                      if (finalTime) {
+                        syncTaskToCalendar(newTaskId, finalTitle, finalTime, false);
+                        pushRealNotification(
+                          `Task Dijadwalkan: ${finalTitle}`,
+                          `Dynamic Island akan mengingatkan pukul ${finalTime}`,
+                          'calendar'
+                        );
+                      }
+                      setNewTaskInput('');
+                      setAddingTask(false);
+                    }}
+                    className="flex items-center gap-1.5 rounded-full bg-[#14151b] hover:bg-[#181a22] focus-within:bg-[#1b1d26] border border-white/[0.09] focus-within:border-white/25 pl-3 pr-1 py-[3px] transition-all duration-200"
                   >
-                    Add
-                  </button>
-                </form>
-              )}
+                    <input
+                      type="text"
+                      ref={(el) => {
+                        if (addingTask && el && document.activeElement !== el && document.activeElement?.getAttribute('type') !== 'time') {
+                          // allow natural focus when opened
+                        }
+                      }}
+                      value={newTaskInput}
+                      onChange={(e) => setNewTaskInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') setAddingTask(false);
+                      }}
+                      placeholder="Nama task..."
+                      className="flex-1 min-w-0 bg-transparent text-[11px] text-white placeholder-white/35 focus:outline-none"
+                    />
+                    <span className="w-[1px] h-3 bg-white/[0.1] shrink-0" />
+                    <input
+                      type="time"
+                      value={newTaskTime}
+                      onChange={(e) => setNewTaskTime(e.target.value)}
+                      title="Jam pengingat task (otomatis sinkron ke Kalender)"
+                      style={{ colorScheme: 'dark' }}
+                      className="isle-capsule-time bg-transparent text-[10px] font-mono font-medium text-white/75 hover:text-white focus:text-white tabular-nums focus:outline-none shrink-0"
+                    />
+                    <button
+                      type="submit"
+                      title="Tambah Task"
+                      className="w-5 h-5 rounded-full bg-white text-black hover:bg-white/90 active:scale-90 flex items-center justify-center transition-all duration-150 shrink-0 cursor-pointer"
+                    >
+                      <PlusSvg size={9.5} />
+                    </button>
+                  </form>
+                </div>
+              </div>
             </div>
           </div>
         );
@@ -7352,12 +7870,14 @@ export default function App() {
             onDragEnter={(e) => {
               e.preventDefault();
               e.stopPropagation();
+              inspectDragEventFiles(e.dataTransfer);
               setIsDragOver(true);
             }}
             onDragOver={(e) => {
               e.preventDefault();
               e.stopPropagation();
               if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+              inspectDragEventFiles(e.dataTransfer);
               setIsDragOver(true);
             }}
             onDragLeave={(e) => {
@@ -7381,27 +7901,34 @@ export default function App() {
             }}
             className="relative w-full h-full flex flex-col justify-between px-8 py-0.5 select-none overflow-hidden"
           >
-            {/* Sub-Header Row: Segmented [Clipboard | Files] Pill on Left + Status / Hint on Right */}
+            {/* Sub-Header Row: Sliding Pill Segmented [Clipboard | Files] on Left + Status / Hint on Right */}
             <div className="isle-stagger-1 flex items-center justify-between gap-2 shrink-0">
-              <div className="inline-flex items-center rounded-full bg-[#1c1c1e] border border-white/[0.06] p-0.5">
+              <div className="relative inline-grid grid-cols-2 items-center rounded-full bg-white/[0.05] border border-white/[0.07] p-0.5">
+                <div
+                  className={`
+                    pointer-events-none absolute top-0.5 bottom-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-white/[0.15] shadow-xs
+                    transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]
+                    ${shelfSubTab === 'files' ? 'translate-x-full' : 'translate-x-0'}
+                  `}
+                />
                 <button
                   type="button"
-                  onClick={() => setShelfSubTab('clipboard')}
-                  className={`px-2.5 py-0.5 rounded-full text-[10.5px] font-semibold transition cursor-pointer ${
+                  onClick={() => handleSwitchShelfSubTab('clipboard')}
+                  className={`relative z-10 px-2.5 py-0.5 rounded-full text-[10px] font-semibold transition-colors duration-200 cursor-pointer whitespace-nowrap ${
                     shelfSubTab === 'clipboard'
-                      ? 'bg-[#3a3a3c] text-white shadow-sm'
-                      : 'text-[#8e8e93] hover:text-white/80'
+                      ? 'text-white'
+                      : 'text-white/45 hover:text-white/80'
                   }`}
                 >
                   Clipboard
                 </button>
                 <button
                   type="button"
-                  onClick={() => setShelfSubTab('files')}
-                  className={`px-2.5 py-0.5 rounded-full text-[10.5px] font-semibold transition cursor-pointer ${
+                  onClick={() => handleSwitchShelfSubTab('files')}
+                  className={`relative z-10 px-2.5 py-0.5 rounded-full text-[10px] font-semibold transition-colors duration-200 cursor-pointer whitespace-nowrap ${
                     shelfSubTab === 'files'
-                      ? 'bg-[#3a3a3c] text-white shadow-sm'
-                      : 'text-[#8e8e93] hover:text-white/80'
+                      ? 'text-white'
+                      : 'text-white/45 hover:text-white/80'
                   }`}
                 >
                   Files
@@ -7411,6 +7938,10 @@ export default function App() {
               <div className="text-[10.5px] font-medium text-[#8e8e93] tracking-tight truncate">
                 {shelfToast ? (
                   <span className="text-white font-semibold">{shelfToast}</span>
+                ) : isDragOver ? (
+                  <span className="text-[#409cff] font-semibold animate-pulse">
+                    Ready to drop {incomingDragCount > 1 ? `${incomingDragCount} files` : 'file'} into Shelf
+                  </span>
                 ) : shelfSubTab === 'files' ? (
                   `${shelfFiles.length} of 8 · click to copy, or drag into any app`
                 ) : (
@@ -7419,218 +7950,296 @@ export default function App() {
               </div>
             </div>
 
-            {/* Main Shelf Content Area: Files Tray OR Clipboard Tray */}
-            {shelfSubTab === 'files' ? (
-              shelfFiles.length === 0 && !isDragOver ? (
-                <div
-                  onClick={() => shelfFileInputRef.current?.click()}
-                  className="isle-stagger-2 w-full flex-1 my-1 rounded-xl border border-dashed border-white/20 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex items-center justify-center gap-3 cursor-pointer"
-                  title="Drag & drop file dari Windows Explorer ke Dynamic Island, atau klik untuk memilih file"
-                >
-                  <div className="text-white/80">
-                    <ShelfTraySvg size={20} />
+            {/* Main Shelf Content Area: Directional Spring Morph between Files Tray and Clipboard Tray */}
+            <div
+              key={shelfSubTab}
+              style={{
+                animation: `${
+                  shelfTabDir === 'right' ? 'isleSubTabInRight' : 'isleSubTabInLeft'
+                } 240ms cubic-bezier(0.22, 1, 0.36, 1) both`,
+              }}
+              className="w-full flex-1 flex flex-col justify-center min-h-0"
+            >
+              {shelfSubTab === 'files' ? (
+                shelfFiles.length === 0 && !isDragOver ? (
+                  <div
+                    onClick={() => shelfFileInputRef.current?.click()}
+                    className="w-full flex-1 my-1 rounded-xl border border-dashed border-white/15 bg-white/[0.02] hover:border-white/35 hover:bg-white/[0.04] transition-all flex items-center justify-center gap-3 cursor-pointer"
+                    title="Drag & drop file dari Windows Explorer ke Dynamic Island, atau klik untuk memilih file"
+                  >
+                    <div className="text-white/75">
+                      <ShelfTraySvg size={20} />
+                    </div>
+                    <div className="flex flex-col items-start">
+                      <span className="text-[11.5px] font-semibold text-white leading-tight">
+                        Drop files here or click to browse
+                      </span>
+                      <span className="text-[10px] text-white/45 leading-tight mt-0.5">
+                        Files wait here with thumbnails until you drag them out or click to copy
+                      </span>
+                    </div>
                   </div>
+                ) : (
+                  <div className="w-full flex-1 flex items-center justify-start gap-3.5 px-1 overflow-x-auto no-scrollbar">
+                    {shelfFiles.map((file, idx) => {
+                      const isCopied = copiedShelfId === file.id;
+                      return (
+                        <div
+                          key={file.id}
+                          draggable
+                          onClick={() => handleCopyShelfFile(file)}
+                          onDragStart={(ev) => {
+                            isInternalShelfDragRef.current = true;
+                            setIsDragOver(false);
+                            ev.dataTransfer.effectAllowed = 'copyMove';
+                            if (file.filePath && window.electronAPI?.startFileDrag) {
+                              ev.preventDefault();
+                              window.electronAPI.startFileDrag({
+                                filePath: file.filePath,
+                                name: file.name,
+                                dataUrl: file.dataUrl,
+                              });
+                              return;
+                            }
+                            if (file.dataUrl) {
+                              const mime = file.mimeType || 'application/octet-stream';
+                              ev.dataTransfer.setData(
+                                'DownloadURL',
+                                `${mime}:${file.name}:${file.dataUrl}`
+                              );
+                            }
+                            ev.dataTransfer.setData(
+                              'text/plain',
+                              file.textContent || file.filePath || file.name
+                            );
+                          }}
+                          onDragEnd={() => {
+                            isInternalShelfDragRef.current = false;
+                            setIsDragOver(false);
+                          }}
+                          style={{
+                            animation: isDragOver
+                              ? 'shelfFileDragOverFloat 0.65s ease-in-out infinite'
+                              : 'shelfFilePopIn 320ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
+                            animationDelay: isDragOver ? `${idx * 65}ms` : `${25 + idx * 40}ms`,
+                          }}
+                          className="relative group flex flex-col items-center w-[58px] shrink-0 cursor-pointer active:cursor-grabbing py-0.5 select-none"
+                          title={`${file.name} (${file.size}) — Klik untuk copy, atau drag keluar ke aplikasi lain`}
+                        >
+                          <div
+                            className={`relative w-[46px] h-[46px] rounded-[11px] flex items-center justify-center transition-all duration-200 group-hover:scale-105 ${
+                              isDragOver
+                                ? 'ring-1 ring-[#0a84ff]/70 shadow-[0_0_14px_rgba(10,132,255,0.35)]'
+                                : ''
+                            }`}
+                          >
+                            {file.thumbnailUrl ? (
+                              <img
+                                src={file.thumbnailUrl}
+                                alt={file.name}
+                                draggable={false}
+                                className="w-[46px] h-[46px] rounded-[11px] object-cover shadow-md border border-white/10"
+                              />
+                            ) : (
+                              <div className="w-[46px] h-[46px] rounded-[11px] bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-md">
+                                <FileDocumentBadgeSvg ext={file.ext} size={36} />
+                              </div>
+                            )}
+
+                            {/* Top-Right Remove (×) Badge */}
+                            <button
+                              type="button"
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setShelfFiles((prev) => prev.filter((f) => f.id !== file.id));
+                              }}
+                              className="absolute -top-1.5 -right-1.5 w-[16px] h-[16px] rounded-full bg-[#2c2c2e] hover:bg-[#3a3a3c] border border-white/20 flex items-center justify-center text-white/80 hover:text-white shadow-md transition z-10 cursor-pointer"
+                              title="Hapus dari Shelf"
+                            >
+                              <CloseCrossSvg size={8} />
+                            </button>
+
+                            {isCopied && (
+                              <div className="absolute inset-0 rounded-[11px] bg-black/75 flex items-center justify-center text-[#30d158]">
+                                <CheckTickSvg size={18} />
+                              </div>
+                            )}
+                          </div>
+
+                          <span className="text-[10.5px] font-medium text-white/85 group-hover:text-white truncate w-full text-center mt-1.5 leading-tight">
+                            {isCopied ? 'Copied!' : truncateMiddleFileName(file.name, 11)}
+                          </span>
+                        </div>
+                      );
+                    })}
+
+                    {/* Animated Ghost Drop-Target Slot when dragging files over existing Shelf files */}
+                    {isDragOver && shelfFiles.length > 0 && shelfFiles.length < 8 && (
+                      <div
+                        style={{ animation: 'shelfGhostSlotPulse 0.8s ease-in-out infinite' }}
+                        className="relative flex flex-col items-center w-[58px] shrink-0 py-0.5 pointer-events-none select-none"
+                      >
+                        <div className="w-[46px] h-[46px] rounded-[11px] border-[1.5px] border-dashed border-[#409cff]/80 bg-[#0a84ff]/15 shadow-[0_0_16px_rgba(10,132,255,0.3)] flex items-center justify-center">
+                          <FileDocumentBadgeSvg ext={incomingDragExts[0] || 'pdf'} size={32} />
+                        </div>
+                        <span className="text-[10px] font-semibold text-[#409cff] truncate w-full text-center mt-1.5 leading-tight">
+                          Drop here
+                        </span>
+                      </div>
+                    )}
+
+                    {shelfFiles.length < 8 && !isDragOver && (
+                      <button
+                        type="button"
+                        onClick={() => shelfFileInputRef.current?.click()}
+                        title="Tambah file dari komputer"
+                        className="w-[46px] h-[46px] rounded-[11px] border border-dashed border-white/15 hover:border-white/35 bg-white/[0.02] hover:bg-white/[0.06] text-white/45 hover:text-white/85 flex items-center justify-center shrink-0 transition cursor-pointer mb-3.5"
+                      >
+                        <PlusSvg size={15} />
+                      </button>
+                    )}
+                  </div>
+                )
+              ) : shelfClips.length === 0 ? (
+                <div
+                  onClick={handleAddClipboardFromSystem}
+                  className="w-full flex-1 my-1 rounded-xl border border-dashed border-white/15 bg-white/[0.02] hover:border-white/35 hover:bg-white/[0.04] transition-all flex items-center justify-center gap-3 cursor-pointer"
+                  title="Klik atau tekan Ctrl+V untuk menyimpan teks dari Clipboard"
+                >
+                  <PlusSvg size={16} className="text-white/75" />
                   <div className="flex flex-col items-start">
-                    <span className="text-[12px] font-semibold text-white leading-tight">
-                      Drop files here or click to browse
+                    <span className="text-[11.5px] font-semibold text-white leading-tight">
+                      Paste from Clipboard
                     </span>
                     <span className="text-[10px] text-white/45 leading-tight mt-0.5">
-                      Files wait here with thumbnails until you drag them out or click to copy
+                      Click here or press Ctrl+V to pin clipboard text
                     </span>
                   </div>
                 </div>
               ) : (
-                <div className="isle-stagger-2 w-full flex-1 flex items-center justify-start gap-3.5 px-1 overflow-x-auto no-scrollbar">
-                  {shelfFiles.map((file, idx) => {
-                    const isCopied = copiedShelfId === file.id;
+                <div className="w-full flex-1 flex items-center justify-start gap-2.5 px-1 overflow-x-auto no-scrollbar">
+                  {shelfClips.map((clip) => {
+                    const isCopied = copiedShelfId === clip.id;
                     return (
                       <div
-                        key={file.id}
+                        key={clip.id}
                         draggable
-                        onClick={() => handleCopyShelfFile(file)}
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(clip.text);
+                            setCopiedShelfId(clip.id);
+                            setShelfToast('Copied!');
+                            setTimeout(() => {
+                              setCopiedShelfId((prev) => (prev === clip.id ? null : prev));
+                              setShelfToast(null);
+                            }, 1300);
+                          } catch {
+                            // ignore
+                          }
+                        }}
                         onDragStart={(ev) => {
                           isInternalShelfDragRef.current = true;
                           setIsDragOver(false);
-                          ev.dataTransfer.effectAllowed = 'copyMove';
-                          if (file.filePath && window.electronAPI?.startFileDrag) {
-                            ev.preventDefault();
-                            window.electronAPI.startFileDrag({
-                              filePath: file.filePath,
-                              name: file.name,
-                              dataUrl: file.dataUrl,
-                            });
-                            return;
-                          }
-                          if (file.dataUrl) {
-                            const mime = file.mimeType || 'application/octet-stream';
-                            ev.dataTransfer.setData(
-                              'DownloadURL',
-                              `${mime}:${file.name}:${file.dataUrl}`
-                            );
-                          }
-                          ev.dataTransfer.setData(
-                            'text/plain',
-                            file.textContent || file.filePath || file.name
-                          );
+                          ev.dataTransfer.setData('text/plain', clip.text);
+                          ev.dataTransfer.effectAllowed = 'copy';
                         }}
                         onDragEnd={() => {
                           isInternalShelfDragRef.current = false;
                           setIsDragOver(false);
                         }}
                         style={{
-                          animation: 'shelfFilePopIn 320ms cubic-bezier(0.22, 1.35, 0.36, 1) both',
-                          animationDelay: `${25 + idx * 40}ms`,
+                          animation: 'isleItemSpringIn 280ms cubic-bezier(0.22, 1, 0.36, 1) both',
                         }}
-                        className="relative group flex flex-col items-center w-[58px] shrink-0 cursor-pointer active:cursor-grabbing py-0.5 select-none"
-                        title={`${file.name} (${file.size}) — Klik untuk copy, atau drag keluar ke aplikasi lain`}
+                        className="relative group w-[112px] h-[68px] rounded-[11px] bg-white/[0.04] hover:bg-white/[0.075] border border-white/[0.06] p-2 flex flex-col justify-between shrink-0 cursor-pointer transition"
+                        title="Klik untuk copy teks, atau drag ke aplikasi lain"
                       >
-                        <div className="relative w-[46px] h-[46px] rounded-[11px] flex items-center justify-center transition-transform duration-200 group-hover:scale-105">
-                          {file.thumbnailUrl ? (
-                            <img
-                              src={file.thumbnailUrl}
-                              alt={file.name}
-                              draggable={false}
-                              className="w-[46px] h-[46px] rounded-[11px] object-cover shadow-md border border-white/10"
-                            />
-                          ) : (
-                            <div className="w-[46px] h-[46px] rounded-[11px] bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-md">
-                              <FileDocumentBadgeSvg ext={file.ext} size={36} />
-                            </div>
-                          )}
-
-                          {/* Top-Right Remove (×) Badge matching reference screenshot */}
-                          <button
-                            type="button"
-                            onClick={(ev) => {
-                              ev.stopPropagation();
-                              setShelfFiles((prev) => prev.filter((f) => f.id !== file.id));
-                            }}
-                            className="absolute -top-1.5 -right-1.5 w-[16px] h-[16px] rounded-full bg-[#2c2c2e] hover:bg-[#3a3a3c] border border-white/20 flex items-center justify-center text-white/80 hover:text-white shadow-md transition z-10 cursor-pointer"
-                            title="Hapus dari Shelf"
-                          >
-                            <CloseCrossSvg size={8} />
-                          </button>
-
-                          {isCopied && (
-                            <div className="absolute inset-0 rounded-[11px] bg-black/65 backdrop-blur-[1px] flex items-center justify-center text-[#30d158]">
-                              <CheckTickSvg size={18} />
-                            </div>
-                          )}
-                        </div>
-
-                        <span className="text-[10.5px] font-medium text-white/85 group-hover:text-white truncate w-full text-center mt-1.5 leading-tight">
-                          {isCopied ? 'Copied!' : truncateMiddleFileName(file.name, 11)}
+                        <p className="text-[10px] text-white/85 line-clamp-3 leading-snug break-words">
+                          {clip.text}
+                        </p>
+                        <span className="text-[9px] text-white/40 tabular-nums">
+                          {isCopied ? 'Copied!' : clip.timeLabel}
                         </span>
+                        <button
+                          type="button"
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            setShelfClips((prev) => prev.filter((c) => c.id !== clip.id));
+                          }}
+                          className="absolute -top-1.5 -right-1.5 w-[16px] h-[16px] rounded-full bg-[#2c2c2e] hover:bg-[#3a3a3c] border border-white/20 flex items-center justify-center text-white/80 hover:text-white shadow-md transition z-10 cursor-pointer"
+                          title="Hapus clip"
+                        >
+                          <CloseCrossSvg size={8} />
+                        </button>
                       </div>
                     );
                   })}
-
-                  {shelfFiles.length < 8 && (
+                  {shelfClips.length < 8 && (
                     <button
                       type="button"
-                      onClick={() => shelfFileInputRef.current?.click()}
-                      title="Tambah file dari komputer"
-                      className="w-[46px] h-[46px] rounded-[11px] border border-dashed border-white/15 hover:border-white/35 bg-white/[0.02] hover:bg-white/[0.06] text-white/45 hover:text-white/85 flex items-center justify-center shrink-0 transition cursor-pointer mb-3.5"
+                      onClick={handleAddClipboardFromSystem}
+                      title="Tempel teks dari Clipboard saat ini"
+                      className="w-[46px] h-[46px] rounded-[11px] border border-dashed border-white/15 hover:border-white/35 bg-white/[0.02] hover:bg-white/[0.06] text-white/45 hover:text-white/85 flex items-center justify-center shrink-0 transition cursor-pointer"
                     >
                       <PlusSvg size={15} />
                     </button>
                   )}
                 </div>
-              )
-            ) : shelfClips.length === 0 ? (
-              <div
-                onClick={handleAddClipboardFromSystem}
-                className="isle-stagger-2 w-full flex-1 my-1 rounded-xl border border-dashed border-white/20 bg-white/[0.02] hover:border-white/40 hover:bg-white/[0.04] transition-all flex items-center justify-center gap-3 cursor-pointer"
-                title="Klik atau tekan Ctrl+V untuk menyimpan teks dari Clipboard"
-              >
-                <PlusSvg size={16} className="text-white/75" />
-                <div className="flex flex-col items-start">
-                  <span className="text-[12px] font-semibold text-white leading-tight">
-                    Paste from Clipboard
-                  </span>
-                  <span className="text-[10px] text-white/45 leading-tight mt-0.5">
-                    Click here or press Ctrl+V to pin clipboard text
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <div className="isle-stagger-2 w-full flex-1 flex items-center justify-start gap-2.5 px-1 overflow-x-auto no-scrollbar">
-                {shelfClips.map((clip) => {
-                  const isCopied = copiedShelfId === clip.id;
-                  return (
-                    <div
-                      key={clip.id}
-                      draggable
-                      onClick={async () => {
-                        try {
-                          await navigator.clipboard.writeText(clip.text);
-                          setCopiedShelfId(clip.id);
-                          setShelfToast('Copied!');
-                          setTimeout(() => {
-                            setCopiedShelfId((prev) => (prev === clip.id ? null : prev));
-                            setShelfToast(null);
-                          }, 1300);
-                        } catch {
-                          // ignore
-                        }
-                      }}
-                      onDragStart={(ev) => {
-                        isInternalShelfDragRef.current = true;
-                        setIsDragOver(false);
-                        ev.dataTransfer.setData('text/plain', clip.text);
-                        ev.dataTransfer.effectAllowed = 'copy';
-                      }}
-                      onDragEnd={() => {
-                        isInternalShelfDragRef.current = false;
-                        setIsDragOver(false);
-                      }}
-                      className="relative group w-[112px] h-[68px] rounded-[11px] bg-[#161618] hover:bg-[#1f1f22] border border-white/[0.07] p-2 flex flex-col justify-between shrink-0 cursor-pointer transition"
-                      title="Klik untuk copy teks, atau drag ke aplikasi lain"
-                    >
-                      <p className="text-[10px] text-white/85 line-clamp-3 leading-snug break-words">
-                        {clip.text}
-                      </p>
-                      <span className="text-[9px] text-white/40 tabular-nums">
-                        {isCopied ? 'Copied!' : clip.timeLabel}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          setShelfClips((prev) => prev.filter((c) => c.id !== clip.id));
-                        }}
-                        className="absolute -top-1.5 -right-1.5 w-[16px] h-[16px] rounded-full bg-[#2c2c2e] hover:bg-[#3a3a3c] border border-white/20 flex items-center justify-center text-white/80 hover:text-white shadow-md transition z-10 cursor-pointer"
-                        title="Hapus clip"
-                      >
-                        <CloseCrossSvg size={8} />
-                      </button>
-                    </div>
-                  );
-                })}
-                {shelfClips.length < 8 && (
-                  <button
-                    type="button"
-                    onClick={handleAddClipboardFromSystem}
-                    title="Tempel teks dari Clipboard saat ini"
-                    className="w-[46px] h-[46px] rounded-[11px] border border-dashed border-white/15 hover:border-white/35 bg-white/[0.02] hover:bg-white/[0.06] text-white/45 hover:text-white/85 flex items-center justify-center shrink-0 transition cursor-pointer"
-                  >
-                    <PlusSvg size={15} />
-                  </button>
-                )}
-              </div>
-            )}
+              )}
+            </div>
 
-            {/* Active Drag-Over Overlay ("Release to add") */}
+            {/* Active Drag-Over Overlay with Animated Fanned File Icons */}
             {isDragOver && (
-              <div className="absolute inset-x-8 inset-y-1 z-20 rounded-xl border-[1.5px] border-dashed border-white/65 bg-black/80 backdrop-blur-[2px] flex flex-col items-center justify-center pointer-events-none animate-[isleFadeIn_140ms_ease-out]">
-                <div
-                  className="text-white mb-1"
-                  style={{ animation: 'shelfTrayBounce 0.9s ease-in-out infinite' }}
-                >
-                  <ShelfTraySvg size={22} />
+              <div className="absolute inset-x-8 inset-y-1 z-20 rounded-xl border-[1.5px] border-dashed border-[#409cff]/80 bg-black/80 flex flex-col items-center justify-center pointer-events-none animate-[isleFadeIn_140ms_ease-out] shadow-[inset_0_0_28px_rgba(10,132,255,0.18)]">
+                <div className="relative flex items-center justify-center h-[52px] w-[110px] mb-1">
+                  {/* Expanding sonar pulse ring behind the fanned file icons */}
+                  <div
+                    style={{ animation: 'shelfDropRingExpand 1.35s ease-out infinite' }}
+                    className="absolute w-[48px] h-[48px] rounded-2xl border border-[#409cff]/55 bg-[#0a84ff]/10"
+                  />
+
+                  {/* Left fanned file icon */}
+                  <div
+                    style={{ animation: 'shelfDropFanLeft 1.1s ease-in-out infinite' }}
+                    className="absolute flex items-center justify-center w-[38px] h-[38px] rounded-[10px] bg-[#1c1c1e]/95 border border-white/15 shadow-lg"
+                  >
+                    <FileDocumentBadgeSvg
+                      ext={incomingDragExts[1] || incomingDragExts[0] || 'img'}
+                      size={28}
+                    />
+                  </div>
+
+                  {/* Right fanned file icon */}
+                  <div
+                    style={{ animation: 'shelfDropFanRight 1.1s ease-in-out infinite' }}
+                    className="absolute flex items-center justify-center w-[38px] h-[38px] rounded-[10px] bg-[#1c1c1e]/95 border border-white/15 shadow-lg"
+                  >
+                    <FileDocumentBadgeSvg
+                      ext={incomingDragExts[2] || incomingDragExts[0] || 'docx'}
+                      size={28}
+                    />
+                  </div>
+
+                  {/* Center foreground file icon */}
+                  <div
+                    style={{ animation: 'shelfDropFanCenter 1.1s ease-in-out infinite' }}
+                    className="relative z-10 flex items-center justify-center w-[42px] h-[42px] rounded-[11px] bg-[#242426] border border-[#409cff]/65 shadow-[0_6px_18px_rgba(10,132,255,0.38)]"
+                  >
+                    <FileDocumentBadgeSvg ext={incomingDragExts[0] || 'pdf'} size={32} />
+
+                    {/* Floating + / count badge */}
+                    <div
+                      style={{ animation: 'shelfDropBadgeFloat 0.95s ease-in-out infinite' }}
+                      className="absolute -top-2 -right-2 min-w-[18px] h-[18px] px-1 rounded-full bg-[#0a84ff] border border-white/30 text-white text-[10px] font-bold flex items-center justify-center shadow-md"
+                    >
+                      +{incomingDragCount > 1 ? incomingDragCount : ''}
+                    </div>
+                  </div>
                 </div>
-                <div className="text-[12.5px] font-semibold text-white tracking-tight">
-                  Release to add to Shelf
+
+                <div className="text-[12px] font-semibold text-white tracking-tight flex items-center gap-1.5">
+                  <span>
+                    Release to drop {incomingDragCount > 1 ? `${incomingDragCount} files` : 'file'} into Shelf
+                  </span>
                 </div>
               </div>
             )}
@@ -7644,7 +8253,7 @@ export default function App() {
             className="w-full h-full flex items-stretch justify-between px-9 py-0.5 gap-4 overflow-hidden"
           >
             {/* Compact Left Calendar Grid (Fits 6 weeks cleanly inside 170px uniform island height with zero clipping) */}
-            <div className="isle-stagger-1 w-[162px] shrink-0 flex flex-col justify-between py-0.5">
+            <div className="isle-stagger-1 w-[158px] shrink-0 flex flex-col justify-between py-0.5">
               <div className="flex items-center justify-between leading-none">
                 <div
                   onClick={() => {
@@ -7656,9 +8265,9 @@ export default function App() {
                   className="text-[10px] font-bold tracking-wider cursor-pointer"
                 >
                   <span className="text-[#ff453a]">{MONTH_NAMES[calMonth]}</span>{' '}
-                  <span className="text-white/50 font-semibold">{calYear}</span>
+                  <span className="text-white/45 font-semibold tabular-nums">{calYear}</span>
                 </div>
-                <div className="flex items-center gap-1 text-white/60">
+                <div className="flex items-center gap-1 text-white/55">
                   <button
                     onClick={() => {
                       if (calMonth === 0) {
@@ -7668,7 +8277,7 @@ export default function App() {
                         setCalMonth((m) => m - 1);
                       }
                     }}
-                    className="hover:text-white transition p-0.5"
+                    className="hover:text-white transition p-0.5 cursor-pointer"
                   >
                     <ChevronLeftSvg size={10} />
                   </button>
@@ -7681,14 +8290,14 @@ export default function App() {
                         setCalMonth((m) => m + 1);
                       }
                     }}
-                    className="hover:text-white transition p-0.5"
+                    className="hover:text-white transition p-0.5 cursor-pointer"
                   >
                     <ChevronRightSvg size={10} />
                   </button>
                 </div>
               </div>
 
-              <div className="grid grid-cols-7 text-center text-[8.5px] font-semibold text-white/40 leading-none my-0.5">
+              <div className="grid grid-cols-7 text-center text-[8.5px] font-semibold text-white/35 leading-none my-0.5">
                 <span>S</span>
                 <span>M</span>
                 <span>T</span>
@@ -7714,9 +8323,9 @@ export default function App() {
                     <button
                       key={idx}
                       onClick={() => setSelectedDay(day)}
-                      className={`relative h-[14.5px] w-[14.5px] mx-auto rounded-full flex flex-col items-center justify-center text-[9px] font-semibold transition ${
+                      className={`relative h-[14.5px] w-[14.5px] mx-auto rounded-full flex flex-col items-center justify-center text-[9px] font-semibold transition-all duration-150 cursor-pointer ${
                         isToday
-                          ? 'bg-[#ff453a] text-white font-bold'
+                          ? 'bg-[#ff453a] text-white font-bold shadow-xs'
                           : isSelected
                           ? 'bg-white/20 text-white'
                           : isWeekend
@@ -7738,200 +8347,307 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right Column: Events, Smart Alarms & World Clocks */}
+            {/* Right Column: Sliding Pill [Events | Alarms] Switcher + Unified Capsule Composer + Fluid Rows */}
             <div className="isle-stagger-2 flex-1 min-w-0 flex flex-col justify-between py-0.5 overflow-hidden">
-              <div className="flex items-center justify-between gap-1.5 shrink-0 whitespace-nowrap leading-none">
-                <div className="flex items-center gap-1.5 shrink-0">
+              <div className="flex items-center justify-between gap-2 shrink-0 whitespace-nowrap leading-none">
+                {/* Sliding Pill Segmented Control for Events vs Alarms */}
+                <div className="relative inline-grid grid-cols-2 items-center rounded-full bg-white/[0.05] border border-white/[0.07] p-0.5">
+                  <div
+                    className={`
+                      pointer-events-none absolute top-0.5 bottom-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-white/[0.15] shadow-xs
+                      transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]
+                      ${calendarSubTab === 'alarms' ? 'translate-x-full' : 'translate-x-0'}
+                    `}
+                  />
                   <button
-                    onClick={() => setCalendarSubTab('events')}
-                    className={`text-[11px] font-bold tracking-tight transition whitespace-nowrap ${
+                    type="button"
+                    onClick={() => handleSwitchCalendarSubTab('events')}
+                    className={`relative z-10 px-2.5 py-[3px] rounded-full text-[10px] font-semibold tracking-tight transition-colors duration-200 cursor-pointer whitespace-nowrap tabular-nums ${
                       calendarSubTab === 'events'
                         ? 'text-white'
-                        : 'text-white/40 hover:text-white/70'
+                        : 'text-white/45 hover:text-white/80'
                     }`}
                   >
-                    Events ({selectedDayEvents.length})
+                    Events · {selectedDayEvents.length}
                   </button>
-                  <span className="text-white/20 select-none text-[10px]">|</span>
                   <button
-                    onClick={() => setCalendarSubTab('alarms')}
-                    className={`flex items-center gap-1 text-[11px] font-bold tracking-tight transition whitespace-nowrap ${
+                    type="button"
+                    onClick={() => handleSwitchCalendarSubTab('alarms')}
+                    className={`relative z-10 flex items-center justify-center gap-1 px-2.5 py-[3px] rounded-full text-[10px] font-semibold tracking-tight transition-colors duration-200 cursor-pointer whitespace-nowrap tabular-nums ${
                       calendarSubTab === 'alarms'
-                        ? 'text-[#ff9f0a]'
-                        : 'text-white/40 hover:text-white/70'
+                        ? 'text-white'
+                        : 'text-white/45 hover:text-white/80'
                     }`}
                   >
-                    <AlarmBellSvg size={10} />
-                    <span>Alarms ({smartAlarms.length})</span>
+                    <span>Alarms · {smartAlarms.length}</span>
                   </button>
                 </div>
 
                 <button
+                  type="button"
                   onClick={() => setShowWorldClocks((w) => !w)}
                   title={showWorldClocks ? 'Sembunyikan Jam Dunia' : 'Tampilkan Jam Dunia'}
-                  className={`p-0.5 rounded transition shrink-0 ${
+                  className={`w-5 h-5 rounded-full flex items-center justify-center transition-all duration-200 shrink-0 cursor-pointer ${
                     showWorldClocks
-                      ? 'bg-white/15 text-white'
-                      : 'text-white/45 hover:text-white/80'
+                      ? 'bg-white/16 text-white'
+                      : 'text-white/45 hover:text-white/85 hover:bg-white/[0.06]'
                   }`}
                 >
-                  <GlobeTimezoneSvg size={12} />
+                  <GlobeTimezoneSvg size={11.5} />
                 </button>
               </div>
 
-              {calendarSubTab === 'events' ? (
-                <>
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      handleAddCalendarEvent(newEventInput);
-                    }}
-                    className="isle-stagger-3 flex items-center gap-1.5 bg-white/[0.06] border border-white/[0.08] rounded-full px-2.5 py-0.5 my-1 shrink-0"
-                  >
-                    <span className="text-white/45">
-                      <PlusSvg size={10} />
-                    </span>
-                    <input
-                      type="text"
-                      value={newEventInput}
-                      onChange={(e) => setNewEventInput(e.target.value)}
-                      placeholder="Add event · e.g. Dinner 20:00"
-                      className="flex-1 min-w-0 bg-transparent text-[10.5px] text-white placeholder-white/35 focus:outline-none"
-                    />
-                  </form>
-
-                  <div className="isle-stagger-3 flex-1 min-h-0 space-y-1 overflow-y-auto no-scrollbar">
-                    {selectedDayEvents.length === 0 ? (
-                      <div className="text-[10.5px] text-white/35 py-0.5 truncate">
-                        No events scheduled for this day
-                      </div>
-                    ) : (
-                      selectedDayEvents.map((ev) => (
-                        <div
-                          key={ev.id}
-                          className="group flex items-center justify-between bg-[#2b1e0e] hover:bg-[#352512] rounded-lg px-2 py-0.5 transition"
-                        >
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <span className="w-[2.5px] h-3 rounded-full bg-[#ff9f0a] shrink-0" />
-                            <span className="text-[10.5px] font-bold text-white truncate">
-                              {ev.title}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-1 shrink-0">
-                            <span className="text-[10px] text-white/65 tabular-nums">{ev.time}</span>
-                            <button
-                              onClick={() =>
-                                setEventsByDate((prev) => ({
-                                  ...prev,
-                                  [currentDateKey]: (prev[currentDateKey] || []).filter(
-                                    (item) => item.id !== ev.id
-                                  ),
-                                }))
-                              }
-                              className="hidden group-hover:inline-flex text-white/45 hover:text-white"
-                            >
-                              <CloseCrossSvg size={9} />
-                            </button>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      handleAddSmartAlarm(newAlarmTime, newAlarmTitle);
-                    }}
-                    className="flex items-center gap-1 bg-[#1c1c21] border border-white/[0.08] rounded-full px-2 py-0.5 my-1 shrink-0"
-                  >
-                    <input
-                      type="time"
-                      value={newAlarmTime}
-                      onChange={(e) => setNewAlarmTime(e.target.value)}
-                      className="bg-white/10 text-white text-[10px] font-mono font-semibold rounded px-1 py-0.2 focus:outline-none shrink-0"
-                      title="Waktu alarm (HH:mm)"
-                    />
-                    <input
-                      type="text"
-                      value={newAlarmTitle}
-                      onChange={(e) => setNewAlarmTitle(e.target.value)}
-                      placeholder="Nama alarm..."
-                      className="flex-1 min-w-0 bg-transparent text-[10.5px] text-white placeholder-white/35 focus:outline-none px-1"
-                    />
-                    <button
-                      type="submit"
-                      className="px-2 py-0.5 rounded-full bg-[#ff9f0a] hover:bg-[#ff9000] text-black text-[9.5px] font-bold transition shrink-0"
+              {/* Directional Spring Sub-Tab Content Container */}
+              <div
+                key={calendarSubTab}
+                style={{
+                  animation: `${
+                    calendarTabDir === 'right' ? 'isleSubTabInRight' : 'isleSubTabInLeft'
+                  } 240ms cubic-bezier(0.22, 1, 0.36, 1) both`,
+                }}
+                className="flex-1 min-h-0 flex flex-col justify-between overflow-hidden"
+              >
+                {calendarSubTab === 'events' ? (
+                  <>
+                    {/* Unified Minimalist Capsule Composer for Events */}
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const raw = newEventInput.trim();
+                        if (!raw) return;
+                        const hasInlineTime = /\b\d{1,2}[:.]\d{2}\b/.test(raw);
+                        handleAddCalendarEvent(
+                          hasInlineTime ? raw : `${raw} ${newEventTime || '09:00'}`
+                        );
+                      }}
+                      className="flex items-center gap-1.5 rounded-full bg-[#14151b] hover:bg-[#181a22] focus-within:bg-[#1b1d26] border border-white/[0.09] focus-within:border-white/25 pl-2.5 pr-1 py-[2.5px] my-1 shrink-0 transition-all duration-200"
                     >
-                      + Set
-                    </button>
-                  </form>
+                      <input
+                        type="time"
+                        value={newEventTime}
+                        onChange={(e) => setNewEventTime(e.target.value)}
+                        style={{ colorScheme: 'dark' }}
+                        title="Waktu event (HH:mm)"
+                        className="isle-capsule-time bg-transparent text-white/80 hover:text-white text-[10px] font-mono font-medium tabular-nums focus:outline-none shrink-0"
+                      />
+                      <span className="w-[1px] h-3 bg-white/[0.1] shrink-0" />
+                      <input
+                        type="text"
+                        value={newEventInput}
+                        onChange={(e) => setNewEventInput(e.target.value)}
+                        placeholder="Nama agenda..."
+                        className="flex-1 min-w-0 bg-transparent text-[10.5px] text-white placeholder-white/35 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        title="Tambah agenda"
+                        className="w-5 h-5 rounded-full bg-white text-black hover:bg-white/90 active:scale-90 flex items-center justify-center transition-all duration-150 shrink-0 cursor-pointer"
+                      >
+                        <PlusSvg size={9.5} />
+                      </button>
+                    </form>
 
-                  <div className="flex-1 min-h-0 space-y-1 overflow-y-auto no-scrollbar">
-                    {smartAlarms.length === 0 ? (
-                      <div className="text-[10.5px] text-white/35 py-0.5 flex items-center gap-1">
-                        <AlarmBellSvg size={11} />
-                        <span className="truncate">Belum ada alarm aktif</span>
-                      </div>
-                    ) : (
-                      smartAlarms.map((a) => (
-                        <div
-                          key={a.id}
-                          className={`group flex items-center justify-between rounded-lg px-2 py-0.5 transition ${
-                            a.enabled
-                              ? 'bg-[#2b1e0e] hover:bg-[#352512]'
-                              : 'bg-white/[0.03] hover:bg-white/[0.06] opacity-60'
-                          }`}
-                        >
-                          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                            <span
-                              className={`w-[2.5px] h-3 rounded-full shrink-0 ${
-                                a.enabled ? 'bg-[#ff9f0a]' : 'bg-white/30'
-                              }`}
-                            />
-                            <span className="text-[10.5px] font-bold text-white tabular-nums shrink-0">
-                              {a.time}
-                            </span>
-                            <span className="text-[10px] text-white/70 truncate flex-1">
-                              {a.title}
-                            </span>
-                          </div>
-
-                          <div className="flex items-center gap-1.5 shrink-0">
-                            <button
-                              onClick={() => handleToggleAlarm(a.id)}
-                              className={`w-5 h-3 rounded-full p-0.5 transition ${
-                                a.enabled ? 'bg-[#ff9f0a]' : 'bg-white/20'
-                              }`}
-                            >
-                              <div
-                                className={`w-2 h-2 rounded-full bg-white transition-transform ${
-                                  a.enabled ? 'translate-x-2' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteAlarm(a.id)}
-                              className="text-white/40 hover:text-white transition"
-                            >
-                              <CloseCrossSvg size={9} />
-                            </button>
-                          </div>
+                    <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar pr-0.5">
+                      {selectedDayEvents.length === 0 ? (
+                        <div className="text-[10.5px] text-white/35 py-1 truncate">
+                          Belum ada agenda di tanggal ini
                         </div>
-                      ))
-                    )}
-                  </div>
-                </>
-              )}
+                      ) : (
+                        selectedDayEvents.map((ev) => {
+                          const isExiting = exitingEventIds.has(ev.id);
+                          return (
+                            <div
+                              key={ev.id}
+                              className={`isle-collapse-row mb-1 last:mb-0 ${
+                                isExiting ? 'is-exiting' : ''
+                              }`}
+                            >
+                              <div className="isle-collapse-inner">
+                                <div
+                                  style={{
+                                    animation:
+                                      'isleItemSpringIn 280ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                                  }}
+                                  className="group flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.075] border border-white/[0.05] rounded-xl px-2.5 py-1 transition-colors duration-200"
+                                >
+                                  <div className="flex items-center gap-1.5 min-w-0 flex-1 pr-2">
+                                    { editingCalEventId === ev.id ? (
+                                      <input
+                                        type="time"
+                                        autoFocus
+                                        value={ev.time || '09:00'}
+                                        onChange={(e) => {
+                                          handleUpdateCalendarEventTime(
+                                            currentDateKey,
+                                            ev.id,
+                                            e.target.value
+                                          );
+                                        }}
+                                        onBlur={() => setEditingCalEventId(null)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter' || e.key === 'Escape') {
+                                            setEditingCalEventId(null);
+                                          }
+                                        }}
+                                        style={{ colorScheme: 'dark' }}
+                                        className="isle-capsule-time bg-white/10 rounded px-1 py-0.2 text-[10px] font-mono text-white tabular-nums focus:outline-none shrink-0"
+                                      />
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingCalEventId(ev.id)}
+                                        title="Klik untuk ubah jam (sinkron otomatis ke Task)"
+                                        className="text-[10.5px] font-mono font-semibold text-white/85 hover:text-white tabular-nums shrink-0 cursor-pointer transition-colors"
+                                      >
+                                        {ev.time}
+                                      </button>
+                                    )}
+                                    <span className="text-white/25 text-[10px] select-none">·</span>
+                                    <span className="text-[10.5px] font-medium text-white/90 truncate">
+                                      {ev.title}
+                                    </span>
+                                    {ev.isTaskSync && (
+                                      <span className="text-[9.5px] text-white/35 shrink-0">
+                                        · Task
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveCalendarEvent(currentDateKey, ev)}
+                                    className="opacity-0 group-hover:opacity-100 w-4 h-4 rounded-full hover:bg-white/12 flex items-center justify-center text-white/40 hover:text-white transition-all duration-150 active:scale-90 shrink-0 cursor-pointer"
+                                    title="Hapus event"
+                                  >
+                                    <CloseCrossSvg size={8.5} />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* Unified Minimalist Capsule Composer for Smart Alarms (Screenshot 2 Redesign) */}
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        handleAddSmartAlarm(newAlarmTime, newAlarmTitle);
+                      }}
+                      className="flex items-center gap-1.5 rounded-full bg-[#14151b] hover:bg-[#181a22] focus-within:bg-[#1b1d26] border border-white/[0.09] focus-within:border-white/25 pl-2.5 pr-1 py-[2.5px] my-1 shrink-0 transition-all duration-200"
+                    >
+                      <input
+                        type="time"
+                        value={newAlarmTime}
+                        onChange={(e) => setNewAlarmTime(e.target.value)}
+                        style={{ colorScheme: 'dark' }}
+                        className="isle-capsule-time bg-transparent text-white/85 hover:text-white text-[10px] font-mono font-medium tabular-nums focus:outline-none shrink-0"
+                        title="Waktu alarm (HH:mm)"
+                      />
+                      <span className="w-[1px] h-3 bg-white/[0.1] shrink-0" />
+                      <input
+                        type="text"
+                        value={newAlarmTitle}
+                        onChange={(e) => setNewAlarmTitle(e.target.value)}
+                        placeholder="Nama alarm..."
+                        className="flex-1 min-w-0 bg-transparent text-[10.5px] text-white placeholder-white/35 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        title="Tambah Alarm"
+                        className="w-5 h-5 rounded-full bg-white text-black hover:bg-white/90 active:scale-90 flex items-center justify-center transition-all duration-150 shrink-0 cursor-pointer"
+                      >
+                        <PlusSvg size={9.5} />
+                      </button>
+                    </form>
+
+                    <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar pr-0.5">
+                      {smartAlarms.length === 0 ? (
+                        <div className="text-[10.5px] text-white/35 py-1 flex items-center gap-1.5">
+                          <AlarmBellSvg size={11} />
+                          <span className="truncate">Belum ada alarm aktif</span>
+                        </div>
+                      ) : (
+                        smartAlarms.map((a) => {
+                          const isExiting = exitingAlarmIds.has(a.id);
+                          return (
+                            <div
+                              key={a.id}
+                              className={`isle-collapse-row mb-1 last:mb-0 ${
+                                isExiting ? 'is-exiting' : ''
+                              }`}
+                            >
+                              <div className="isle-collapse-inner">
+                                <div
+                                  style={{
+                                    animation:
+                                      'isleItemSpringIn 280ms cubic-bezier(0.22, 1, 0.36, 1) both',
+                                  }}
+                                  className={`group flex items-center justify-between rounded-xl px-2.5 py-1 border transition-all duration-200 ${
+                                    a.enabled
+                                      ? 'bg-white/[0.045] hover:bg-white/[0.08] border-white/[0.06]'
+                                      : 'bg-white/[0.02] hover:bg-white/[0.04] border-white/[0.03] opacity-55'
+                                  }`}
+                                >
+                                  <div className="flex items-center gap-1.5 min-w-0 flex-1 pr-2">
+                                    <span
+                                      className={`text-[10.5px] font-mono font-semibold tabular-nums shrink-0 transition-colors ${
+                                        a.enabled ? 'text-white' : 'text-white/50'
+                                      }`}
+                                    >
+                                      {a.time}
+                                    </span>
+                                    <span className="text-white/25 text-[10px] select-none">·</span>
+                                    <span className="text-[10.5px] text-white/75 truncate flex-1">
+                                      {a.title}
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {/* Round iOS/macOS Minimalist Toggle Switch */}
+                                    <button
+                                      type="button"
+                                      onClick={() => handleToggleAlarm(a.id)}
+                                      className={`w-6 h-3.5 rounded-full p-0.5 transition-colors duration-200 cursor-pointer shrink-0 ${
+                                        a.enabled ? 'bg-[#30d158]' : 'bg-white/15'
+                                      }`}
+                                      title={a.enabled ? 'Matikan alarm' : 'Aktifkan alarm'}
+                                    >
+                                      <div
+                                        className={`w-2.5 h-2.5 rounded-full bg-white shadow-xs transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                                          a.enabled ? 'translate-x-2.5' : 'translate-x-0'
+                                        }`}
+                                      />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteAlarm(a.id)}
+                                      className="opacity-0 group-hover:opacity-100 w-4 h-4 rounded-full hover:bg-white/12 flex items-center justify-center text-white/40 hover:text-white transition-all duration-150 active:scale-90 cursor-pointer"
+                                      title="Hapus alarm"
+                                    >
+                                      <CloseCrossSvg size={8.5} />
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
 
               {showWorldClocks && (
-                <div className="pt-0.5 mt-0.5 border-t border-white/10 flex items-center justify-between text-[9.5px] tabular-nums shrink-0">
+                <div className="pt-0.5 mt-0.5 border-t border-white/[0.07] flex items-center justify-between text-[9.5px] tabular-nums shrink-0 animate-[isleFadeIn_160ms_ease-out]">
                   {worldClocks.map((wc) => (
                     <div key={wc.city} className="flex items-center gap-1">
-                      <span className="text-white/45">{wc.city}</span>
-                      <span className="text-white font-bold">{wc.time}</span>
+                      <span className="text-white/40">{wc.city}</span>
+                      <span className="text-white/90 font-semibold font-mono">{wc.time}</span>
                     </div>
                   ))}
                 </div>
@@ -8880,8 +9596,8 @@ export default function App() {
             <div
               className={`absolute inset-x-0 top-0 h-[32px] w-full max-w-[164px] mx-auto flex items-center justify-between px-3.5 text-white transition-all duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                 !isExpanded && !(miniCapsuleMode && !topEdgeHover)
-                  ? 'opacity-100 scale-100 blur-0 pointer-events-auto z-20'
-                  : 'opacity-0 scale-90 blur-[4px] pointer-events-none z-0'
+                  ? 'opacity-100 scale-100 pointer-events-auto z-20'
+                  : 'opacity-0 scale-90 pointer-events-none z-0'
               }`}
             >
               <div className="flex items-center gap-1.5">
@@ -8930,17 +9646,17 @@ export default function App() {
                     type="button"
                     onClick={() =>
                       setAssistantModel((m) =>
-                        m === 'agnes-3.0-flash' || m === 'agnes-2.5-flash'
-                          ? 'muse-spark-1.3-contributor'
-                          : 'agnes-3.0-flash'
+                        m === 'gemini-3.8-flash'
+                          ? 'gemini-3.8-flash-thinking'
+                          : 'gemini-3.8-flash'
                       )
                     }
-                    title="Klik untuk beralih mode model: Agnes (Fast + Web) / Muse Spark (Deep Think)"
+                    title="Klik untuk beralih mode model: Fast / Thinking (Low)"
                     className="text-[11.5px] text-white/50 hover:text-white transition tracking-tight font-normal cursor-pointer select-none"
                   >
-                    {assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                      ? 'Agnes Fast'
-                      : 'Muse Spark'}
+                    {assistantModel === 'gemini-3.8-flash'
+                      ? 'Fast'
+                      : 'Thinking (Low)'}
                   </button>
 
                   {voiceListening && (
@@ -9000,8 +9716,8 @@ export default function App() {
                       label={
                         agentHeadline ||
                         (assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
-                          ? 'Agnes sedang mencari informasi & merespons...'
-                          : 'Muse Spark sedang berpikir mendalam...')
+                          ? 'Sedang mencari informasi & merespons...'
+                          : 'Sedang berpikir mendalam...')
                       }
                     />
                   </div>
@@ -9215,7 +9931,7 @@ export default function App() {
                   className="hidden"
                 />
 
-                <div className="w-full flex items-center bg-white/[0.08] hover:bg-white/[0.10] focus-within:bg-white/[0.12] border border-white/15 focus-within:border-white/30 backdrop-blur-xl shadow-[0_4px_24px_rgba(0,0,0,0.35)] rounded-full pl-2 pr-1.5 py-1 gap-1.5 transition duration-200">
+                <div className="w-full flex items-center bg-[#181a22] hover:bg-[#1e202a] focus-within:bg-[#222530] border border-white/15 focus-within:border-white/30 shadow-[0_4px_24px_rgba(0,0,0,0.35)] rounded-full pl-2 pr-1.5 py-1 gap-1.5 transition duration-200">
                   {/* Left Interactive Bot Avatar */}
                   <div
                     onClick={() => startBrowserVoiceRecognition()}
@@ -9291,7 +10007,7 @@ export default function App() {
                         ? 'Tanya tentang gambar ini... (Enter)'
                         : assistantModel === 'agnes-3.0-flash' || assistantModel === 'agnes-2.5-flash'
                         ? 'Tanya info terkini atau perintahkan laptop... (Enter)'
-                        : 'Mulai analisis mendalam bersama Muse Spark... (Enter)'
+                        : 'Mulai analisis mendalam... (Enter)'
                     }
                     className="flex-1 bg-transparent text-[12px] text-white placeholder-white/40 focus:outline-none min-w-0 font-normal px-1"
                   />
@@ -9345,8 +10061,8 @@ export default function App() {
               }}
               className={`relative w-full h-full flex flex-col justify-between text-white origin-top transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                 isExpanded
-                  ? 'opacity-100 scale-100 translate-y-0 blur-0 pointer-events-auto'
-                  : 'opacity-0 scale-[0.84] -translate-y-3 blur-[6px] pointer-events-none'
+                  ? 'opacity-100 scale-100 translate-y-0 pointer-events-auto'
+                  : 'opacity-0 scale-[0.84] -translate-y-3 pointer-events-none'
               }`}
             >
               {/* ── Top Header Row on Non-Music Pages (Clean Title / Weather City Search on Left + Battery, Date & Clock on Right) ── */}
@@ -9589,8 +10305,8 @@ export default function App() {
                 onClick={goPrevPage}
                 className={`absolute left-[10px] top-[48%] -translate-y-1/2 z-30 w-[21px] h-[21px] rounded-full bg-[#3a3a3c] hover:bg-[#48484a] flex items-center justify-center cursor-pointer transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-90 ${
                   (activePage === 'music' && lyricsMode) || settingsOpen
-                    ? 'opacity-0 scale-75 -translate-x-2 blur-[2px] pointer-events-none'
-                    : 'opacity-100 scale-100 translate-x-0 blur-0 pointer-events-auto'
+                    ? 'opacity-0 scale-75 -translate-x-2 pointer-events-none'
+                    : 'opacity-100 scale-100 translate-x-0 pointer-events-auto'
                 }`}
                 title="Previous Slide"
                 aria-label="Previous Slide"
@@ -9612,8 +10328,8 @@ export default function App() {
                 onClick={goNextPage}
                 className={`absolute right-[10px] top-[48%] -translate-y-1/2 z-30 w-[21px] h-[21px] rounded-full bg-[#3a3a3c] hover:bg-[#48484a] flex items-center justify-center cursor-pointer transition-all duration-350 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-90 ${
                   (activePage === 'music' && lyricsMode) || settingsOpen
-                    ? 'opacity-0 scale-75 translate-x-2 blur-[2px] pointer-events-none'
-                    : 'opacity-100 scale-100 translate-x-0 blur-0 pointer-events-auto'
+                    ? 'opacity-0 scale-75 translate-x-2 pointer-events-none'
+                    : 'opacity-100 scale-100 translate-x-0 pointer-events-auto'
                 }`}
                 title="Next Slide"
                 aria-label="Next Slide"
@@ -9632,148 +10348,211 @@ export default function App() {
                 </svg>
               </button>
 
-              {/* ── Quick Settings Overlay (Alt+Q Mode + Auto-Close Speed + FLAC Lossless + Mood Shuffle + Done) ── */}
+              {/* ── Quick Settings Overlay (Minimalist Sliding Pill Controls & Round iOS/macOS Toggles — Zero Boxy Clutter) ── */}
               {settingsOpen ? (
                 <div
                   onClick={(e) => e.stopPropagation()}
-                  className="flex-1 flex flex-col justify-center gap-1.5 px-7 py-1 animate-[isleFadeIn_180ms_ease-out]"
+                  className="flex-1 flex flex-col justify-between px-8 py-1 animate-[isleFadeIn_180ms_ease-out] select-none"
                 >
-                  {/* Row 1: Shortcut Alt + Q */}
-                  <div className="isle-stagger-1 flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-2.5 py-1.5">
-                    <div className="flex flex-col">
-                      <span className="text-[10.5px] font-semibold text-white tracking-tight leading-tight">
-                        Shortcut Alt + Q
-                      </span>
-                      <span className="text-[9px] text-white/45 leading-tight">
-                        Mode saat buka Isle Assistant
-                      </span>
+                  <div className="divide-y divide-white/[0.06]">
+                    {/* Row 1: Shortcut Alt + Q (Sliding Pill Segmented Control) */}
+                    <div className="isle-stagger-1 flex items-center justify-between py-1.5">
+                      <div className="flex flex-col">
+                        <span className="text-[11px] font-semibold text-white tracking-tight leading-tight">
+                          Shortcut Alt + Q
+                        </span>
+                        <span className="text-[9.5px] text-white/40 leading-tight mt-0.5">
+                          Mode saat buka Isle Assistant
+                        </span>
+                      </div>
+                      <div className="relative inline-grid grid-cols-2 items-center rounded-full bg-white/[0.06] border border-white/[0.07] p-0.5 w-[108px]">
+                        <div
+                          className={`
+                            pointer-events-none absolute top-0.5 bottom-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-white shadow-xs
+                            transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]
+                            ${defaultAltQMode === 'voice-pill' ? 'translate-x-full' : 'translate-x-0'}
+                          `}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setDefaultAltQMode('conversation')}
+                          className={`relative z-10 py-[2px] text-[10px] font-semibold transition-colors duration-200 cursor-pointer text-center ${
+                            defaultAltQMode === 'conversation'
+                              ? 'text-black'
+                              : 'text-white/55 hover:text-white'
+                          }`}
+                        >
+                          Type
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDefaultAltQMode('voice-pill')}
+                          className={`relative z-10 py-[2px] text-[10px] font-semibold transition-colors duration-200 cursor-pointer text-center ${
+                            defaultAltQMode === 'voice-pill'
+                              ? 'text-black'
+                              : 'text-white/55 hover:text-white'
+                          }`}
+                        >
+                          Voice
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center bg-black/60 border border-white/10 rounded-[4px] p-0.5 text-[9.5px]">
+
+                    {/* Row 2: Kecepatan Tutup Island (5-Slot Sliding Pill Segmented Control) */}
+                    <div className="isle-stagger-2 flex items-center justify-between py-1.5">
+                      <div className="flex flex-col">
+                        <span className="text-[11px] font-semibold text-white tracking-tight leading-tight">
+                          Kecepatan Tutup Island
+                        </span>
+                        <span className="text-[9.5px] text-white/40 leading-tight mt-0.5">
+                          Jeda setelah mouse pergi
+                        </span>
+                      </div>
+                      <div className="relative inline-grid grid-cols-5 items-center rounded-full bg-white/[0.06] border border-white/[0.07] p-0.5 w-[210px]">
+                        {(() => {
+                          const speedIdx = Math.max(
+                            0,
+                            [0, 120, 300, 600, 1200].indexOf(closeDelayMs)
+                          );
+                          const slideClasses = [
+                            'translate-x-0',
+                            'translate-x-full',
+                            'translate-x-[200%]',
+                            'translate-x-[300%]',
+                            'translate-x-[400%]',
+                          ];
+                          return (
+                            <div
+                              className={`
+                                pointer-events-none absolute top-0.5 bottom-0.5 left-0.5 w-[calc(20%-0.8px)] rounded-full bg-white shadow-xs
+                                transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]
+                                ${slideClasses[speedIdx] || 'translate-x-0'}
+                              `}
+                            />
+                          );
+                        })()}
+                        {[
+                          { label: 'Instan', ms: 0 },
+                          { label: '0.1s', ms: 120 },
+                          { label: '0.3s', ms: 300 },
+                          { label: '0.6s', ms: 600 },
+                          { label: '1.2s', ms: 1200 },
+                        ].map((opt) => {
+                          const active = closeDelayMs === opt.ms;
+                          return (
+                            <button
+                              key={opt.ms}
+                              type="button"
+                              onClick={() => setCloseDelayMs(opt.ms)}
+                              className={`relative z-10 py-[2px] text-[9.5px] font-semibold transition-colors duration-200 cursor-pointer tabular-nums text-center whitespace-nowrap ${
+                                active ? 'text-black' : 'text-white/55 hover:text-white'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Row 3: Startup Windows (Unboxed Metadata + Round iOS/macOS Toggle Switch) */}
+                    <div
+                      onClick={() => handleToggleStartup()}
+                      className="isle-stagger-3 flex items-center justify-between py-1.5 cursor-pointer group"
+                    >
+                      <div className="flex flex-col">
+                        <div className="flex items-baseline gap-1.5">
+                          <span className="text-[11px] font-semibold text-white group-hover:text-white/95 tracking-tight leading-tight">
+                            Startup Windows
+                          </span>
+                          <span className="text-[9.5px] text-white/40 font-normal">
+                            · {startupEnabled ? 'Auto-start' : 'Manual'}
+                          </span>
+                        </div>
+                        <span className="text-[9.5px] text-white/40 leading-tight mt-0.5">
+                          Otomatis berjalan saat laptop/PC dinyalakan
+                        </span>
+                      </div>
                       <button
-                        onClick={() => setDefaultAltQMode('conversation')}
-                        className={`px-2.5 py-0.5 rounded-[3px] font-medium transition cursor-pointer ${
-                          defaultAltQMode === 'conversation'
-                            ? 'bg-white text-black'
-                            : 'text-white/60 hover:text-white'
+                        type="button"
+                        aria-label="Toggle Startup Windows"
+                        className={`w-7 h-4 rounded-full p-0.5 transition-colors duration-200 shrink-0 cursor-pointer ${
+                          startupEnabled ? 'bg-[#30d158]' : 'bg-white/15 group-hover:bg-white/25'
                         }`}
                       >
-                        Type
-                      </button>
-                      <button
-                        onClick={() => setDefaultAltQMode('voice-pill')}
-                        className={`px-2.5 py-0.5 rounded-[3px] font-medium transition cursor-pointer ${
-                          defaultAltQMode === 'voice-pill'
-                            ? 'bg-white text-black'
-                            : 'text-white/60 hover:text-white'
-                        }`}
-                      >
-                        Voice
+                        <div
+                          className={`w-3 h-3 rounded-full bg-white shadow-xs transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                            startupEnabled ? 'translate-x-3' : 'translate-x-0'
+                          }`}
+                        />
                       </button>
                     </div>
                   </div>
 
-                  {/* Row 2: Customizable Auto-Close Speed when Mouse Leaves Dynamic Island */}
-                  <div className="isle-stagger-2 flex items-center justify-between bg-white/[0.04] border border-white/[0.08] rounded-md px-2.5 py-1.5">
-                    <div className="flex flex-col">
-                      <span className="text-[10.5px] font-semibold text-white tracking-tight leading-tight">
-                        Kecepatan Tutup Island
-                      </span>
-                      <span className="text-[9px] text-white/45 leading-tight">
-                        Jeda setelah mouse pergi
-                      </span>
-                    </div>
-                    <div className="flex items-center bg-black/60 border border-white/10 rounded-[4px] p-0.5 text-[9.5px] gap-0.5">
-                      {[
-                        { label: 'Instan', ms: 0 },
-                        { label: '0.1s', ms: 120 },
-                        { label: '0.3s', ms: 300 },
-                        { label: '0.6s', ms: 600 },
-                        { label: '1.2s', ms: 1200 },
-                      ].map((opt) => {
-                        const active = closeDelayMs === opt.ms;
-                        return (
-                          <button
-                            key={opt.ms}
-                            type="button"
-                            onClick={() => setCloseDelayMs(opt.ms)}
-                            className={`px-2 py-0.5 rounded-[3px] font-medium transition cursor-pointer tabular-nums ${
-                              active
-                                ? 'bg-white text-black font-semibold'
-                                : 'text-white/60 hover:text-white'
-                            }`}
-                          >
-                            {opt.label}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Row 3: Audio & Playback Options (FLAC Lossless + Smart Mood Shuffle + Done) */}
-                  <div className="isle-stagger-3 flex items-center justify-between gap-2">
+                  {/* Row 4: Audio & Playback Toggles (FLAC Lossless + Mood Shuffle + Minimalist Done Pill) */}
+                  <div className="isle-stagger-4 flex items-center justify-between gap-3 pt-1 border-t border-white/[0.06]">
                     <div
                       onClick={() => {
                         const nextFlac = !flacEnabled;
                         setFlacEnabled(nextFlac);
                         setActiveTrack((prev) => (prev ? { ...prev, isFlac: nextFlac } : prev));
                       }}
-                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-2.5 py-1.5 cursor-pointer transition select-none"
+                      className="flex-1 flex items-center justify-between py-0.5 cursor-pointer group"
                     >
-                      <div className="flex flex-col">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-white text-[10px] leading-tight">
-                            FLAC Lossless
-                          </span>
-                          <span className="text-[7px] font-mono tracking-wider text-white/50 border border-white/10 px-1 rounded-[2px]">
-                            HI-RES
-                          </span>
-                        </div>
-                        <span className="text-[8.5px] text-white/40 leading-tight">Studio Audio</span>
+                      <div className="flex items-baseline gap-1.5 min-w-0">
+                        <span className="font-semibold text-white text-[10.5px] leading-tight whitespace-nowrap">
+                          FLAC Lossless
+                        </span>
+                        <span className="text-[9.5px] text-white/40 truncate">· Hi-Res</span>
                       </div>
-                      <div
-                        className={`w-6 h-3 rounded-[3px] p-0.5 transition shrink-0 border ${
-                          flacEnabled ? 'bg-white border-white' : 'bg-black/50 border-white/20'
+                      <button
+                        type="button"
+                        aria-label="Toggle FLAC Lossless"
+                        className={`w-7 h-4 rounded-full p-0.5 transition-colors duration-200 shrink-0 cursor-pointer ${
+                          flacEnabled ? 'bg-[#30d158]' : 'bg-white/15 group-hover:bg-white/25'
                         }`}
                       >
                         <div
-                          className={`w-2 h-2 rounded-[1.5px] transition-transform ${
-                            flacEnabled ? 'translate-x-3 bg-black' : 'translate-x-0 bg-white/40'
+                          className={`w-3 h-3 rounded-full bg-white shadow-xs transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                            flacEnabled ? 'translate-x-3' : 'translate-x-0'
                           }`}
                         />
-                      </div>
+                      </button>
                     </div>
+
+                    <span className="w-[1px] h-3.5 bg-white/[0.08] shrink-0" />
 
                     <div
                       onClick={() => setMoodShuffleEnabled((prev) => !prev)}
-                      className="flex-1 flex items-center justify-between bg-white/[0.04] hover:bg-white/[0.07] border border-white/[0.08] rounded-md px-2.5 py-1.5 cursor-pointer transition select-none"
+                      className="flex-1 flex items-center justify-between py-0.5 cursor-pointer group"
                     >
-                      <div className="flex flex-col">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-white text-[10px] leading-tight">
-                            Mood Shuffle
-                          </span>
-                          <span className="text-[7px] font-mono tracking-wider text-white/50 border border-white/10 px-1 rounded-[2px]">
-                            AUTO
-                          </span>
-                        </div>
-                        <span className="text-[8.5px] text-white/40 leading-tight">Mix Sesuai Mood</span>
+                      <div className="flex items-baseline gap-1.5 min-w-0">
+                        <span className="font-semibold text-white text-[10.5px] leading-tight whitespace-nowrap">
+                          Mood Shuffle
+                        </span>
+                        <span className="text-[9.5px] text-white/40 truncate">· Auto</span>
                       </div>
-                      <div
-                        className={`w-6 h-3 rounded-[3px] p-0.5 transition shrink-0 border ${
-                          moodShuffleEnabled ? 'bg-white border-white' : 'bg-black/50 border-white/20'
+                      <button
+                        type="button"
+                        aria-label="Toggle Mood Shuffle"
+                        className={`w-7 h-4 rounded-full p-0.5 transition-colors duration-200 shrink-0 cursor-pointer ${
+                          moodShuffleEnabled
+                            ? 'bg-[#30d158]'
+                            : 'bg-white/15 group-hover:bg-white/25'
                         }`}
                       >
                         <div
-                          className={`w-2 h-2 rounded-[1.5px] transition-transform ${
-                            moodShuffleEnabled ? 'translate-x-3 bg-black' : 'translate-x-0 bg-white/40'
+                          className={`w-3 h-3 rounded-full bg-white shadow-xs transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                            moodShuffleEnabled ? 'translate-x-3' : 'translate-x-0'
                           }`}
                         />
-                      </div>
+                      </button>
                     </div>
 
                     <button
+                      type="button"
                       onClick={() => setSettingsOpen(false)}
-                      className="px-3.5 py-1.5 rounded-md bg-white text-black hover:bg-neutral-200 text-[10px] font-semibold shrink-0 transition cursor-pointer"
+                      className="px-3 py-1 rounded-full bg-white text-black hover:bg-white/90 active:scale-95 text-[10px] font-semibold shrink-0 transition-all duration-150 cursor-pointer"
                     >
                       Done
                     </button>
@@ -9870,8 +10649,28 @@ export default function App() {
         onError={(e) => {
           const curr = activeTrackRef.current;
           if (!curr || curr.sourceType === 'external') return;
+          const el = e.currentTarget;
+          if (
+            curr.audioUrl &&
+            !curr.audioUrl.includes('/api/music/proxy-stream') &&
+            !curr.audioUrl.startsWith('blob:')
+          ) {
+            const proxyUrl = `/api/music/proxy-stream?url=${encodeURIComponent(curr.audioUrl)}`;
+            const fallbackTrack: RealMediaTrack = { ...curr, audioUrl: proxyUrl };
+            activeTrackRef.current = fallbackTrack;
+            setActiveTrack(fallbackTrack);
+            el.src = proxyUrl;
+            el.load();
+            el.play().catch(() => {
+              if (curr.previewUrl) {
+                el.src = curr.previewUrl;
+                el.load();
+                el.play().catch(() => {});
+              }
+            });
+            return;
+          }
           if (curr.previewUrl && curr.audioUrl !== curr.previewUrl) {
-            const el = e.currentTarget;
             const fallbackTrack: RealMediaTrack = { ...curr, audioUrl: curr.previewUrl };
             activeTrackRef.current = fallbackTrack;
             setActiveTrack(fallbackTrack);

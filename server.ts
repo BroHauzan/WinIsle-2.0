@@ -20,7 +20,43 @@ const execAsync = promisify(exec);
 
 const app = express();
 const DESKTOP_DEFAULT_PORT = 45781;
-const PORT = Number(process.env.PORT) || (process.env.ISLE_ELECTRON_STATIC === '1' ? DESKTOP_DEFAULT_PORT : 3000);
+
+export function resolveServerPort(customPort?: number): number {
+  if (customPort && customPort > 0) return customPort;
+
+  // 1. Explicit CLI arguments (--port <val> or -p <val>)
+  for (let i = 0; i < process.argv.length; i++) {
+    if (process.argv[i] === '--port' || process.argv[i] === '-p') {
+      const p = parseInt(process.argv[i + 1], 10);
+      if (!isNaN(p) && p > 0 && p < 65536) return p;
+    }
+  }
+
+  // 2. Control plane / AI Studio default app port
+  if (process.env.DEFAULT_APP_PORT) {
+    const p = parseInt(process.env.DEFAULT_APP_PORT, 10);
+    if (!isNaN(p) && p > 0 && p < 65536) return p;
+  }
+
+  // 3. Desktop packaged mode
+  if (process.env.ISLE_ELECTRON_STATIC === '1') {
+    return DESKTOP_DEFAULT_PORT;
+  }
+
+  // 4. Cloud Run / NGINX reverse-proxy container: PORT=8080 is reserved for NGINX
+  if (process.env.NGINX_PORT || process.env.PORT === '8080') {
+    return 3000;
+  }
+
+  if (process.env.PORT) {
+    const p = parseInt(process.env.PORT, 10);
+    if (!isNaN(p) && p > 0 && p < 65536) return p;
+  }
+
+  return 3000;
+}
+
+const PORT = resolveServerPort();
 
 // Allow CORS for local file:// and desktop renderer connections
 app.use((_req, res, next) => {
@@ -64,6 +100,9 @@ app.get('/api/winisle-health', (_req, res) => {
 });
 
 const INITIAL_ENV_GEMINI_KEY = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+const DEFAULT_GEMINI_THINKING_API_KEY = (
+  process.env.GEMINI_THINKING_API_KEY || ''
+).trim();
 
 function isValidGeminiKey(key?: string | null): boolean {
   if (!key) return false;
@@ -75,7 +114,7 @@ function isValidGeminiKey(key?: string | null): boolean {
 // Endpoint to check & configure Gemini API Key directly from Dynamic Island UI
 app.get('/api/gemini/config', (_req, res) => {
   const persisted = loadPersistedGeminiKey();
-  const envKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  const envKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || DEFAULT_GEMINI_THINKING_API_KEY).trim();
   const effectiveKey = (isValidGeminiKey(persisted) ? persisted : envKey).trim();
   const hasKey = isValidGeminiKey(effectiveKey);
   res.json({
@@ -230,14 +269,16 @@ function savePersistedGeminiKey(key: string): boolean {
   return saved;
 }
 
-// Server-Side Gemini Client Resolver (custom/persisted key or Google AI Studio env key)
-function getGeminiClient(customKey?: string): GoogleGenAI | null {
+// Server-Side Gemini Client Resolver (custom/persisted key, thinking key, or Google AI Studio env key)
+function getGeminiClient(customKey?: string, isThinking = false): GoogleGenAI | null {
   const envKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
   const persisted = loadPersistedGeminiKey();
   const key = (
     (customKey && isValidGeminiKey(customKey) && !customKey.includes('Dummy') ? customKey.trim() : '') ||
+    (isThinking && isValidGeminiKey(DEFAULT_GEMINI_THINKING_API_KEY) ? DEFAULT_GEMINI_THINKING_API_KEY : '') ||
     (isValidGeminiKey(persisted) ? persisted : '') ||
-    envKey
+    envKey ||
+    DEFAULT_GEMINI_THINKING_API_KEY
   ).trim();
 
   if (!key) return null;
@@ -259,6 +300,7 @@ function getGeminiClients(customKey?: string): GoogleGenAI[] {
     customKey && isValidGeminiKey(customKey) && !customKey.includes('Dummy') ? customKey.trim() : '',
     isValidGeminiKey(persisted) ? persisted : '',
     isValidGeminiKey(envKey) ? envKey : '',
+    isValidGeminiKey(DEFAULT_GEMINI_THINKING_API_KEY) ? DEFAULT_GEMINI_THINKING_API_KEY : '',
   ].filter((k) => isValidGeminiKey(k));
   const uniqueKeys = Array.from(new Set(candidates));
   if (uniqueKeys.length === 0 && envKey) {
@@ -323,15 +365,50 @@ interface LaunchAppResult {
   success: boolean;
   appName: string;
   matchedName?: string;
+  protocolUri?: string;
+  platform?: string;
   error?: string;
 }
+
+const WINDOWS_APP_PROTOCOL_MAP: Record<string, { displayName: string; uri: string }> = {
+  spotify: { displayName: 'Spotify', uri: 'spotify:' },
+  discord: { displayName: 'Discord', uri: 'discord:' },
+  vscode: { displayName: 'Visual Studio Code', uri: 'vscode:' },
+  'vs code': { displayName: 'Visual Studio Code', uri: 'vscode:' },
+  'visual studio code': { displayName: 'Visual Studio Code', uri: 'vscode:' },
+  whatsapp: { displayName: 'WhatsApp', uri: 'whatsapp:' },
+  wa: { displayName: 'WhatsApp', uri: 'whatsapp:' },
+  telegram: { displayName: 'Telegram', uri: 'tg:' },
+  steam: { displayName: 'Steam', uri: 'steam:' },
+  calculator: { displayName: 'Calculator', uri: 'ms-calculator:' },
+  kalkulator: { displayName: 'Calculator', uri: 'ms-calculator:' },
+  calc: { displayName: 'Calculator', uri: 'ms-calculator:' },
+  settings: { displayName: 'Windows Settings', uri: 'ms-settings:' },
+  pengaturan: { displayName: 'Windows Settings', uri: 'ms-settings:' },
+  setting: { displayName: 'Windows Settings', uri: 'ms-settings:' },
+  paint: { displayName: 'Paint', uri: 'ms-paint:' },
+  mspaint: { displayName: 'Paint', uri: 'ms-paint:' },
+  photos: { displayName: 'Photos', uri: 'ms-photos:' },
+  foto: { displayName: 'Photos', uri: 'ms-photos:' },
+  clock: { displayName: 'Clock', uri: 'ms-clock:' },
+  todo: { displayName: 'Microsoft To Do', uri: 'ms-todo:' },
+  store: { displayName: 'Microsoft Store', uri: 'ms-windows-store:' },
+  'microsoft store': { displayName: 'Microsoft Store', uri: 'ms-windows-store:' },
+  edge: { displayName: 'Microsoft Edge', uri: 'microsoft-edge:' },
+  'microsoft edge': { displayName: 'Microsoft Edge', uri: 'microsoft-edge:' },
+  figma: { displayName: 'Figma', uri: 'figma:' },
+  notion: { displayName: 'Notion', uri: 'notion:' },
+  slack: { displayName: 'Slack', uri: 'slack:' },
+  zoom: { displayName: 'Zoom', uri: 'zoommtg:' },
+  postman: { displayName: 'Postman', uri: 'postman:' },
+};
 
 // Dynamic Windows Application Resolver & Launcher:
 // Discovers installed applications via:
 // 1. Get-StartApps (PowerShell cmdlet returning Win32 & UWP / Microsoft Store Apps with AppUserModelIDs)
-// 2. Start Menu Programs shortcuts (.lnk files in ProgramData & AppData)
-// 3. Registry App Paths & PATH executables
-// Launches in background via explorer.exe shell:AppsFolder\<AppID> or Start-Process without blocking
+// 2. Start Menu Programs & Desktop shortcuts (.lnk files in ProgramData, AppData, Desktop)
+// 3. Common AppData / ProgramFiles paths, Registry App Paths & PATH executables
+// Launches in background via Shell.Application InvokeVerb('open') or Start-Process without blocking
 async function launchWindowsAppDynamically(requestedApp: string): Promise<LaunchAppResult> {
   const cleanQuery = requestedApp
     .trim()
@@ -340,49 +417,77 @@ async function launchWindowsAppDynamically(requestedApp: string): Promise<Launch
     .trim();
 
   if (!cleanQuery) {
-    return { success: false, appName: requestedApp, error: 'Nama aplikasi tidak valid' };
+    return {
+      success: false,
+      appName: requestedApp,
+      platform: process.platform,
+      error: 'Nama aplikasi tidak valid',
+    };
   }
 
-  // If running in development container (Linux / non-Windows preview), simulate successful app launch
+  const lowerKey = cleanQuery.toLowerCase();
+  const knownProto = WINDOWS_APP_PROTOCOL_MAP[lowerKey];
+
+  // If running in development container (Linux / non-Windows preview), return protocolUri so browser can trigger native URI scheme
   if (process.platform !== 'win32') {
     return {
       success: true,
       appName: cleanQuery,
-      matchedName: cleanQuery,
+      matchedName: knownProto?.displayName || cleanQuery,
+      protocolUri: knownProto?.uri,
+      platform: process.platform,
     };
   }
 
   try {
-    const safeQ = cleanQuery.replace(/"/g, '`"');
+    const safeQ = cleanQuery.replace(/'/g, "''");
     const psScript = `
       $ErrorActionPreference = 'SilentlyContinue'
-      $q = "${safeQ}".Trim()
+      $q = '${safeQ}'.Trim()
+      $lowerQ = $q.ToLower()
+
+      $aliasMap = @{
+        'chrome' = 'chrome.exe'; 'google chrome' = 'chrome.exe';
+        'edge' = 'msedge.exe'; 'microsoft edge' = 'msedge.exe';
+        'brave' = 'brave.exe'; 'firefox' = 'firefox.exe';
+        'notepad' = 'notepad.exe';
+        'calculator' = 'calc.exe'; 'kalkulator' = 'calc.exe'; 'calc' = 'calc.exe';
+        'explorer' = 'explorer.exe'; 'file explorer' = 'explorer.exe';
+        'settings' = 'ms-settings:'; 'pengaturan' = 'ms-settings:'; 'setting' = 'ms-settings:';
+        'task manager' = 'taskmgr.exe'; 'taskmgr' = 'taskmgr.exe';
+        'control panel' = 'control.exe';
+        'paint' = 'mspaint.exe'; 'mspaint' = 'mspaint.exe';
+        'cmd' = 'cmd.exe'; 'command prompt' = 'cmd.exe';
+        'powershell' = 'powershell.exe'; 'terminal' = 'wt.exe'; 'windows terminal' = 'wt.exe';
+        'snipping tool' = 'SnippingTool.exe';
+        'word' = 'winword.exe'; 'microsoft word' = 'winword.exe';
+        'excel' = 'excel.exe'; 'microsoft excel' = 'excel.exe';
+        'powerpoint' = 'powerpnt.exe'; 'ppt' = 'powerpnt.exe';
+        'vscode' = 'code'; 'vs code' = 'code'; 'visual studio code' = 'code';
+        'spotify' = 'spotify:'; 'discord' = 'discord:'; 'whatsapp' = 'whatsapp:'; 'wa' = 'whatsapp:';
+        'telegram' = 'tg:'; 'steam' = 'steam:'
+      }
+
+      # 1. Search Get-StartApps (Exact, StartsWith, Contains, AppID)
       $startApps = Get-StartApps
-
-      # 1. Exact Name Match
       $matched = $startApps | Where-Object { $_.Name -ieq $q } | Select-Object -First 1
-
-      # 2. StartsWith Name Match
       if (-not $matched) {
         $matched = $startApps | Where-Object { $_.Name -like "$q*" } | Select-Object -First 1
       }
-
-      # 3. Contains Name Match
       if (-not $matched) {
         $matched = $startApps | Where-Object { $_.Name -like "*$q*" } | Select-Object -First 1
       }
-
-      # 4. AppID Partial Match (e.g. Spotify, Discord, Chrome, VSCode, Telegram)
       if (-not $matched) {
         $matched = $startApps | Where-Object { $_.AppID -like "*$q*" } | Select-Object -First 1
       }
 
       if ($matched) {
         $appId = $matched.AppID
-        if ($appId -match '^[a-zA-Z]:\\\\') {
-          Start-Process -FilePath $appId
-        } else {
-          Start-Process "explorer.exe" -ArgumentList "shell:AppsFolder\\$appId"
+        try {
+          $shell = New-Object -ComObject Shell.Application
+          $shell.NameSpace('shell:AppsFolder').ParseName($appId).InvokeVerb('open')
+        } catch {
+          Start-Process "shell:AppsFolder\\$appId"
         }
         [PSCustomObject]@{
           Found = $true
@@ -392,7 +497,29 @@ async function launchWindowsAppDynamically(requestedApp: string): Promise<Launch
         exit 0
       }
 
-      # 5. Check Registry App Paths
+      # 2. Search Start Menu & Desktop .lnk shortcuts
+      $shortcutDirs = @(
+        "$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+        "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs",
+        "$env:USERPROFILE\\Desktop"
+      )
+      foreach ($dir in $shortcutDirs) {
+        if (Test-Path $dir) {
+          $lnk = Get-ChildItem -Path $dir -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -like "*$q*" } | Select-Object -First 1
+          if ($lnk) {
+            Start-Process -FilePath $lnk.FullName
+            [PSCustomObject]@{
+              Found = $true
+              Name = $lnk.BaseName
+              AppId = $lnk.FullName
+            } | ConvertTo-Json -Compress
+            exit 0
+          }
+        }
+      }
+
+      # 3. Check Registry App Paths
       $regPath1 = "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$q.exe"
       $regPath2 = "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$q.exe"
       $targetExe = (Get-ItemProperty -Path $regPath1 -Name "(default)" -ErrorAction SilentlyContinue).'(default)'
@@ -409,7 +536,19 @@ async function launchWindowsAppDynamically(requestedApp: string): Promise<Launch
         exit 0
       }
 
-      # 6. Try standard Start-Process as executable name in PATH
+      # 4. Known Alias / Protocol / Executable Map
+      if ($aliasMap.ContainsKey($lowerQ)) {
+        $target = $aliasMap[$lowerQ]
+        Start-Process $target
+        [PSCustomObject]@{
+          Found = $true
+          Name = $q
+          AppId = $target
+        } | ConvertTo-Json -Compress
+        exit 0
+      }
+
+      # 5. Try standard Start-Process as executable name in PATH
       try {
         Start-Process $q -ErrorAction Stop
         [PSCustomObject]@{
@@ -437,21 +576,33 @@ async function launchWindowsAppDynamically(requestedApp: string): Promise<Launch
         success: true,
         appName: cleanQuery,
         matchedName: parsed.Name || cleanQuery,
+        platform: process.platform,
       };
     }
 
     return {
       success: false,
       appName: cleanQuery,
+      platform: process.platform,
       error: `Aplikasi "${cleanQuery}" tidak ditemukan di sistem Windows.`,
     };
   } catch (err: any) {
     console.error('Windows app launch error:', err?.message || err);
     try {
       exec(`start "" "${cleanQuery}"`);
-      return { success: true, appName: cleanQuery, matchedName: cleanQuery };
+      return {
+        success: true,
+        appName: cleanQuery,
+        matchedName: cleanQuery,
+        platform: process.platform,
+      };
     } catch {
-      return { success: false, appName: cleanQuery, error: err?.message };
+      return {
+        success: false,
+        appName: cleanQuery,
+        platform: process.platform,
+        error: err?.message,
+      };
     }
   }
 }
@@ -461,26 +612,46 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
   action: string;
   actionParam?: string;
 } {
+  const trimmedPrompt = prompt.trim();
+  const p = trimmedPrompt.toLowerCase();
+
+  // Guard: If the user is asking a conversational/knowledge question (e.g., "bro lu tau Open Design yang open-source itu ga?", "apa itu...", "pernah denger..."),
+  // never misclassify it as a system/app/music command unless it explicitly starts with an imperative verb ("tolong buka aplikasi...", "putar lagu...").
+  const isConversationalQuestion =
+    /\?$/.test(trimmedPrompt) ||
+    /\b(apa\s+itu|apakah|siapa|kenapa|mengapa|gimana|bagaimana|kapan|dimana|di\s+mana|berapa|tau\s+ga|tau\s+gak|tahu\s+ga|tahu\s+gak|tau\s+nggak|lu\s+tau|kamu\s+tau|pernah\s+denger|pernah\s+tau|jelasin|jelaskan|ceritain|artinya|maksudnya|bedanya|menurutmu|menurut\s+lu|itu\s+apa|itu\s+ga|itu\s+gak|open-source|open\s+source)\b/i.test(
+      trimmedPrompt
+    );
+
+  const hasExplicitImperativePrefix =
+    /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|coba\s+)?(?:buka\s+aplikasi|jalankan\s+aplikasi|putar\s+lagu|puter\s+lagu|setel\s+lagu|ingetin|ingatkan|pasang\s+alarm|set\s+timer)\b/i.test(
+      trimmedPrompt
+    );
+
+  if (isConversationalQuestion && !hasExplicitImperativePrefix) {
+    return { action: 'none' };
+  }
+
   if (explicitAction && explicitAction !== 'none') {
     return { action: explicitAction, actionParam: explicitParam };
   }
-  const p = prompt.toLowerCase();
 
-  // 0. Dynamic Windows App Launch (e.g., "buka discord", "tolong buka spotify", "open chrome", "jalankan vscode")
-  const appMatch =
-    prompt.match(/\b(?:tolong\s+)?(?:buka(?:kan|in)?|jalankan|run|open|launch|start)\s+(?:aplikasi|app|program|software)?\s*([a-zA-Z0-9_\-\.\s]{2,40})/i);
+  // 0. Dynamic Windows App Launch (Strictly anchored at command start: "buka discord", "tolong buka spotify", "open chrome", "jalankan vscode")
+  const appMatch = trimmedPrompt.match(
+    /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|coba\s+|ayo\s+)?(?:buka(?:kan|in)?|jalankan|run|open|launch|start)\s+(?:aplikasi\s+|app\s+|program\s+|software\s+)?([a-zA-Z0-9_\-\.\s]{2,32})$/i
+  );
   if (appMatch && appMatch[1]) {
     const rawTarget = appMatch[1].trim();
-    // Exclude internal island page triggers
-    const isInternalTrigger =
-      /\b(terminal|cmd|powershell|cuaca|weather|shelf|notifikasi|notification|tugas|task|todo|kalender|calendar|pomodoro|timer|lirik|lyrics|lagu|musik|bluetooth|wifi|wi-fi|kecerahan|brightness|volume|mini capsule|kapsul mini)\b/i.test(
+    // Exclude internal island page triggers AND conversational words
+    const isInternalOrConversational =
+      /\b(terminal|cmd|powershell|cuaca|weather|shelf|notifikasi|notification|tugas|task|todo|kalender|calendar|pomodoro|timer|lirik|lyrics|lagu|musik|bluetooth|wifi|wi-fi|kecerahan|brightness|volume|mini capsule|kapsul mini|yang|itu|ini|ga|gak|nggak|enggak|apa|apakah|siapa|kenapa|gimana|open-source|open source|source|design|puasa|suara|hati|pikiran|mata|pintu|halaman|akun|rekening|kesempatan|diskusi|obrolan|topik)\b/i.test(
         rawTarget
       );
-    if (!isInternalTrigger) {
+    if (!isInternalOrConversational) {
       const cleanAppName = rawTarget
-        .replace(/\b(sekarang|dong|ya|bro|please|plis)\b/gi, '')
+        .replace(/\b(sekarang|dong|ya|bro|please|plis|di\s+windows|di\s+laptop|di\s+pc)\b/gi, '')
         .trim();
-      if (cleanAppName.length >= 2) {
+      if (cleanAppName.length >= 2 && cleanAppName.split(/\s+/).length <= 4) {
         return { action: 'launch_app', actionParam: cleanAppName };
       }
     }
@@ -503,20 +674,20 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
   }
 
   // File Search
-  const fileMatch = prompt.match(/\b(?:cariin|cari|temukan|search|find)\s+(?:file|berkas|dokumen)\s+(.+)/i);
+  const fileMatch = trimmedPrompt.match(/\b(?:cariin|cari|temukan|search|find)\s+(?:file|berkas|dokumen)\s+(.+)/i);
   if (fileMatch && fileMatch[1]) {
     return { action: 'find_files', actionParam: fileMatch[1].trim() };
   }
   if (/\b(cariin file|cari file|search file|find file|daftar file|list file)\b/i.test(p)) {
-    const cleaned = prompt
+    const cleaned = trimmedPrompt
       .replace(/.*?\b(?:cariin file|cari file|search file|find file|daftar file|list file)\b/i, '')
       .trim();
     return { action: 'find_files', actionParam: cleaned || '' };
   }
 
   // Terminal / System Command
-  const termMatch = prompt.match(/\b(?:jalankan|eksekusi|run|ketik di terminal)\s+`?([^`]+)`?/i);
-  if (termMatch && termMatch[1] && /\b(terminal|cmd|perintah|command|ls|dir|git|node|npm|df|free|uptime|ipconfig|whoami)\b/i.test(prompt)) {
+  const termMatch = trimmedPrompt.match(/\b(?:jalankan|eksekusi|run|ketik di terminal)\s+`?([^`]+)`?/i);
+  if (termMatch && termMatch[1] && /\b(terminal|cmd|perintah|command|ls|dir|git|node|npm|df|free|uptime|ipconfig|whoami)\b/i.test(trimmedPrompt)) {
     return { action: 'open_terminal', actionParam: termMatch[1].trim() };
   }
   if (/\b(bukain terminal|buka terminal|open terminal|buka cmd|buka powershell|cek ram|cek penyimpanan|cek spesifikasi|cek disk)\b/i.test(p)) {
@@ -532,9 +703,9 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
   }
 
   // Queue song (e.g., "tolong setelah ini setel lagu X", "habis ini putar X", "masukin antrian lagu X", "play next X")
-  const queueMatch = prompt.match(
+  const queueMatch = trimmedPrompt.match(
     /\b(?:setelah ini|habis ini|habis lagu ini|abis ini|abis lagu ini|selanjutnya|nanti)\s+(?:tolong\s+)?(?:putar lagu|puter lagu|stel lagu|setel musik|setel lagu|mainkan lagu|putar musik|puter musik|setel|putar|puter|play|stel)\s+(.+)/i
-  ) || prompt.match(
+  ) || trimmedPrompt.match(
     /\b(?:masukin ke antrian|masukkan ke antrian|tambah ke antrian|tambahin ke antrian|antriin lagu|antrikan lagu|antri lagu|add to queue|queue song|queue track|play next)\s+(?:lagu\s+)?(.+)/i
   );
   if (queueMatch && queueMatch[1]) {
@@ -560,18 +731,30 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
   ) {
     return { action: 'shuffle_on' };
   }
+  // General play command ("puter musik", "play music", "setel musik", "dengerin lagu", "nyalain musik", etc.)
+  if (
+    /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|mau\s+|coba\s+)?(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play|nyalain|nyalakan|dengerin|dengarkan)\s+(?:musik|lagu|musiknya|lagunya|track|song)(?:\s+(?:dong|ya|bro|please|plis))?$/i.test(
+      p
+    )
+  ) {
+    return { action: 'play_music' };
+  }
 
-  // Play specific song query (including "puter lagu", "puter musik", "puterin", "putarkan", "setelin", "mainin")
-  const songMatch = prompt.match(
-    /\b(?:putar lagu|puter lagu|putarkan lagu|puterin lagu|stel lagu|setel musik|setel lagu|setelin lagu|mainkan lagu|mainin lagu|dengerin lagu|play song|play music|putar musik|puter musik|putarkan musik|puterin musik)\s+(.+)/i
-  ) || prompt.match(
-    /\b(?:putar|puter|putarkan|puterin|setel|setelin|stel|mainkan|mainin|play)\s+(?:lagunya|lagu|musik|musiknya|track|song)\s+(.+)/i
+  // Play specific song or artist (Strictly anchored at command start: "puter coldplay", "puterin queen", "setel tulus", "dengerin bruno mars", "play viva la vida")
+  const songMatch = trimmedPrompt.match(
+    /^(?:(?:bro|kak|min|eh|oi|ai|isle)\s*,?\s*)?(?:tolong\s+|bisa\s+|mau\s+|coba\s+|ayo\s+)?(?:putar(?:kan|in)?|puter(?:kan|in)?|setel(?:kan|in)?|stel(?:kan|in)?|mainkan|mainin|dengerin|dengarkan|play|listen\s+to)\s+(?:lagu(?:nya)?|musik(?:nya)?|track|song)?\s*(.+)/i
   );
+
   if (songMatch && songMatch[1]) {
-    const cleanedSong = songMatch[1]
-      .replace(/\b(dong|ya|sekarang|please|plis|di\s+dynamic\s+island)\b/gi, '')
+    const rawMatch = songMatch[1];
+    const cleanedSong = rawMatch
+      .replace(/\b(dong|ya|sekarang|please|plis|di\s+dynamic\s+island|nih|bro|aja)\b/gi, '')
+      .replace(/[?!.]+$/, '')
       .trim();
-    if (cleanedSong) {
+    const isControlOrSystem = /^(?:pause|jeda|stop|matiin|matikan|selanjutnya|next|prev|volume|kecerahan|brightness|timer|pomodoro|alarm|jadwal|task|tugas|cuaca|weather|shelf|startup)\b/i.test(
+      cleanedSong
+    );
+    if (cleanedSong && !isControlOrSystem) {
       return { action: 'play_song', actionParam: cleanedSong };
     }
   }
@@ -657,6 +840,14 @@ function inferIslandAction(prompt: string, explicitAction?: string, explicitPara
   // Mini Capsule Auto-Hide mode (Alt+H)
   if (/\b(mini capsule|kapsul mini|sembunyikan pulau|auto hide|mode sembunyi|alt\s*\+\s*h)\b/i.test(p)) {
     return { action: 'toggle_mini_capsule' };
+  }
+
+  // Windows Startup Control (Task Manager Startup Apps & Registry Run)
+  if (/\b(?:daftarkan|tambah(?:kan)?|aktifkan|nyalakan|masuk(?:kan)?|pasang|atur|enable|daftar)\b.*\b(?:ke\s+)?startup\b|\bstartup\b.*\b(aktif|nyala|on|enable|daftar|jalan)\b/i.test(p)) {
+    return { action: 'enable_startup' };
+  }
+  if (/\b(?:hapus|keluarkan|matikan|nonaktifkan|disable|remove)\b.*\b(?:dari\s+)?startup\b|\bstartup\b.*\b(mati|off|disable|hapus)\b/i.test(p)) {
+    return { action: 'disable_startup' };
   }
 
   // Relative volume & brightness
@@ -1282,25 +1473,47 @@ async function searchRiMusicYouTubeTrack(
 
     const scoreCandidate = (title: string, subText: string, sec: number, baseScore: number): number => {
       let score = baseScore;
-      const combined = `${title} ${subText}`;
+      const combined = `${title} ${subText}`.toLowerCase();
       const lowerTitle = title.toLowerCase();
       const lowerSub = subText.toLowerCase();
+
+      // Heavily penalize non-official uploads, fan covers, karaoke, bootlegs, sped up, slowed, remixes
+      if (
+        /\b(cover|karaoke|lirik|remix|bootleg|tribute|parodi|parody|fan\s*made|sped\s*up|slowed|reverb|nightcore|8d|reaction|guitar\s*cover|drum\s*cover|piano\s*cover|bass\s*cover|chords|tutorial)\b/i.test(
+          combined
+        )
+      ) {
+        score -= 350;
+      }
 
       // Penalize Live, Concert, Music Video, MV, Extended Intro, Orchestra/Symphony, etc.
       if (hasUnrequestedNonStudioKeyword(combined, query)) {
         score -= 180;
       }
 
-      // Distinguish YTM "Song" (studio album track) vs "Video" (Music Video with story intro/outro)
+      // Priority 1: Official Topic channels (YouTube Music auto-generated pure studio releases directly from record label)
+      if (
+        /\b(topic)\b/i.test(lowerSub) ||
+        /provided to youtube by/i.test(lowerSub) ||
+        /auto-generated by youtube/i.test(lowerSub)
+      ) {
+        score += 200;
+      }
+
+      // Priority 2: Distinguish YTM "Song" (studio album track) vs "Video"
       if (/\bsong\b/.test(lowerSub)) {
-        score += 45;
+        score += 65;
       }
       if (/\b(video|music video|mv|episode)\b/.test(lowerSub) && !query.toLowerCase().includes('video')) {
         score -= 110;
       }
 
+      // Priority 3: Official Audio / Verified Channel / Vevo
       if (/\b(official audio|audio)\b/.test(lowerTitle)) {
-        score += 35;
+        score += 60;
+      }
+      if (/\b(vevo|official)\b/.test(lowerSub)) {
+        score += 70;
       }
 
       // Strict duration matching against studio track duration
@@ -1817,6 +2030,64 @@ app.get('/api/music/search', async (req, res) => {
   return res.json({ found: true, track });
 });
 
+// Endpoint 1c: Streaming Audio Proxy to prevent 403 Forbidden, CORS or Chinese CDN drops
+app.get('/api/music/proxy-stream', async (req, res) => {
+  const targetUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  if (!targetUrl || !targetUrl.startsWith('http')) {
+    return res.status(400).send('Invalid audio URL');
+  }
+
+  try {
+    const rangeHeader = req.headers.range;
+    const fetchHeaders: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept: '*/*',
+    };
+    if (rangeHeader) {
+      fetchHeaders['Range'] = rangeHeader;
+    }
+
+    const audioRes = await fetch(targetUrl, { headers: fetchHeaders });
+    if (!audioRes.ok && audioRes.status !== 206) {
+      return res.status(audioRes.status).send('Upstream stream error');
+    }
+
+    res.status(audioRes.status);
+    const contentType = audioRes.headers.get('content-type') || 'audio/mpeg';
+    const contentLength = audioRes.headers.get('content-length');
+    const contentRange = audioRes.headers.get('content-range');
+    const acceptRanges = audioRes.headers.get('accept-ranges') || 'bytes';
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', acceptRanges);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+
+    if (audioRes.body) {
+      const reader = audioRes.body.getReader();
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(Buffer.from(value));
+          }
+          res.end();
+        } catch {
+          res.end();
+        }
+      };
+      pump();
+    } else {
+      res.end();
+    }
+  } catch (err: any) {
+    res.status(500).send('Stream proxy failure');
+  }
+});
+
 // Endpoint 1b: Smart Mood-Based Shuffle Recommendation (Picks next song matching the current song's mood/vibe)
 app.get('/api/music/mood-shuffle', async (req, res) => {
   const seedTitle = sanitizeText(req.query.title, 100);
@@ -2202,6 +2473,222 @@ if ($monitor) { Invoke-CimMethod -InputObject $monitor -MethodName WmiSetBrightn
   } catch (err: any) {
     return res.json({ ok: false, error: err?.message });
   }
+});
+
+// ── Windows Startup (Auto-launch) Management ──
+interface WindowsStartupInfo {
+  enabled: boolean;
+  registeredPath?: string;
+  source?: 'registry' | 'startup_folder' | 'persisted' | 'simulated';
+  platform: string;
+}
+
+const STARTUP_CONFIG_FILE = path.resolve(process.cwd(), '.winisle', 'startup_config.json');
+
+function loadPersistedStartupPref(): boolean {
+  try {
+    if (fs.existsSync(STARTUP_CONFIG_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(STARTUP_CONFIG_FILE, 'utf-8'));
+      if (typeof parsed?.enabled === 'boolean') return parsed.enabled;
+    }
+  } catch {}
+  return true; // Default to true on Windows
+}
+
+function savePersistedStartupPref(enabled: boolean): void {
+  try {
+    const dir = path.dirname(STARTUP_CONFIG_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      STARTUP_CONFIG_FILE,
+      JSON.stringify({ enabled, updatedAt: new Date().toISOString() }, null, 2)
+    );
+  } catch {}
+}
+
+async function getWindowsStartupStatus(): Promise<WindowsStartupInfo> {
+  if (process.platform !== 'win32') {
+    return {
+      enabled: loadPersistedStartupPref(),
+      registeredPath: process.execPath,
+      source: 'persisted',
+      platform: process.platform,
+    };
+  }
+
+  try {
+    const psScript = `
+      $ErrorActionPreference = 'SilentlyContinue'
+      $regVal1 = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'WinIsle' -ErrorAction SilentlyContinue).WinIsle
+      $regVal2 = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'IsleDynamicIsland' -ErrorAction SilentlyContinue).IsleDynamicIsland
+      $startupFolder = [System.Environment]::GetFolderPath('Startup')
+      $lnkPath = Join-Path $startupFolder 'WinIsle.lnk'
+      $lnkExists = Test-Path $lnkPath
+
+      $hasReg = [bool]($regVal1 -or $regVal2)
+      $effectivePath = if ($regVal1) { $regVal1 } elseif ($regVal2) { $regVal2 } elseif ($lnkExists) { $lnkPath } else { '' }
+
+      [PSCustomObject]@{
+        Enabled = ($hasReg -or $lnkExists)
+        HasRegistry = $hasReg
+        HasStartupLnk = $lnkExists
+        Path = $effectivePath
+      } | ConvertTo-Json -Compress
+    `;
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+    const { stdout } = await execAsync(`powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`, {
+      timeout: 5000,
+    });
+    const parsed = extractJsonObject(stdout);
+    if (parsed) {
+      return {
+        enabled: Boolean(parsed.Enabled),
+        registeredPath: parsed.Path || '',
+        source: parsed.HasRegistry ? 'registry' : parsed.HasStartupLnk ? 'startup_folder' : undefined,
+        platform: 'win32',
+      };
+    }
+  } catch (err: any) {
+    console.warn('[WinIsle] getWindowsStartupStatus error:', err?.message || err);
+  }
+
+  return {
+    enabled: loadPersistedStartupPref(),
+    registeredPath: process.execPath,
+    source: 'persisted',
+    platform: process.platform,
+  };
+}
+
+async function setWindowsStartupStatus(
+  enable: boolean,
+  explicitExePath?: string
+): Promise<{ success: boolean; enabled: boolean; message: string; path?: string }> {
+  savePersistedStartupPref(enable);
+
+  if (process.platform !== 'win32') {
+    return {
+      success: true,
+      enabled: enable,
+      message: enable
+        ? 'WinIsle berhasil didaftarkan di Startup Windows (Status aktif disimpan).'
+        : 'WinIsle dinonaktifkan dari Startup Windows.',
+    };
+  }
+
+  try {
+    if (enable) {
+      const candidatePaths = [
+        explicitExePath,
+        process.env.ISLE_EXE_PATH,
+        process.execPath,
+      ].filter(Boolean) as string[];
+
+      if (process.env.LOCALAPPDATA) {
+        candidatePaths.push(path.join(process.env.LOCALAPPDATA, 'Programs', 'WinIsle', 'WinIsle.exe'));
+      }
+      if (process.env.ProgramFiles) {
+        candidatePaths.push(path.join(process.env.ProgramFiles, 'WinIsle', 'WinIsle.exe'));
+      }
+      candidatePaths.push(path.resolve(process.cwd(), 'release', 'win-unpacked', 'WinIsle.exe'));
+      candidatePaths.push(path.resolve(process.cwd(), 'WinIsle.exe'));
+
+      const verifiedExe = candidatePaths.find((p) => {
+        try {
+          return (
+            fs.existsSync(p) &&
+            p.toLowerCase().endsWith('.exe') &&
+            !p.toLowerCase().includes('node.exe') &&
+            !p.toLowerCase().includes('tsx.exe')
+          );
+        } catch {
+          return false;
+        }
+      }) || process.execPath;
+
+      const safeExe = verifiedExe.replace(/'/g, "''");
+      const psScript = `
+        $ErrorActionPreference = 'SilentlyContinue'
+        $target = '${safeExe}'
+        $targetDir = [System.IO.Path]::GetDirectoryName($target)
+        if (-not $targetDir) { $targetDir = $PSScriptRoot }
+
+        # 1. Register in HKCU Run registry
+        $runKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+        Set-ItemProperty -Path $runKey -Name 'WinIsle' -Value ('"' + $target + '"')
+        Set-ItemProperty -Path $runKey -Name 'IsleDynamicIsland' -Value ('"' + $target + '"')
+
+        # 2. Also register in Windows Startup folder for double guarantee
+        $startupFolder = [System.Environment]::GetFolderPath('Startup')
+        if (Test-Path $startupFolder) {
+          $wsh = New-Object -ComObject WScript.Shell
+          $sc = $wsh.CreateShortcut((Join-Path $startupFolder 'WinIsle.lnk'))
+          $sc.TargetPath = $target
+          $sc.WorkingDirectory = $targetDir
+          $sc.Description = 'WinIsle Dynamic Island'
+          $sc.Save()
+        }
+
+        [PSCustomObject]@{
+          Success = $true
+          RegisteredPath = $target
+        } | ConvertTo-Json -Compress
+      `;
+      const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+      await execAsync(`powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`, { timeout: 6000 });
+      return {
+        success: true,
+        enabled: true,
+        path: verifiedExe,
+        message: 'WinIsle berhasil didaftarkan di Startup Windows (Registry Run & Folder Startup)!',
+      };
+    } else {
+      const psScript = `
+        $ErrorActionPreference = 'SilentlyContinue'
+        $runKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+        Remove-ItemProperty -Path $runKey -Name 'WinIsle' -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $runKey -Name 'IsleDynamicIsland' -ErrorAction SilentlyContinue
+
+        $startupFolder = [System.Environment]::GetFolderPath('Startup')
+        if (Test-Path $startupFolder) {
+          Remove-Item (Join-Path $startupFolder 'WinIsle.lnk') -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $startupFolder 'IsleDynamicIsland.lnk') -Force -ErrorAction SilentlyContinue
+        }
+
+        [PSCustomObject]@{
+          Success = $true
+        } | ConvertTo-Json -Compress
+      `;
+      const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+      await execAsync(`powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`, { timeout: 6000 });
+      return {
+        success: true,
+        enabled: false,
+        message: 'WinIsle berhasil dihapus dari Startup Windows.',
+      };
+    }
+  } catch (err: any) {
+    console.error('[WinIsle] setWindowsStartupStatus error:', err?.message || err);
+    return {
+      success: false,
+      enabled: enable,
+      message: `Gagal memperbarui Startup Windows: ${err?.message || 'Error eksekusi'}`,
+    };
+  }
+}
+
+// Endpoint 3c: Check Windows Startup Registration Status
+app.get('/api/system/startup', async (_req, res) => {
+  const status = await getWindowsStartupStatus();
+  res.json(status);
+});
+
+// Endpoint 3d: Register or Unregister WinIsle in Windows Startup
+app.post('/api/system/startup', async (req, res) => {
+  const enable = req.body?.enabled !== false;
+  const customPath = typeof req.body?.path === 'string' ? req.body.path : undefined;
+  const result = await setWindowsStartupStatus(enable, customPath);
+  res.json(result);
 });
 
 // Track external OS media session shuffle state & cache resolved track metadata so polling is fast
@@ -3026,16 +3513,13 @@ app.post('/api/gemini/assistant', async (req, res) => {
     .filter(Boolean)
     .join('\n');
 
+  const requestedModel = (req.body?.model as string)?.trim() || 'gemini-3.8-flash';
+  const isThinkingModel =
+    requestedModel.includes('thinking') ||
+    requestedModel === 'laguna-s-2.1' ||
+    requestedModel === 'muse-spark-1.3-contributor';
   const clientKey = (req.headers['x-gemini-key'] as string) || req.body?.apiKey;
-  const ai = getGeminiClient(clientKey);
-  if (!ai) {
-    return res.status(200).json({
-      error: 'GEMINI_API_KEY_REQUIRED',
-      reply: 'API Key Gemini belum diatur atau tidak valid. Silakan klik tombol di bawah untuk memasukkan Gemini API Key gratis Anda (diawali AIzaSy...) di menu Settings agar Isle Assistant dapat merespons.',
-      action: 'none',
-      needApiKey: true,
-    });
-  }
+  const ai = getGeminiClient(clientKey, isThinkingModel);
 
   // Fetch live Google Search / Wikipedia data in parallel so we always have real web grounding (when text query is sent)
   const liveWebPromise = imageBase64
@@ -3077,23 +3561,13 @@ Valid action_name values:
 - set_volume|0_to_100 (set system volume)
 - set_brightness|0_to_10 (set screen brightness 0..10)
 - launch_app|app_name (dynamically find and launch any installed Windows desktop or Store application, e.g. [ACTION:launch_app|Discord], [ACTION:launch_app|Spotify], [ACTION:launch_app|Chrome], [ACTION:launch_app|VS Code], [ACTION:launch_app|Notion], [ACTION:launch_app|WhatsApp])
+- enable_startup, disable_startup (register or unregister WinIsle in Windows Startup Apps and HKCU Run, e.g., [ACTION:enable_startup], [ACTION:disable_startup])
 - play_music, pause_music, next_track, prev_track, toggle_lyrics, mute_volume, unmute_volume, start_pomodoro, pause_pomodoro, reset_pomodoro, open_tasks, open_shelf, clear_shelf, open_calendar, add_calendar_event|event_title, open_notifications, toggle_dnd, none.
 Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'}, nowPlaying=${sanitizeText(currentState.trackTitle, 80) || 'Idle'}, queueLength=${Number(currentState.queueCount) || 0}, moodShuffle=${currentState.moodShuffleEnabled ? 'ON' : 'OFF'}, volume=${Number(currentState.volume) || 36}%, brightness=${Number(currentState.brightness) ?? 7}/10, battery=${Number(currentState.batteryLevel) || 82}%, bluetooth=${currentState.bluetoothEnabled !== false ? 'ON' : 'OFF'}, pomodoro=${sanitizeText(currentState.pomoRemaining, 10) || '25:00'} (${currentState.pomoRunning ? 'running' : 'paused'}), shelfFiles=${Number(currentState.shelfCount) || 0}.`;
 
   let response: any = null;
-  const requestedModel = (req.body?.model as string)?.trim() || 'agnes-3.0-flash';
-  const isThinkingModel = requestedModel === 'muse-spark-1.3-contributor';
-  let usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : (requestedModel === 'agnes-2.5-flash' ? 'agnes-2.5-flash' : 'agnes-3.0-flash');
+  let usedModel = isThinkingModel ? 'gemini-3.8-flash (thinking)' : 'gemini-3.8-flash';
   let lastError: any = null;
-
-  const bynaraKey =
-    clientKey && clientKey.trim().startsWith('sk-nry-')
-      ? clientKey.trim()
-      : 'sk-nry-2f6-6P7a7WIv0g3go0dRtL4rpR4zaTFhIb3uEAeByRY';
-  const bynaraBaseUrl = (process.env.BYNARA_BASE_URL || 'https://router.bynara.id/v1').replace(
-    /\/+$/,
-    ''
-  );
 
   const AGNES_BASE_URL = (process.env.AGNES_BASE_URL || 'https://apihub.agnes-ai.com/v1').replace(
     /\/+$/,
@@ -3130,110 +3604,117 @@ Desktop State: activePage=${sanitizeText(currentState.activePage, 20) || 'music'
 
   // ROUTE 0: Multimodal Audio Speech Understanding (when voice recording is attached)
   if (audioBase64 && ai) {
-    try {
-      const audioRes = await withTimeout(
-        ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: audioMimeType,
-                    data: audioBase64,
+    const audioModels = isThinkingModel
+      ? ['gemini-3-flash-preview', 'gemini-3.8-flash']
+      : ['gemini-3.8-flash', 'gemini-3-flash-preview'];
+    for (const audioModel of audioModels) {
+      try {
+        const audioRes = await withTimeout(
+          ai.models.generateContent({
+            model: audioModel,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: audioMimeType,
+                      data: audioBase64,
+                    },
                   },
-                },
-                {
-                  text: `${systemPrompt}\n\nUser sent a voice message recorded from their microphone. Transcribe and execute the user's intent or reply naturally in the requested companion style.`,
-                },
-              ],
-            },
-          ],
-        }),
-        12000,
-        'gemini-audio-multimodal'
-      );
-      const audioText = audioRes?.text?.trim();
-      if (audioText) {
-        response = { text: audioText, candidates: [] };
-        usedModel = 'gemini-2.5-flash';
+                  {
+                    text: `${systemPrompt}\n\nUser sent a voice message recorded from their microphone. Transcribe and execute the user's intent or reply naturally in the requested companion style.`,
+                  },
+                ],
+              },
+            ],
+          }),
+          12000,
+          'gemini-audio-multimodal'
+        );
+        const audioText = audioRes?.text?.trim();
+        if (audioText) {
+          response = { text: audioText, candidates: [] };
+          usedModel = 'gemini-3.8-flash (audio)';
+          break;
+        }
+      } catch (err: any) {
+        console.warn('[AUDIO ROUTE ERROR]', err?.message);
       }
-    } catch (err: any) {
-      console.warn('[AUDIO ROUTE ERROR]', err?.message);
     }
   }
 
-  // ROUTE 1: Thinking Mode (`muse-spark-1.3-contributor`) via Bynara Router
-  if (!response && isThinkingModel) {
-    try {
-      const bynaraMessages: Array<{ role: string; content: any }> = [
-        { role: 'system', content: systemPrompt },
-      ];
-      for (const m of rawHistory.slice(-6)) {
-        const text = sanitizeText(m?.text, 300);
-        if (!text || text.includes('maaf') || text.includes('gagal memproses')) continue;
-        bynaraMessages.push({
-          role: m?.role === 'assistant' ? 'assistant' : 'user',
-          content: text,
-        });
-      }
-      if (imageBase64) {
-        bynaraMessages.push({
-          role: 'user',
-          content: [
-            { type: 'text', text: `${prompt}${webContextBlock}` },
-            { type: 'image_url', image_url: { url: `data:${imageMimeType};base64,${imageBase64}` } },
-          ],
-        });
-      } else {
-        bynaraMessages.push({
-          role: 'user',
-          content: `${prompt}${webContextBlock}`,
-        });
-      }
-
-      const bynaraRes = await withTimeout(
-        fetch(`${bynaraBaseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${bynaraKey}`,
-          },
-          body: JSON.stringify({
-            model: 'muse-spark-1.3-contributor',
-            messages: bynaraMessages,
-            temperature: 0.7,
-            max_tokens: 3500,
-          }),
-        }),
-        18000,
-        'bynara-muse-spark'
-      );
-
-      if (bynaraRes.ok) {
-        const bynaraData: any = await bynaraRes.json();
-        const choice = bynaraData?.choices?.[0];
-        const content = String(
-          choice?.message?.content || choice?.message?.reasoning_content || ''
-        ).trim();
-        if (content) {
-          response = { text: content, candidates: [] };
-          usedModel = 'muse-spark-1.3-contributor';
-        }
-      } else {
-        const errBody = await bynaraRes.text().catch(() => '');
-        lastError = new Error(`Muse Spark HTTP ${bynaraRes.status}: ${errBody.slice(0, 160)}`);
-      }
-    } catch (err: any) {
-      lastError = err;
+  // ROUTE 1: Official Google Gemini (Uses Dedicated Thinking Key in Thinking Mode)
+  const route1Client = isThinkingModel
+    ? getGeminiClient(clientKey || DEFAULT_GEMINI_THINKING_API_KEY, true)
+    : ai;
+  if (!response && route1Client) {
+    const geminiContents: any[] = [];
+    for (const m of rawHistory.slice(-8)) {
+      const text = sanitizeText(m?.text, 400);
+      if (!text || text.includes('maaf') || text.includes('gagal memproses')) continue;
+      geminiContents.push({
+        role: m?.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text }],
+      });
     }
-  } else {
-    // ROUTE 2: Fast Mode (`agnes-3.0-flash` / `agnes-2.5-flash`) via Agnes AI API Hub
-    const agnesModels =
-      requestedModel === 'agnes-2.5-flash'
-        ? ['agnes-2.5-flash', 'agnes-3.0-flash']
-        : ['agnes-3.0-flash', 'agnes-2.5-flash'];
+
+    const userParts: any[] = [];
+    if (imageBase64) {
+      userParts.push({
+        inlineData: {
+          mimeType: imageMimeType,
+          data: imageBase64,
+        },
+      });
+    }
+    userParts.push({ text: `${prompt}${webContextBlock}` });
+    geminiContents.push({
+      role: 'user',
+      parts: userParts,
+    });
+
+    const geminiConfig: any = {
+      systemInstruction: systemPrompt,
+      temperature: 0.7,
+      thinkingConfig: isThinkingModel ? { thinkingBudget: 1024 } : { thinkingBudget: 0 },
+    };
+
+    const candidateGeminiModels = isThinkingModel
+      ? ['gemini-3-flash-preview', 'gemini-3.8-flash']
+      : ['gemini-3.8-flash', 'gemini-3-flash-preview'];
+
+    for (const geminiModelName of candidateGeminiModels) {
+      try {
+        const geminiRes = await withTimeout(
+          route1Client.models.generateContent({
+            model: geminiModelName,
+            contents: geminiContents,
+            config: geminiConfig,
+          }),
+          18000,
+          geminiModelName
+        );
+
+        const geminiText = geminiRes?.text?.trim();
+        if (geminiText) {
+          response = {
+            text: geminiText,
+            candidates: geminiRes?.candidates || [],
+          };
+          usedModel = isThinkingModel ? 'gemini-3.8-flash (thinking-low)' : 'gemini-3.8-flash';
+          break;
+        }
+      } catch (err: any) {
+        console.warn(`[GEMINI ROUTE ERROR (${geminiModelName})]`, err?.message || err);
+        lastError = err;
+      }
+    }
+  }
+
+  if (!response) {
+    // ROUTE 2: Backup Fast Mode (`agnes-3.0-flash` / `agnes-2.5-flash`) via Agnes AI API Hub
+    const agnesModels = ['agnes-3.0-flash', 'agnes-2.5-flash'];
 
     const agnesMessages: Array<{ role: string; content: any }> = [
       {
@@ -3320,7 +3801,7 @@ Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan 
         }]`,
         candidates: [],
       };
-      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'agnes-3.0-flash';
+      usedModel = isThinkingModel ? 'gemini-3.8-flash (thinking)' : 'gemini-3.8-flash';
     } else if (liveWeb.snippets.length > 0) {
       const cleanSummary = liveWeb.snippets
         .slice(0, 2)
@@ -3330,7 +3811,7 @@ Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan 
         text: cleanSummary,
         candidates: [],
       };
-      usedModel = isThinkingModel ? 'muse-spark-1.3-contributor' : 'agnes-3.0-flash';
+      usedModel = isThinkingModel ? 'gemini-3.8-flash (thinking)' : 'gemini-3.8-flash';
     } else {
       console.error('Model request failed:', usedModel, lastError?.message || lastError);
       return res.status(200).json({
@@ -3455,6 +3936,22 @@ Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan 
       } else {
         replyText = `Maaf, aplikasi "${inferred.actionParam}" tidak ditemukan di sistem Windows kamu.`;
       }
+    } else if (inferred.action === 'enable_startup') {
+      const startupRes = await setWindowsStartupStatus(true);
+      replyText = 'WinIsle sudah berhasil didaftarkan di Startup Windows (Registry Run & folder Startup). Aplikasi akan otomatis aktif saat laptop/PC kamu dinyalakan.';
+      commandCard = {
+        command: 'Set-ItemProperty -Path HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run -Name WinIsle',
+        purpose: 'Registrasi Startup Windows',
+        output: startupRes.message || 'WinIsle terdaftar di Startup Apps',
+      };
+    } else if (inferred.action === 'disable_startup') {
+      const startupRes = await setWindowsStartupStatus(false);
+      replyText = 'WinIsle telah dinonaktifkan dari Startup Windows.';
+      commandCard = {
+        command: 'Remove-ItemProperty -Path HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run -Name WinIsle',
+        purpose: 'Hapus dari Startup Windows',
+        output: startupRes.message || 'WinIsle dihapus dari Startup',
+      };
     }
 
     // Extract Google Search Grounding URLs from groundingMetadata.groundingChunks + liveWeb.sources
@@ -3465,6 +3962,8 @@ Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan 
     // Only attach web search sources if not a purely local hardware command
     const isLocalSystemAction = [
       'launch_app',
+      'enable_startup',
+      'disable_startup',
       'bluetooth_off',
       'bluetooth_on',
       'wifi_off',
@@ -3524,7 +4023,7 @@ Kamu adalah Agnes, model AI yang sangat cepat sekaligus cerdas dengan kemampuan 
 });
 
 export async function startServer(customPort?: number) {
-  const listenPort = customPort || PORT;
+  const listenPort = resolveServerPort(customPort);
   const httpServer = createServer(app);
 
   // ── WebSocket Server for Real-Time Voice Conversation with gemini-3.8-live (Live API) ──
@@ -3721,25 +4220,6 @@ export async function startServer(customPort?: number) {
   const isDev =
     process.env.NODE_ENV !== 'production' && process.env.ISLE_ELECTRON_STATIC !== '1';
 
-  // Bind HTTP server to port immediately so container health checks succeed without waiting for Vite bundle scan
-  const listenPromise = new Promise<typeof httpServer>((resolve) => {
-    httpServer.on('error', (err: any) => {
-      if (err?.code === 'EADDRINUSE') {
-        console.log(`Isle Server already active on http://localhost:${listenPort}`);
-        resolve(httpServer);
-      } else {
-        console.error('Isle Server error:', err);
-      }
-    });
-
-    httpServer.listen(listenPort, '0.0.0.0', () => {
-      console.log(
-        `Isle Server (with Gemini 3.8 Flash Search & Gemini 3.8 Live WS) running on http://0.0.0.0:${listenPort}`
-      );
-      resolve(httpServer);
-    });
-  });
-
   let viteActive = false;
 
   if (isDev) {
@@ -3747,7 +4227,7 @@ export async function startServer(customPort?: number) {
       const vitePkg = 'vite';
       const { createServer: createViteServer } = await import(vitePkg);
       const vite = await createViteServer({
-        server: { middlewareMode: true, hmr: false },
+        server: { middlewareMode: true, ws: false, hmr: false },
         appType: 'spa',
       });
       app.use(vite.middlewares);
@@ -3824,6 +4304,31 @@ export async function startServer(customPort?: number) {
   <script>setTimeout(() => window.location.reload(), 1200);</script>
 </body>
 </html>`);
+    });
+  }
+
+  const listenPromise = new Promise<typeof httpServer>((resolve) => {
+    httpServer.on('error', (err: any) => {
+      if (err?.code === 'EADDRINUSE') {
+        console.log(`Isle Server already active on http://localhost:${listenPort}`);
+        resolve(httpServer);
+      } else {
+        console.error('Isle Server error:', err);
+      }
+    });
+
+    httpServer.listen(listenPort, '0.0.0.0', () => {
+      console.log(
+        `Isle Server (with Gemini 3.8 Flash Search & Gemini 3.8 Live WS) running on http://0.0.0.0:${listenPort}`
+      );
+      resolve(httpServer);
+    });
+  });
+
+  // On Windows, ensure WinIsle startup registration is active if user preference is enabled
+  if (process.platform === 'win32' && loadPersistedStartupPref()) {
+    setWindowsStartupStatus(true).catch((err) => {
+      console.warn('[WinIsle] Initial startup registration error:', err?.message || err);
     });
   }
 

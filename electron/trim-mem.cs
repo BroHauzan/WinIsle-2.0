@@ -37,9 +37,14 @@ namespace WinIsleMemoryTrimmer {
                 }
 
                 if (targetName.Equals("WinIsle", StringComparison.OrdinalIgnoreCase)) {
-                    Process[] devProcs = Process.GetProcessesByName("electron");
-                    foreach (Process p in devProcs) {
-                        Trim(p);
+                    string[] extraTargets = new string[] { "electron", "msedgewebview2", "crashpad_handler" };
+                    foreach (string name in extraTargets) {
+                        try {
+                            Process[] extraProcs = Process.GetProcessesByName(name);
+                            foreach (Process p in extraProcs) {
+                                Trim(p);
+                            }
+                        } catch {}
                     }
                 }
             } catch {}

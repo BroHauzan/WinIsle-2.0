@@ -13,7 +13,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let toggle_island = MenuItemBuilder::with_id("toggle_island", "Toggle Dynamic Island").build(app)?;
     let open_assistant = MenuItemBuilder::with_id("open_assistant", "Open Assistant (Alt+Q)").build(app)?;
+    let optimize_ram = MenuItemBuilder::with_id("optimize_ram", "Optimize RAM (<50MB)").build(app)?;
     let always_on_top = CheckMenuItemBuilder::with_id("always_on_top", "Always on Top")
+        .checked(true)
+        .build(app)?;
+    let run_on_startup = CheckMenuItemBuilder::with_id("run_on_startup", "Run on Windows Startup")
         .checked(true)
         .build(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
@@ -22,7 +26,9 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let menu = MenuBuilder::new(app)
         .item(&toggle_island)
         .item(&open_assistant)
+        .item(&optimize_ram)
         .item(&always_on_top)
+        .item(&run_on_startup)
         .item(&separator)
         .item(&exit_app)
         .build()?;
@@ -44,13 +50,18 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(visible) = window.is_visible() {
                             if visible {
                                 let _ = window.hide();
+                                crate::memory::trim_process_tree_memory();
                             } else {
                                 let _ = window.show();
                                 let _ = window.unminimize();
                                 let _ = window.set_focus();
+                                crate::memory::trim_process_tree_memory();
                             }
                         }
                     }
+                }
+                "optimize_ram" => {
+                    crate::memory::trim_process_tree_memory();
                 }
                 "open_assistant" => {
                     if let Some(window) = app.get_webview_window("main") {
@@ -65,6 +76,26 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(is_top) = window.is_always_on_top() {
                             let _ = window.set_always_on_top(!is_top);
                         }
+                    }
+                }
+                "run_on_startup" => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = std::process::Command::new("powershell")
+                            .args(["-NoProfile", "-Command", "
+                                $runKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+                                $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+                                Set-ItemProperty -Path $runKey -Name 'WinIsle' -Value ('\"' + $exe + '\"')
+                                Set-ItemProperty -Path $runKey -Name 'IsleDynamicIsland' -Value ('\"' + $exe + '\"')
+                                $startup = [System.Environment]::GetFolderPath('Startup')
+                                if (Test-Path $startup) {
+                                    $wsh = New-Object -ComObject WScript.Shell
+                                    $sc = $wsh.CreateShortcut((Join-Path $startup 'WinIsle.lnk'))
+                                    $sc.TargetPath = $exe
+                                    $sc.Save()
+                                }
+                            "])
+                            .spawn();
                     }
                 }
                 "exit_app" => {

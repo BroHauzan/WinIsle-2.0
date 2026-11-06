@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { getIslandBackdrop, updateIslandBounds } from '../core/tauri-bridge';
+import { trimWebViewMemory, updateIslandBounds } from '../core/tauri-bridge';
 
 interface SpringState {
   value: number;
@@ -13,7 +13,7 @@ function stepSpring(s: SpringState, dt: number): boolean {
   const force = (s.target - s.value) * s.stiffness - s.velocity * s.damping;
   s.velocity += force * dt;
   s.value += s.velocity * dt;
-  if (Math.abs(s.target - s.value) < 0.2 && Math.abs(s.velocity) < 1.0) {
+  if (Math.abs(s.target - s.value) < 0.25 && Math.abs(s.velocity) < 1.0) {
     s.value = s.target;
     s.velocity = 0;
     return true;
@@ -99,67 +99,54 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     current: isExpanded ? 1 : 0,
     target: isExpanded ? 1 : 0,
   });
-  const backdropImgRef = useRef<HTMLImageElement | null>(null);
-  const wasExpandedRef = useRef<boolean>(false);
   const noiseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const noisePatternRef = useRef<CanvasPattern | null>(null);
+  const wakeLoopRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
-    expandProgressRef.current.target = isExpanded ? 1 : 0;
-    if (isExpanded && !wasExpandedRef.current) {
-      wasExpandedRef.current = true;
-      // Capture the desktop area directly behind the island right as expansion starts
-      getIslandBackdrop()
-        .then((dataUrl) => {
-          if (!dataUrl) return;
-          const img = new Image();
-          img.onload = () => {
-            backdropImgRef.current = img;
-          };
-          img.src = dataUrl;
-        })
-        .catch(() => {});
-    } else if (!isExpanded) {
-      wasExpandedRef.current = false;
-    }
-  }, [isExpanded]);
-
-  useEffect(() => {
-    // Create a tiny 64x64 subtle frosted acrylic grain tile once
+    // Create a tiny 32x32 subtle frosted acrylic grain tile once (zero GPU blur overhead)
     if (typeof document === 'undefined' || noiseCanvasRef.current) return;
     const nc = document.createElement('canvas');
-    nc.width = 64;
-    nc.height = 64;
+    nc.width = 32;
+    nc.height = 32;
     const nctx = nc.getContext('2d');
     if (nctx) {
-      const imgData = nctx.createImageData(64, 64);
+      const imgData = nctx.createImageData(32, 32);
       const data = imgData.data;
       for (let i = 0; i < data.length; i += 4) {
         const v = (Math.random() * 255) | 0;
         data[i] = v;
         data[i + 1] = v;
         data[i + 2] = v;
-        data[i + 3] = 7; // subtle frosted acrylic diffusion
+        data[i + 3] = 6;
       }
       nctx.putImageData(imgData, 0, 0);
       noiseCanvasRef.current = nc;
+      noisePatternRef.current = nctx.createPattern(nc, 'repeat');
     }
   }, []);
 
   useEffect(() => {
+    expandProgressRef.current.target = isExpanded ? 1 : 0;
+    wakeLoopRef.current?.();
+  }, [isExpanded]);
+
+  useEffect(() => {
     if (tintRgb && tintRgb.length === 3) {
       rgbTargetRef.current = [tintRgb[0], tintRgb[1], tintRgb[2]];
+      wakeLoopRef.current?.();
     }
   }, [tintRgb]);
 
   useEffect(() => {
     washAlphaRef.current.target = tintStyle === 'wash' ? 1 : 0;
+    wakeLoopRef.current?.();
   }, [tintStyle]);
 
   useEffect(() => {
     const sp = springsRef.current;
     const dw = width - sp.w.target;
     const dh = height - sp.h.target;
-    // Add subtle organic elastic impulse when morphing between modes/menus
     if (Math.abs(dw) > 12) {
       sp.w.velocity += Math.sign(dw) * Math.min(180, Math.abs(dw) * 1.4);
     }
@@ -170,53 +157,79 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
     sp.h.target = height;
     sp.r.target = radius;
     sp.s.target = shoulder;
+    wakeLoopRef.current?.();
   }, [width, height, radius, shoulder]);
 
   useEffect(() => {
     if (nudgeTrigger > 0) {
       springsRef.current.w.velocity += 220;
+      wakeLoopRef.current?.();
     }
   }, [nudgeTrigger]);
 
   useEffect(() => {
     let rafId = 0;
+    let isRunning = false;
     let lastTime = performance.now();
+    let lastAuraDraw = 0;
+    let trimTimer = 0;
     const startTime = lastTime;
 
     const tick = (now: number) => {
       if (document.hidden) {
-        lastTime = now;
-        rafId = requestAnimationFrame(tick);
+        isRunning = false;
         return;
       }
+
       const dt = Math.min(0.04, Math.max(0.001, (now - lastTime) / 1000));
       lastTime = now;
       const sp = springsRef.current;
-      stepSpring(sp.w, dt);
-      stepSpring(sp.h, dt);
-      stepSpring(sp.r, dt);
-      stepSpring(sp.s, dt);
+      const wDone = stepSpring(sp.w, dt);
+      const hDone = stepSpring(sp.h, dt);
+      const rDone = stepSpring(sp.r, dt);
+      const sDone = stepSpring(sp.s, dt);
 
       // Smoothly lerp current RGB & wash opacity towards target
-      const lerpFactor = Math.min(1, dt * 7.0);
+      const lerpFactor = Math.min(1, dt * 7.5);
       const curRgb = rgbCurrentRef.current;
       const tgtRgb = rgbTargetRef.current;
       curRgb[0] += (tgtRgb[0] - curRgb[0]) * lerpFactor;
       curRgb[1] += (tgtRgb[1] - curRgb[1]) * lerpFactor;
       curRgb[2] += (tgtRgb[2] - curRgb[2]) * lerpFactor;
+      const rgbDone =
+        Math.abs(tgtRgb[0] - curRgb[0]) < 0.004 &&
+        Math.abs(tgtRgb[1] - curRgb[1]) < 0.004 &&
+        Math.abs(tgtRgb[2] - curRgb[2]) < 0.004;
+      if (rgbDone) {
+        curRgb[0] = tgtRgb[0];
+        curRgb[1] = tgtRgb[1];
+        curRgb[2] = tgtRgb[2];
+      }
 
       const wa = washAlphaRef.current;
-      wa.current += (wa.target - wa.current) * Math.min(1, dt * 7.5);
+      wa.current += (wa.target - wa.current) * Math.min(1, dt * 8.0);
+      const waDone = Math.abs(wa.target - wa.current) < 0.004;
+      if (waDone) wa.current = wa.target;
 
       const epObj = expandProgressRef.current;
       epObj.current += (epObj.target - epObj.current) * Math.min(1, dt * 10.0);
+      const epDone = Math.abs(epObj.target - epObj.current) < 0.004;
+      if (epDone) epObj.current = epObj.target;
+
+      const allSpringsSettled = wDone && hDone && rDone && sDone && rgbDone && waDone && epDone;
+
+      // Throttle aura animation to ~20 FPS when springs are settled to keep GPU/CPU near 0%
+      if (allSpringsSettled && tintStyle === 'aura' && now - lastAuraDraw < 50) {
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+      lastAuraDraw = now;
 
       const curW = Math.max(0, sp.w.value);
       const curH = Math.max(0, sp.h.value);
       const curR = Math.max(0, sp.r.value);
       const curS = Math.max(0, sp.s.value);
 
-      // Tie glass transparency strictly to physical expansion beyond compact height (32px)
       const ep = Math.max(0, Math.min(1, (curH - 34) / 68));
 
       setDims((prev) => {
@@ -230,20 +243,19 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
       const canvas = canvasRef.current;
       if (canvas) {
-        const dpr = window.devicePixelRatio || 1;
-        const outerW = Math.ceil(curW + 2 * curS) + 8;
-        const outerH = Math.ceil(curH) + 8;
-        if (canvas.width !== Math.round(outerW * dpr) || canvas.height !== Math.round(outerH * dpr)) {
-          canvas.width = Math.round(outerW * dpr);
-          canvas.height = Math.round(outerH * dpr);
+        // Use 1x logical pixel buffer for the solid/gradient island silhouette to cut GPU VRAM by 75%
+        const outerW = Math.max(1, Math.ceil(curW + 2 * curS) + 8);
+        const outerH = Math.max(1, Math.ceil(curH) + 8);
+        if (canvas.width !== outerW || canvas.height !== outerH) {
+          canvas.width = outerW;
+          canvas.height = outerH;
           canvas.style.width = `${outerW}px`;
           canvas.style.height = `${outerH}px`;
         }
         const ctx = canvas.getContext('2d');
         if (ctx) {
           ctx.save();
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.scale(dpr, dpr);
+          ctx.clearRect(0, 0, outerW, outerH);
           ctx.translate(4, 0);
 
           const top = Math.min(topInset, curH);
@@ -254,7 +266,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
           const hanging = Math.min(1, margin / 4);
           const rad = Math.max(0, Math.min(curR, curH - top * hanging - sh, (right - left) / 2));
 
-          // Trace concave-shoulder notch path
           const traceOutline = () => {
             ctx.beginPath();
             ctx.moveTo(left - sh, 0);
@@ -297,10 +308,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             ctx.lineTo(right, top + sh);
           };
 
-          // Draw notch body:
-          // When in compact/small form (ep <= 0.02): completely solid pitch black (#000000, 100% opaque)
-          // When expanding/expanded: real blurred desktop backdrop + rich frosted dark acrylic glass
-          // so any desktop text behind the Dynamic Island is blurred and never interferes with readability
           if (ep <= 0.02) {
             traceOutline();
             ctx.fillStyle = '#000000';
@@ -310,55 +317,30 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             traceOutline();
             ctx.clip();
 
-            // 1. If a real desktop backdrop snapshot is available (Windows Tauri), draw it heavily Gaussian-blurred
-            if (backdropImgRef.current) {
-              ctx.save();
-              ctx.filter = 'blur(24px) saturate(165%)';
-              const winW = window.innerWidth || 740;
-              const winH = window.innerHeight || 340;
-              const drawX = (left + right) / 2 - winW / 2;
-              ctx.drawImage(backdropImgRef.current, drawX - 18, -18, winW + 36, winH + 36);
-              ctx.restore();
-            }
-
-            // 2. Frosted Dark Acrylic Glass Gradient (High contrast readability so background text never bleeds through)
+            // Rich dark acrylic gradient (zero GPU blur FBO overhead)
             const liquidGlassGrad = ctx.createLinearGradient(0, 0, 0, curH);
             liquidGlassGrad.addColorStop(0, '#000000');
-            liquidGlassGrad.addColorStop(
-              0.28,
-              `rgba(8, 10, 16, ${(1 - 0.05 * ep).toFixed(3)})`
-            );
-            liquidGlassGrad.addColorStop(
-              0.68,
-              `rgba(11, 14, 22, ${(1 - 0.13 * ep).toFixed(3)})`
-            );
-            liquidGlassGrad.addColorStop(
-              1,
-              `rgba(14, 18, 28, ${(1 - 0.20 * ep).toFixed(3)})`
-            );
+            liquidGlassGrad.addColorStop(0.28, `rgba(8, 10, 16, ${(1 - 0.03 * ep).toFixed(3)})`);
+            liquidGlassGrad.addColorStop(0.68, `rgba(11, 14, 22, ${(1 - 0.06 * ep).toFixed(3)})`);
+            liquidGlassGrad.addColorStop(1, `rgba(14, 18, 28, ${(1 - 0.09 * ep).toFixed(3)})`);
             ctx.fillStyle = liquidGlassGrad;
             ctx.fillRect(0, 0, outerW, outerH);
 
-            // 3. Subtle Frosted Acrylic Matte Sheen & Micro-Grain Diffusion
             const glassSheen = ctx.createLinearGradient(left, 0, right, curH);
-            glassSheen.addColorStop(0, `rgba(255, 255, 255, ${(0.085 * ep).toFixed(3)})`);
-            glassSheen.addColorStop(0.45, `rgba(255, 255, 255, ${(0.028 * ep).toFixed(3)})`);
-            glassSheen.addColorStop(1, `rgba(255, 255, 255, ${(0.06 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(0, `rgba(255, 255, 255, ${(0.075 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(0.45, `rgba(255, 255, 255, ${(0.024 * ep).toFixed(3)})`);
+            glassSheen.addColorStop(1, `rgba(255, 255, 255, ${(0.05 * ep).toFixed(3)})`);
             ctx.fillStyle = glassSheen;
             ctx.fillRect(0, 0, outerW, outerH);
 
-            if (noiseCanvasRef.current) {
-              const pat = ctx.createPattern(noiseCanvasRef.current, 'repeat');
-              if (pat) {
-                ctx.fillStyle = pat;
-                ctx.fillRect(0, 0, outerW, outerH);
-              }
+            if (noisePatternRef.current) {
+              ctx.fillStyle = noisePatternRef.current;
+              ctx.fillRect(0, 0, outerW, outerH);
             }
 
             ctx.restore();
           }
 
-          // Dominant Cover Color Wash (smoothly interpolated via wa.current)
           if (wa.current > 0.005 && tintStyle !== 'glow' && tintStyle !== 'aura') {
             ctx.save();
             traceOutline();
@@ -369,7 +351,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             const B = Math.round(b * 255);
             const a = wa.current;
 
-            // 1. Diagonal warm ambient wash across the island
             const wash = ctx.createLinearGradient(left, top, right, curH);
             wash.addColorStop(0, `rgba(${R}, ${G}, ${B}, ${(0.06 * a).toFixed(3)})`);
             wash.addColorStop(0.45, `rgba(${R}, ${G}, ${B}, ${(0.25 * a).toFixed(3)})`);
@@ -377,7 +358,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             ctx.fillStyle = wash;
             ctx.fillRect(0, 0, outerW, outerH);
 
-            // 2. Soft radial aura bloom on bottom-left and bottom-right
             const bloomL = ctx.createRadialGradient(
               left + curW * 0.25,
               curH,
@@ -393,7 +373,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
 
             ctx.restore();
           } else if (tintStyle === 'glow') {
-            // Corner Drop Glow
             ctx.save();
             traceOutline();
             ctx.clip();
@@ -409,23 +388,22 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             }
             ctx.restore();
           } else if (tintStyle === 'aura') {
-            // Smooth Animated Ambient Gradient Inside Island (No moving border stroke)
             ctx.save();
             traceOutline();
             ctx.clip();
 
             const elapsed = Math.max(0, (now - startTime) / 1000);
             const geminiPalette: [number, number, number][] = [
-              [0.26, 0.52, 0.96], // Blue
-              [0.61, 0.45, 0.98], // Violet
-              [0.93, 0.40, 0.58], // Rose
-              [0.22, 0.78, 0.98], // Sky Cyan
+              [0.26, 0.52, 0.96],
+              [0.61, 0.45, 0.98],
+              [0.93, 0.40, 0.58],
+              [0.22, 0.78, 0.98],
             ];
             const pLen = geminiPalette.length;
 
             const makeFlow = (alpha: number, shift: number) => {
               const grad = ctx.createLinearGradient(left, top, right, curH);
-              const stops = 16;
+              const stops = 8;
               for (let i = 0; i <= stops; i++) {
                 const x = i / stops;
                 const at = Math.abs((x + (elapsed * 0.18 + shift)) * pLen);
@@ -443,12 +421,10 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
               return grad;
             };
 
-            // Soft animated gradient wash across the island interior
             const curVoiceLevel = voiceLevelRef?.current ?? voiceLevelRefInternal.current ?? 0;
             ctx.fillStyle = makeFlow(0.16 + curVoiceLevel * 0.1, 0);
             ctx.fillRect(0, 0, outerW, outerH);
 
-            // Soft bottom radial ambient glow
             const bottomGlow = ctx.createRadialGradient(
               (left + right) / 2,
               curH + 8,
@@ -466,7 +442,6 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
             ctx.restore();
           }
 
-          // Specular liquid glass rim reflection along sides and bottom (only when expanded)
           if (ep > 0.02) {
             ctx.save();
             traceSidesAndBottom();
@@ -484,11 +459,41 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         }
       }
 
+      // Stop RAF loop completely as soon as morph settles (0% CPU & 0 GPU frame allocations while open/idle)
+      if (allSpringsSettled && tintStyle !== 'aura') {
+        isRunning = false;
+        if (trimTimer) window.clearTimeout(trimTimer);
+        trimTimer = window.setTimeout(() => {
+          void trimWebViewMemory();
+        }, 120);
+        return;
+      }
+
       rafId = requestAnimationFrame(tick);
     };
 
-    rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
+    const startLoop = () => {
+      if (!isRunning) {
+        isRunning = true;
+        lastTime = performance.now();
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+
+    wakeLoopRef.current = startLoop;
+    startLoop();
+
+    const onVisChange = () => {
+      if (!document.hidden) startLoop();
+    };
+    document.addEventListener('visibilitychange', onVisChange);
+
+    return () => {
+      isRunning = false;
+      cancelAnimationFrame(rafId);
+      if (trimTimer) window.clearTimeout(trimTimer);
+      document.removeEventListener('visibilitychange', onVisChange);
+    };
   }, [topInset, tintStyle, auraColors, voiceLevelRef]);
 
   const isMiniHidden = Boolean(hidden || dims.h <= 6 || height <= 6);
@@ -542,16 +547,12 @@ export const IslandSurface: React.FC<IslandSurfaceProps> = ({
         className="pointer-events-none absolute top-0 left-1/2 -translate-x-1/2"
       />
       <div
-        className={`relative z-10 overflow-hidden flex flex-col justify-between ${
-          dims.h > 34 ? 'backdrop-blur-3xl backdrop-saturate-[190%]' : ''
-        }`}
+        className="relative z-10 overflow-hidden flex flex-col justify-between"
         style={{
           width: `${dims.w}px`,
           height: `${dims.h}px`,
           borderBottomLeftRadius: `${dims.r}px`,
           borderBottomRightRadius: `${dims.r}px`,
-          backdropFilter: dims.h > 34 ? 'blur(48px) saturate(190%)' : 'none',
-          WebkitBackdropFilter: dims.h > 34 ? 'blur(48px) saturate(190%)' : 'none',
           background:
             dims.h > 34
               ? 'linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, rgba(255, 255, 255, 0.015) 45%, rgba(255, 255, 255, 0.03) 100%)'

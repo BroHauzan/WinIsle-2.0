@@ -29,7 +29,7 @@
         "x": 0,
         "y": 0,
         "dragDropEnabled": false,
-        "additionalBrowserArgs": "--autoplay-policy=no-user-gesture-required"
+        "additionalBrowserArgs": "--autoplay-policy=no-user-gesture-required --enable-low-end-device-mode --force-gpu-mem-available-mb=16 --gpu-program-cache-size-kb=256 --disable-gpu-shader-disk-cache --disable-gpu-memory-buffer-video-frames --renderer-process-limit=1 --process-per-site --disable-site-isolation-trials --no-zygote --disable-breakpad --disable-crash-reporter --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-spell-checking --disk-cache-size=524288 --media-cache-size=524288 --enable-features=MemoryReducer --disable-features=SpareRendererForSitePerProcess,BackForwardCache,Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion,AutofillServerCommunication,InterestFeedContentSuggestions,Prerender2,SpeculativeServiceWorkerWarmUp,AudioServiceOutOfProcess --js-flags=--max-old-space-size=24"
       }
     ],
     "security": {
